@@ -34,7 +34,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -43,6 +43,7 @@ use app::App;
 
 const DEFERRED_EDIT: u32 = WM_APP + 3;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+const WM_NCMOUSELEAVE: u32 = 0x02A2;
 
 thread_local! {
     static BUSY: Cell<bool> = const { Cell::new(false) };
@@ -106,7 +107,86 @@ fn with_app<R>(hwnd: HWND, f: impl FnOnce(&mut App) -> R) -> Option<R> {
     Some(r)
 }
 
+// ------------------------------------------------------------ custom title bar
+//
+// The client area covers the native caption, so the title bar row (app icon, editor tabs,
+// caption buttons) is painted by the app. The side and bottom frame stay native (resizing,
+// shadow, Windows 11 rounded corners). The top resize edge, the caption buttons (HTMAXBUTTON
+// keeps the Windows 11 snap layouts flyout) and dragging are restored with WM_NCHITTEST.
+
+/// Thickness of the resize frame, which is also how far a maximized window hangs off screen.
+unsafe fn frame_thickness(hwnd: HWND) -> i32 {
+    let dpi = GetDpiForWindow(hwnd);
+    GetSystemMetricsForDpi(SM_CYFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi)
+}
+
+/// WM_NCCALCSIZE: the native frame on the left, right and bottom, none on top. `lp` points
+/// to an NCCALCSIZE_PARAMS when `wp` is TRUE, else (at creation) to a RECT; both start with
+/// the rectangle to adjust.
+unsafe fn nc_calc_size(hwnd: HWND, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // DefWindowProcW writes the rectangle through `lp`, so no reference to it may live across
+    // that call (the optimizer would drop restoring `top` as a no-op store)
+    let rc = if wp != 0 { std::ptr::addr_of_mut!((*(lp as *mut NCCALCSIZE_PARAMS)).rgrc[0]) } else { lp as *mut RECT };
+    let top = std::ptr::read(std::ptr::addr_of!((*rc).top));
+    let r = DefWindowProcW(hwnd, WM_NCCALCSIZE, wp, lp);
+    let mut new_top = top;
+    if IsZoomed(hwnd) != 0 {
+        // the top edge of a maximized window is off screen by the frame's thickness
+        new_top += frame_thickness(hwnd);
+    }
+    std::ptr::write(std::ptr::addr_of_mut!((*rc).top), new_top);
+    r
+}
+
+/// WM_NCHITTEST: the native frame, then the top resize edge, then the title bar (`app` is
+/// None while a message is handled re-entrantly; then only the caption buttons are known).
+unsafe fn nc_hit_test(hwnd: HWND, lp: LPARAM, nested: bool) -> LRESULT {
+    let r = DefWindowProcW(hwnd, WM_NCHITTEST, 0, lp);
+    if r != HTCLIENT as LRESULT {
+        return r;
+    }
+    let mut p = POINT { x: lo(lp), y: hi(lp) };
+    ScreenToClient(hwnd, &mut p);
+    let mut c: RECT = std::mem::zeroed();
+    GetClientRect(hwnd, &mut c);
+    let frame = frame_thickness(hwnd);
+    if IsZoomed(hwnd) == 0 && p.y < frame {
+        return if p.x < frame * 2 {
+            HTTOPLEFT
+        } else if p.x >= c.right - frame * 2 {
+            HTTOPRIGHT
+        } else {
+            HTTOP
+        } as LRESULT;
+    }
+    if !nested {
+        if let Some(h) = with_app(hwnd, |a| a.caption_hit(p.x, p.y)) {
+            return h as LRESULT;
+        }
+    }
+    // fallback from the geometry alone: the caption buttons are the three rightmost cells
+    let scale = GetDpiForWindow(hwnd) as f32 / 96.0;
+    let (th, cw) = ((app::TITLE_H as f32 * scale).round() as i32, (46.0 * scale).round() as i32);
+    if p.y < th && p.x >= c.right - cw * 3 {
+        return [HTMINBUTTON, HTMAXBUTTON, HTCLOSE][((p.x - (c.right - cw * 3)) / cw).clamp(0, 2) as usize] as LRESULT;
+    }
+    HTCLIENT as LRESULT
+}
+
+fn caption_button_hit(ht: usize) -> Option<app::Hit> {
+    match ht as u32 {
+        HTMINBUTTON => Some(app::Hit::CaptionMin),
+        HTMAXBUTTON => Some(app::Hit::CaptionMax),
+        HTCLOSE => Some(app::Hit::CaptionClose),
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    // the frame is the same before the app exists and while it is busy
+    if msg == WM_NCCALCSIZE {
+        return nc_calc_size(hwnd, wp, lp);
+    }
     if app_ptr(hwnd).is_null() {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -137,6 +217,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return 0;
             }
             WM_CTLCOLOREDIT => {}
+            WM_NCHITTEST => return nc_hit_test(hwnd, lp, true),
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         }
     }
@@ -149,6 +230,51 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ERASEBKGND => 1,
+        WM_NCHITTEST => nc_hit_test(hwnd, lp, false),
+        WM_NCMOUSEMOVE => {
+            // hover of the caption buttons, which are non-client (HTMINBUTTON, ...) areas
+            let hit = caption_button_hit(wp);
+            if hit.is_some() {
+                let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE | TME_NONCLIENT, hwndTrack: hwnd, dwHoverTime: 0 };
+                TrackMouseEvent(&mut tme);
+            }
+            with_app(hwnd, |a| {
+                let h = hit.unwrap_or(app::Hit::None);
+                if a.hover != h {
+                    a.hover = h;
+                    a.invalidate();
+                }
+            });
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        WM_NCMOUSELEAVE => {
+            with_app(hwnd, |a| {
+                if matches!(a.hover, app::Hit::CaptionMin | app::Hit::CaptionMax | app::Hit::CaptionClose) {
+                    a.hover = app::Hit::None;
+                    a.invalidate();
+                }
+            });
+            0
+        }
+        // the caption buttons act on release, like the native ones; the default handling would
+        // draw classic buttons over the title bar
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if caption_button_hit(wp).is_some() => {
+            with_app(hwnd, |a| a.caption_down = wp as u32);
+            0
+        }
+        WM_NCLBUTTONUP if caption_button_hit(wp).is_some() => {
+            let down = with_app(hwnd, |a| std::mem::take(&mut a.caption_down)).unwrap_or(0);
+            if down == wp as u32 {
+                let sc = match wp as u32 {
+                    HTMINBUTTON => SC_MINIMIZE,
+                    HTMAXBUTTON if IsZoomed(hwnd) != 0 => SC_RESTORE,
+                    HTMAXBUTTON => SC_MAXIMIZE,
+                    _ => SC_CLOSE,
+                };
+                PostMessageW(hwnd, WM_SYSCOMMAND, sc as usize, 0);
+            }
+            0
+        }
         WM_SIZE => {
             with_app(hwnd, |a| {
                 if wp as u32 == SIZE_MINIMIZED {
@@ -226,16 +352,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ACTIVATE => {
-            if (wp & 0xFFFF) != 0 {
-                with_app(hwnd, |a| {
-                    if a.repo.is_some() {
-                        unsafe {
-                            SetTimer(hwnd, app::TIMER_FS, 150, None);
-                        }
+            let activating = (wp & 0xFFFF) != 0;
+            with_app(hwnd, |a| {
+                if activating && a.repo.is_some() {
+                    unsafe {
+                        SetTimer(hwnd, app::TIMER_FS, 150, None);
                     }
-                    a.invalidate();
-                });
-            }
+                }
+                // the title bar dims while the window is inactive
+                a.invalidate();
+            });
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
@@ -564,6 +690,8 @@ fn main() {
         if hwnd.is_null() {
             return;
         }
+        // recomputes the frame without the native caption (see `nc_calc_size`)
+        SetWindowPos(hwnd, null_mut(), 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         let dpi = GetDpiForWindow(hwnd);
         let mut app = Box::new(App::new(hwnd, dpi, st));
         app.git_version = git::version();

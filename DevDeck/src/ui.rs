@@ -111,6 +111,8 @@ impl App {
         let (w, h) = (rw(&c), rh(&c));
         let sb = self.s(22);
         let ab = self.s(48);
+        // title bar row: the window has no native caption (see `nc_calc_size` in main.rs)
+        let th = self.s(TITLE_H);
         let sw = self.s(self.st.sidebar_w).clamp(self.s(180), (w - ab - self.s(260)).max(self.s(180)));
         let right = self.st.sidebar_right;
         // activity bar on the outer edge, side bar next to it, main area takes the rest
@@ -118,13 +120,16 @@ impl App {
         let sx = if right { w - ab - sw } else { ab };
         let mut l = Layout::default();
         let mode = self.panel_mode();
-        let out_h = if self.st.output_visible { self.s(self.st.output_h).clamp(self.s(80), (h - sb - self.s(150)).max(self.s(80))) } else { 0 };
+        let out_h = if self.st.output_visible { self.s(self.st.output_h).clamp(self.s(80), (h - th - sb - self.s(150)).max(self.s(80))) } else { 0 };
         // a full width panel runs under the activity bar and the side bar too
         let side_bottom = if mode == PanelMode::FullWidth { h - sb - out_h } else { h - sb };
         l.status = rect(0, h - sb, w, h);
-        l.activity = rect(ax, 0, ax + ab, side_bottom);
-        l.sidebar = rect(sx, 0, sx + sw, side_bottom);
-        l.title = rect(sx, 0, sx + sw, self.s(35));
+        l.titlebar = rect(0, 0, w, th);
+        let cw = self.s(46);
+        l.captions = rect(w - cw * 3, 0, w, th);
+        l.activity = rect(ax, th, ax + ab, side_bottom);
+        l.sidebar = rect(sx, th, sx + sw, side_bottom);
+        l.title = rect(sx, th, sx + sw, th + self.s(35));
         // sidebar sections, top to bottom: Changes, Graph, Branches. Changes and Graph share
         // the flexible space (graph_split); Branches keeps its own height at the bottom.
         let avail_top = l.title.bottom;
@@ -176,26 +181,28 @@ impl App {
             (l.changes_header, l.edit, l.button, l.changes) = (z, z, z, z);
             (l.graph_header, l.graph, l.branches_header, l.branches) = (z, z, z, z);
         }
-        l.main = rect(mx, 0, mr, h - sb - out_h);
+        l.main = rect(mx, th, mr, h - sb - out_h);
         l.output = rect(mx, l.main.bottom, mr, h - sb);
         match mode {
             PanelMode::Normal => {}
             PanelMode::FullWidth => l.output = rect(0, h - sb - out_h, w, h - sb),
             PanelMode::FullHeight => {
-                l.main = rect(mx, 0, mr, 0);
-                l.output = rect(mx, 0, mr, h - sb);
+                l.main = rect(mx, th, mr, th);
+                l.output = rect(mx, th, mr, h - sb);
             }
             PanelMode::FullScreen => {
                 let z = rect(0, 0, 0, 0);
                 l.main = z;
-                l.output = rect(0, 0, w, h - sb);
+                l.output = rect(0, th, w, h - sb);
                 (l.activity, l.sidebar, l.title, l.changes_header, l.edit, l.button, l.changes) = (z, z, z, z, z, z, z);
                 (l.graph_header, l.graph, l.branches_header, l.branches) = (z, z, z, z);
                 (l.explorer_header, l.explorer) = (z, z);
             }
         }
-        l.main_header = rect(l.main.left, 0, l.main.right, self.s(35).min(l.main.bottom));
-        l.main_body = rect(l.main.left, l.main_header.bottom, l.main.right, l.main.bottom);
+        // the editor tabs sit in the title bar above the main area, between the app icon
+        // (in the activity bar's column) and the caption buttons
+        l.main_header = if rh(&l.main) > 0 { rect(l.main.left.max(ab), 0, l.main.right.min(l.captions.left), th) } else { rect(0, 0, 0, 0) };
+        l.main_body = l.main;
         l.output_body = rect(l.output.left, l.output.top + self.s(35), l.output.right, l.output.bottom);
         self.l = l;
         unsafe {
@@ -296,7 +303,7 @@ impl App {
         let c = self.client();
         let w = self.s(600).min((rw(&c) as f32 * 0.62) as i32).max(self.s(320));
         let x = (rw(&c) - w) / 2;
-        xywh(x, self.s(8), w, self.s(42))
+        xywh(x, self.l.titlebar.bottom + self.s(8), w, self.s(42))
     }
 
     pub fn layout_overlay_edit(&mut self) {
@@ -441,6 +448,7 @@ impl App {
         let g = Gfx { dc: self.buf.0 };
         self.hits.clear();
         g.fill(&c, self.t.editor);
+        self.paint_titlebar(&g);
         let mode = self.panel_mode();
         if mode != PanelMode::FullScreen {
             self.paint_activity(&g);
@@ -507,6 +515,73 @@ impl App {
             }
         }
         self.buf = (null_mut(), null_mut(), 0, 0);
+    }
+
+    /// Title bar row: app icon, window title, and the minimize / maximize / close buttons.
+    /// The editor tabs are painted into it by `paint_main` (`l.main_header`).
+    fn paint_titlebar(&mut self, g: &Gfx) {
+        let l = self.l;
+        let tb = l.titlebar;
+        let active = unsafe { GetForegroundWindow() } == self.hwnd;
+        let fg = if active { self.t.fg } else { self.t.fg_dim };
+        g.fill(&tb, self.t.sidebar);
+        g.hline(tb.left, tb.right, tb.bottom - 1, self.t.border);
+        let ab = self.s(48);
+        // app icon, centered over the activity bar's column
+        let sz = self.s(16);
+        unsafe {
+            if self.title_icon.1 != sz {
+                if !self.title_icon.0.is_null() {
+                    DestroyIcon(self.title_icon.0);
+                }
+                let hinst = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null());
+                self.title_icon = (LoadImageW(hinst, 1 as *const u16, IMAGE_ICON, sz, sz, LR_DEFAULTCOLOR) as HICON, sz);
+            }
+            if !self.title_icon.0.is_null() {
+                DrawIconEx(g.dc, (ab - sz) / 2, (rh(&tb) - sz) / 2, self.title_icon.0, sz, sz, 0, null_mut(), DI_NORMAL);
+            }
+        }
+        // window title in the wider free part: over the side bar (left or right of the tabs)
+        let hd = l.main_header;
+        let (hl, hr) = if rw(&hd) > 0 { (hd.left, hd.right) } else { (ab, ab) };
+        let left = rect(ab + self.s(2), tb.top, hl - self.s(8), tb.bottom);
+        let right = rect(hr + self.s(12), tb.top, l.captions.left - self.s(8), tb.bottom);
+        let tr = if rw(&left) >= rw(&right) { left } else { right };
+        if rw(&tr) > self.s(40) {
+            g.text_in(&tr, &self.window_title(), self.fonts.ui, fg, DT_LINE | DT_END_ELLIPSIS);
+        }
+        // caption buttons (Segoe Fluent Icons / MDL2 chrome glyphs)
+        let maxed = unsafe { IsZoomed(self.hwnd) } != 0;
+        let cw = rw(&l.captions) / 3;
+        let buttons = [(Hit::CaptionMin, '\u{E921}'), (Hit::CaptionMax, if maxed { '\u{E923}' } else { '\u{E922}' }), (Hit::CaptionClose, '\u{E8BB}')];
+        for (k, (hit, glyph)) in buttons.into_iter().enumerate() {
+            let r = xywh(l.captions.left + k as i32 * cw, tb.top, cw, rh(&tb) - 1);
+            let close = hit == Hit::CaptionClose;
+            let hovered = self.hover == hit;
+            let mut color = fg;
+            if hovered {
+                // Windows' own close button red, and a light tint for the others
+                g.fill(&r, if close { 0x001C2BC4 } else { crate::theme::blend_colorref(self.t.sidebar, self.t.fg, 0.12) });
+                color = if close { 0x00FFFFFF } else { self.t.fg_strong };
+            }
+            g.icon(&r, glyph, self.fonts.icon_small, color);
+            self.hits.push((r, hit));
+        }
+    }
+
+    /// What `WM_NCHITTEST` returns for a client point: the caption buttons, the title bar's
+    /// free space (drags the window, double click maximizes), or the client area.
+    pub fn caption_hit(&self, x: i32, y: i32) -> u32 {
+        if !contains(&self.l.titlebar, x, y) {
+            return HTCLIENT;
+        }
+        match self.hit_test(x, y) {
+            Hit::CaptionMin => HTMINBUTTON,
+            Hit::CaptionMax => HTMAXBUTTON,
+            Hit::CaptionClose => HTCLOSE,
+            Hit::None => HTCAPTION,
+            _ => HTCLIENT,
+        }
     }
 
     fn icon_button(&mut self, g: &Gfx, r: RECT, glyph: char, hit: Hit, enabled: bool) {
@@ -1766,7 +1841,8 @@ impl App {
         }
         // right side
         let mut rx = r.right - self.s(8);
-        let mut right_items: Vec<(String, Hit)> = vec![("Output".into(), Hit::Cmd(Cmd::ToggleOutput)), (if self.t.dark { "\u{263D} Dark".into() } else { "\u{2600} Light".into() }, Hit::Cmd(Cmd::ToggleTheme))];
+        let version = format!("DevDeck {}", env!("CARGO_PKG_VERSION"));
+        let mut right_items: Vec<(String, Hit)> = vec![(version, Hit::Cmd(Cmd::About)), ("Output".into(), Hit::Cmd(Cmd::ToggleOutput)), (if self.t.dark { "\u{263D} Dark".into() } else { "\u{2600} Light".into() }, Hit::Cmd(Cmd::ToggleTheme))];
         if let MainView::File(f) = &self.view {
             if f.ed.editable {
                 let (l, c) = f.ed.cur;
@@ -2207,6 +2283,16 @@ impl App {
             SetCapture(self.hwnd);
         }
         match hit {
+            Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose => unsafe {
+                ReleaseCapture();
+                let sc = match hit {
+                    Hit::CaptionMin => SC_MINIMIZE,
+                    Hit::CaptionMax if IsZoomed(self.hwnd) != 0 => SC_RESTORE,
+                    Hit::CaptionMax => SC_MAXIMIZE,
+                    _ => SC_CLOSE,
+                };
+                PostMessageW(self.hwnd, WM_SYSCOMMAND, sc as usize, 0);
+            },
             Hit::None => {
                 if self.overlay.is_none() {
                     unsafe {

@@ -16,6 +16,8 @@ use crate::theme::Theme;
 use crate::watch::Watcher;
 use crate::win::{self, Fonts};
 
+/// Height of the title bar row (unscaled pixels).
+pub const TITLE_H: i32 = 30;
 pub const WM_JOB: u32 = WM_APP + 1;
 pub const WM_FS: u32 = WM_APP + 2;
 pub const WM_TERM: u32 = WM_APP + 4;
@@ -310,6 +312,10 @@ pub enum Hit {
     TermKillPanel,
     TermTab(usize),
     TermTabKill(usize),
+    /// Minimize / maximize (restore) / close buttons drawn in the title bar.
+    CaptionMin,
+    CaptionMax,
+    CaptionClose,
 }
 
 pub enum Drag {
@@ -322,6 +328,10 @@ pub enum Drag {
 
 #[derive(Clone, Copy)]
 pub struct Layout {
+    /// Title bar row (the window has no native caption): app icon and title, the editor
+    /// tabs over the main area, and the caption buttons on the right.
+    pub titlebar: RECT,
+    pub captions: RECT,
     pub activity: RECT,
     pub sidebar: RECT,
     pub title: RECT,
@@ -346,7 +356,7 @@ pub struct Layout {
 impl Default for Layout {
     fn default() -> Self {
         let z = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        Layout { activity: z, sidebar: z, title: z, changes_header: z, explorer_header: z, explorer: z, edit: z, button: z, changes: z, branches_header: z, branches: z, graph_header: z, graph: z, main: z, main_header: z, main_body: z, output: z, output_body: z, status: z }
+        Layout { titlebar: z, captions: z, activity: z, sidebar: z, title: z, changes_header: z, explorer_header: z, explorer: z, edit: z, button: z, changes: z, branches_header: z, branches: z, graph_header: z, graph: z, main: z, main_header: z, main_body: z, output: z, output_body: z, status: z }
     }
 }
 
@@ -545,6 +555,10 @@ pub struct App {
     /// Key of the tab that was active before a terminal tab was shown, which Ctrl+Alt+`
     /// returns to.
     pub term_editor_prev: Option<String>,
+    /// Caption button (HTMINBUTTON / HTMAXBUTTON / HTCLOSE) pressed in the title bar, 0 = none.
+    pub caption_down: u32,
+    /// App icon for the title bar and its size in pixels.
+    pub title_icon: (windows_sys::Win32::UI::WindowsAndMessaging::HICON, i32),
     pub term_skip_char: bool,
     pub term_surrogate: u16,
     pub shells: Vec<crate::term::Shell>,
@@ -655,6 +669,8 @@ impl App {
             term_next_id: 1,
             term_editor_last: None,
             term_editor_prev: None,
+            caption_down: 0,
+            title_icon: (std::ptr::null_mut(), 0),
             term_skip_char: false,
             term_surrogate: 0,
             shells: Vec::new(),
@@ -1074,7 +1090,16 @@ impl App {
     }
 
     pub fn update_title(&self) {
-        let title = match &self.repo {
+        let t = win::wz(&self.window_title());
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(self.hwnd, t.as_ptr());
+        }
+        self.invalidate();
+    }
+
+    /// Window title: the repository (branch) or folder, then the app name.
+    pub fn window_title(&self) -> String {
+        match &self.repo {
             Some(r) => {
                 let b = r.status.branch.clone().unwrap_or_else(|| r.status.head.as_deref().map(|h| h[..h.len().min(8)].to_string()).unwrap_or_default());
                 format!("{} ({}) - DevDeck", r.name, b)
@@ -1083,10 +1108,6 @@ impl App {
                 Some(f) => format!("{} - DevDeck", f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.display().to_string())),
                 None => "DevDeck".to_string(),
             },
-        };
-        let t = win::wz(&title);
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(self.hwnd, t.as_ptr());
         }
     }
 
