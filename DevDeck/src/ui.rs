@@ -2933,6 +2933,9 @@ impl App {
                     .collect();
                 items.push(MenuItem::Sep);
                 items.push(m.cmd("New Terminal in Editor Area", Cmd::NewTerminalEditor));
+                if crate::term::find_claude().is_some() {
+                    items.push(m.cmd("New Claude Code Session", Cmd::ClaudeNew));
+                }
                 if let Some(i) = self.panel_term() {
                     items.push(m.it("Move Terminal into Editor Area", move |a| a.move_terminal_to_editor(i)));
                 }
@@ -3364,6 +3367,7 @@ impl App {
             (0x4E, true, true) => Some(Cmd::NewWindow),                      // Ctrl+Shift+N
             (0x47, true, true) => Some(Cmd::FocusCommit),                    // Ctrl+Shift+G
             (0x43, true, true) => Some(Cmd::OpenTerminal),                   // Ctrl+Shift+C
+            (0x41, true, true) => Some(Cmd::ClaudeOpen),                     // Ctrl+Shift+A
             (0xC0, true, false) => Some(Cmd::ToggleTerminal),                // Ctrl+`
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),                 // Ctrl+Shift+M
             (0x42, true, false) => Some(Cmd::ToggleSidebar),                 // Ctrl+B

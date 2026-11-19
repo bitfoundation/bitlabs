@@ -505,7 +505,7 @@ unsafe extern "system" fn commit_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
                 SetFocus(main);
                 return 0;
             }
-            if ctrl && vk == 0x41 {
+            if ctrl && !shift && vk == 0x41 {
                 SendMessageW(hwnd, 0x00B1, 0, -1);
                 return 0;
             }
@@ -557,7 +557,7 @@ unsafe extern "system" fn overlay_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
             if matches!(vk, 0x26 | 0x28 | 0x21 | 0x22 | 0x0D | 0x1B) && with_app(main, |a| a.overlay_key(vk)).unwrap_or(false) {
                 return 0;
             }
-            if key_down(VK_CONTROL) && vk == 0x41 {
+            if key_down(VK_CONTROL) && !key_down(VK_SHIFT) && vk == 0x41 {
                 SendMessageW(hwnd, 0x00B1, 0, -1);
                 return 0;
             }

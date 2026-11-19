@@ -26,6 +26,9 @@ call :addmenu "HKCU\Software\Classes\Directory\shell\DevDeck" || goto fail
 call :addmenu "HKCU\Software\Classes\Directory\Background\shell\DevDeck" || goto fail
 echo   Done.
 
+echo Refreshing Explorer icons...
+call :refreshicons
+
 echo.
 echo DevDeck is installed. Open a new terminal and run: devdeck .
 echo Right-click a folder (or empty space inside one) in Explorer and pick "Open with DevDeck".
@@ -51,4 +54,11 @@ rem Deletes a registry key if it exists; a missing key is not an error.
 :delkey
 reg query "%~1" >nul 2>&1 || exit /b 0
 reg delete "%~1" /f >nul || exit /b 1
+exit /b 0
+
+rem Explorer caches icons by file path, so an updated devdeck.exe in the same folder keeps
+rem showing its old icon. ie4uinit rebuilds the icon cache (-show on Windows 10/11,
+rem -ClearIconCache on older versions); failures are ignored.
+:refreshicons
+ie4uinit.exe -show >nul 2>&1 || ie4uinit.exe -ClearIconCache >nul 2>&1
 exit /b 0

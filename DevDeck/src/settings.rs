@@ -31,6 +31,8 @@ pub struct Settings {
     pub smart_commit: Option<bool>,
     pub confirm_sync: bool,
     pub recent: Vec<String>,
+    /// Titles of the commands run from the Command Palette, most recent first.
+    pub recent_cmds: Vec<String>,
     pub panel_terminal: bool,
     pub terminal_shell: String,
     pub window: Option<(i32, i32, i32, i32, bool)>,
@@ -59,6 +61,7 @@ impl Default for Settings {
             smart_commit: None,
             confirm_sync: true,
             recent: Vec::new(),
+            recent_cmds: Vec::new(),
             panel_terminal: false,
             terminal_shell: String::new(),
             window: None,
@@ -110,6 +113,7 @@ impl Settings {
                 "panel_terminal" => s.panel_terminal = b,
                 "terminal_shell" => s.terminal_shell = v.to_string(),
                 "recent" => s.recent = v.split('|').filter(|x| !x.is_empty()).map(String::from).collect(),
+                "recent_cmds" => s.recent_cmds = v.split('|').filter(|x| !x.is_empty()).map(String::from).collect(),
                 "window" => {
                     let p: Vec<i32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
                     if p.len() == 5 {
@@ -151,6 +155,7 @@ impl Settings {
         out += &format!("panel_terminal={}\n", b(self.panel_terminal));
         out += &format!("terminal_shell={}\n", self.terminal_shell);
         out += &format!("recent={}\n", self.recent.join("|"));
+        out += &format!("recent_cmds={}\n", self.recent_cmds.join("|"));
         if let Some((x, y, w, h, m)) = self.window {
             out += &format!("window={x},{y},{w},{h},{}\n", if m { 1 } else { 0 });
         }
@@ -161,5 +166,11 @@ impl Settings {
         self.recent.retain(|r| !r.eq_ignore_ascii_case(folder));
         self.recent.insert(0, folder.to_string());
         self.recent.truncate(15);
+    }
+
+    pub fn add_recent_cmd(&mut self, title: &str) {
+        self.recent_cmds.retain(|r| r != title);
+        self.recent_cmds.insert(0, title.to_string());
+        self.recent_cmds.truncate(10);
     }
 }

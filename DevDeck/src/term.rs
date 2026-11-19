@@ -229,6 +229,27 @@ pub fn detect_shells() -> Vec<Shell> {
     v
 }
 
+/// Profile name of Claude Code sessions.
+pub const CLAUDE: &str = "Claude Code";
+
+/// The Claude Code CLI as a terminal profile, when it is installed: claude.exe on PATH, else
+/// where the native installer (%USERPROFILE%\.local\bin) or WinGet (its Links folder) put it,
+/// which this process's PATH may lack when Claude Code was installed after DevDeck started;
+/// else npm's claude.cmd.
+pub fn find_claude() -> Option<Shell> {
+    let dir = |var: &str, sub: &[&str]| std::env::var_os(var).map(|v| sub.iter().fold(std::path::PathBuf::from(v), |p, s| p.join(s)));
+    let known = [dir("USERPROFILE", &[".local", "bin"]), dir("LOCALAPPDATA", &["Microsoft", "WinGet", "Links"])];
+    let exe = which("claude.exe").or_else(|| known.into_iter().flatten().map(|d| d.join("claude.exe")).find(|p| p.is_file()));
+    if let Some(p) = exe {
+        return Some(Shell { name: CLAUDE.into(), cmd: format!("\"{}\"", p.display()) });
+    }
+    let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
+    let script = which("claude.cmd").or_else(|| appdata.map(|a| a.join("npm").join("claude.cmd")).filter(|p| p.is_file()))?;
+    // a batch file runs through cmd.exe; /s strips the outer quotes and keeps the quoted path
+    let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
+    Some(Shell { name: CLAUDE.into(), cmd: format!("\"{comspec}\" /d /s /c \"\"{}\"\"", script.display()) })
+}
+
 // ================================================================ emulator
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

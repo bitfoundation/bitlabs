@@ -210,11 +210,23 @@ pub fn install_context_menu() -> Result<(), String> {
             return Err(format!("Unable to write registry key HKCU\\{key}"));
         }
     }
+    refresh_shell_icons();
     Ok(())
 }
 
 pub fn uninstall_context_menu() {
     delete_keys(MENU_KEYS.iter().map(|(k, _)| *k).chain(LEGACY_MENU_KEYS.iter().copied()));
+    refresh_shell_icons();
+}
+
+/// Explorer caches icons by file path, so a rebuilt devdeck.exe at the same path keeps showing
+/// its old icon (on the file and on the context menu entry). Tells the shell that associations
+/// and icons changed, which drops those cached images.
+fn refresh_shell_icons() {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST, std::ptr::null(), std::ptr::null());
+    }
 }
 
 fn delete_keys<'a>(keys: impl Iterator<Item = &'a str>) {

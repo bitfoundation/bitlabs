@@ -467,6 +467,32 @@ impl App {
         }
     }
 
+    /// Ctrl+Shift+A, "Claude Code: Open": focuses the running Claude Code session (the
+    /// terminal tab used last first, then any other, in the editor area or the panel), else
+    /// starts one in an editor tab in the open folder.
+    pub fn open_claude(&mut self) {
+        let running = |t: &TermSession| t.shell.name == term::CLAUDE && t.exited.is_none();
+        let last = self.term_editor_last.and_then(|id| self.term_index(id)).filter(|&i| running(&self.terms[i]));
+        let Some(i) = last.or_else(|| self.terms.iter().position(running)) else {
+            self.new_claude_session();
+            return;
+        };
+        if !self.terms[i].editor {
+            self.reveal_terminal_panel(true);
+        }
+        self.activate_terminal(i);
+        self.resize_terminal();
+        self.invalidate();
+    }
+
+    /// "Claude Code: New Session": starts Claude Code in a new editor tab.
+    pub fn new_claude_session(&mut self) {
+        match term::find_claude() {
+            Some(shell) => self.new_editor_terminal(Some(shell)),
+            None => self.info("Claude Code is not installed. Install it from https://claude.com/claude-code and try again."),
+        }
+    }
+
     pub fn select_shell(&mut self) {
         let current = self.default_shell().name;
         let items = self
@@ -620,6 +646,7 @@ impl App {
             (0x47, true, true) => Some(Cmd::FocusCommit),
             (0x42, true, false) if !alt => Some(Cmd::ToggleSidebar),
             (0x45, true, true) => Some(Cmd::ShowExplorer),
+            (0x41, true, true) => Some(Cmd::ClaudeOpen),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),
             // Ctrl+W / Ctrl+F4 close a terminal tab like any other tab

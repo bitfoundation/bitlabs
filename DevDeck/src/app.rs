@@ -443,6 +443,8 @@ cmds! {
     RenameTerminal => "Terminal: Rename...", "";
     SelectShell => "Terminal: Select Default Profile", "";
     ClearTerminal => "Terminal: Clear", "";
+    ClaudeOpen => "Claude Code: Open", "Ctrl+Shift+A";
+    ClaudeNew => "Claude Code: New Session", "";
     ToggleOutput => "View: Toggle Output", "Ctrl+J";
     CloseEditor => "View: Close Editor", "Ctrl+W";
     CloseOtherEditors => "View: Close Other Editors", "";
@@ -2246,12 +2248,29 @@ impl App {
         self.invalidate();
     }
 
+    /// Command Palette. Like VS Code, the commands run from it last come first ("recently
+    /// used"), then all the others ("other commands"); typing filters both groups in place.
     pub fn palette(&mut self) {
-        let items = COMMANDS.iter().filter(|(c, _, _)| *c != Cmd::Palette).map(|(c, t, k)| PickItem { label: t.to_string(), desc: String::new(), icon: '\0', data: format!("{}", *c as u32), sep: k.to_string() }).collect();
+        let claude = crate::term::find_claude().is_some();
+        let available: Vec<&(Cmd, &str, &str)> = COMMANDS.iter().filter(|(c, _, _)| *c != Cmd::Palette && (claude || !matches!(c, Cmd::ClaudeOpen | Cmd::ClaudeNew))).collect();
+        let recent: Vec<&(Cmd, &str, &str)> = self.st.recent_cmds.iter().filter_map(|r| available.iter().find(|(_, t, _)| *t == r.as_str()).copied()).collect();
+        let item = |&(c, t, k): &(Cmd, &str, &str)| PickItem { label: t.to_string(), desc: String::new(), icon: '\0', data: format!("{}", c as u32), sep: k.to_string() };
+        // the group's name goes on its first row, after the shortcut
+        let group = |it: &mut PickItem, name: &str| it.sep = if it.sep.is_empty() { name.to_string() } else { format!("{}    {name}", it.sep) };
+        let mut items: Vec<PickItem> = recent.iter().map(|e| item(e)).collect();
+        let first_other = items.len();
+        items.extend(available.iter().filter(|e| !recent.contains(e)).map(|e| item(e)));
+        if first_other > 0 {
+            group(&mut items[0], "recently used");
+            if let Some(it) = items.get_mut(first_other) {
+                group(it, "other commands");
+            }
+        }
         self.pick("Type the name of a command to run.", items, |app, it| {
             let id: u32 = it.data.parse().unwrap_or(0);
-            if let Some((c, _, _)) = COMMANDS.iter().find(|(c, _, _)| *c as u32 == id) {
-                let c = *c;
+            if let Some(&(c, t, _)) = COMMANDS.iter().find(|(c, _, _)| *c as u32 == id) {
+                app.st.add_recent_cmd(t);
+                app.st.save();
                 app.exec(c);
             }
         });
@@ -2260,7 +2279,7 @@ impl App {
     pub fn exec(&mut self, c: Cmd) {
         let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
         // the Explorer and the editor work in a folder without a repository too
-        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh);
+        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
             self.info("There are no available repositories. Open a folder first.");
             return;
@@ -2376,6 +2395,8 @@ impl App {
                 }
             }
             Cmd::SelectShell => self.select_shell(),
+            Cmd::ClaudeOpen => self.open_claude(),
+            Cmd::ClaudeNew => self.new_claude_session(),
             Cmd::ClearTerminal => {
                 if let Some(t) = self.term_mut() {
                     t.screen.scrollback.clear();
