@@ -69,7 +69,7 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 
 ## Features
 
-- **Changes view:** Merge / Staged / Changes groups shown as a list or a folder tree (*View as Tree* in the "..." menu, with compact folders and stage / unstage / discard per folder), git status colors and letters, hover actions (open file, discard, stage, unstage), multi-select (Ctrl/Shift), collapsible groups and context menus. You can also reveal a file in Explorer, copy its path, and add it to .gitignore.
+- **Changes view:** Merge / Staged / Changes groups shown as a list or a folder tree (*View as Tree* in the "..." menu, with compact folders and stage / unstage / discard per folder), git status colors and letters, hover actions (open the file in an editor tab, discard, stage, unstage; *Open with Default App* in the context menu opens it outside DevDeck), multi-select (Ctrl/Shift), collapsible groups and context menus. You can also reveal a file in Explorer, copy its path, and add it to .gitignore.
 - **Commit box:** multi-line, `Ctrl+Enter` to commit. The Commit button has a dropdown (Amend, Commit All, Commit & Push, Commit & Sync). It turns into **Sync Changes N↓ M↑** or **Publish Branch** when relevant, or **Continue** during a rebase. Smart commit prompt and undo last commit are included, and the merge message is prefilled during a merge.
 - **Diff viewer:** side-by-side or inline, full file or collapsed to the changes, and F7 / Shift+F7 to move between changes.
   - **Stage / Unstage / Revert Block** buttons appear on hover.
@@ -91,7 +91,11 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
   - Kill / clear / rename terminal. It is restored on startup if it was open, and pressing any key after the shell exits restarts it.
   - Panel size: the maximize button in the panel header (or `Ctrl+Shift+M`) toggles between the normal size and a maximized mode, and the "..." button (or right-clicking the header) picks the mode: Normal, Full Width (spans under the side bar too), Full Height (fills the main area) or Full Screen (covers everything but the status bar). The last maximized mode is remembered.
   - Started lazily: no shell process exists until you open the terminal. With it open and idle the app still uses 0 ms CPU and about 2.7 MB of private memory; the shell's own memory is separate (cmd ~6 MB, bash ~8 MB, Windows PowerShell ~80 MB).
-- **Explorer and file viewer:** the Explorer view (top icon of the activity bar, or `Ctrl+Shift+E`) shows the repository's folder tree with git status colors and letters, folders that contain changes marked with a dot, and ignored files dimmed. Click a folder to expand it; click a file to view it in a read-only text viewer tab (double-click or Enter keeps the tab). The viewer shows UTF-8 and UTF-16 text with line numbers and reloads when the file changes on disk; binary files and files over 16 MB show a message instead. Right-click for Open, Open Changes, Open with Default App, Reveal in File Explorer, Copy Path and Copy Relative Path. *Go to File...* (`Ctrl+P`) picks any tracked or untracked file by name.
+- **Explorer and file editor:** the Explorer view (top icon of the activity bar, or `Ctrl+Shift+E`) shows the repository's folder tree with git status colors and letters, folders that contain changes marked with a dot, and ignored files dimmed. Click a folder to expand it; click a file to open it in a tab (double-click or Enter keeps the tab and moves the keyboard focus to the editor). Right-click for Open, Open Changes, Open with Default App, Reveal in File Explorer, Copy Path and Copy Relative Path. *Go to File...* (`Ctrl+P`) picks any tracked or untracked file by name.
+  - **File operations:** *New File...* and *New Folder...* (title bar buttons or right-click) create an entry in the selected folder (or next to the selected file); like VS Code, a name such as `src/util/a.rs` creates the folders in between. *Rename...* (`F2`) renames a file or folder, and open tabs follow it. *Delete* (`Del`) moves it to the Recycle Bin after a confirmation. Names are checked for characters and names Windows doesn't allow.
+  - **Editing:** files open in an editor with line numbers, a caret and selection (mouse, Shift+arrows, double-click selects a word), Ctrl+arrows by word, smart Home, Tab / Shift+Tab to indent or outdent lines (the indentation style is detected from the file), auto-indent on Enter, cut / copy / paste (the whole line without a selection), undo / redo and a context menu. `Ctrl+S` saves, keeping the file's encoding (UTF-8 with or without BOM, UTF-16 LE / BE) and line endings (CRLF / LF); *File: Save All* and *File: Revert File* are in the Command Palette. The status bar shows the caret position, the encoding and the line endings.
+  - **Unsaved changes:** a modified tab shows a dot instead of its close button. Closing it, closing several tabs, opening another folder or closing the window asks to save, discard or cancel. A clean file reloads when it changes on disk; a modified one is never replaced, and saving it asks before overwriting changes made outside DevDeck.
+  - Binary files and files over 16 MB show a message instead; files that aren't valid UTF-8 / UTF-16 are shown read-only, since saving them would change bytes you didn't edit.
 - **Editor tabs:** diffs, files and commits open in tabs, like VS Code. A single click opens a preview tab (italic title) that the next click replaces; double-clicking the file or commit, double-clicking the tab, or *Keep Open* pins it so it stays. Opening something that already has a tab switches to it. Close a tab with its × button, a middle click, `Ctrl+W` or `Ctrl+F4`; right-click a tab for Close, Close Others, Close to the Right, Close All, Keep Open and Copy Path. Background tabs of working tree changes are refreshed when you switch back to them.
 - **Workbench:** command palette (`Ctrl+Shift+P`), quick pick and input overlays, dialogs, toasts with "Open Git Log", an Output panel with every git command, and a status bar showing branch, sync and in-progress state. Dark and light themes (the native title bar and popup menus follow the theme), a side bar that can sit on the left or the right (*View: Toggle Primary Side Bar Position*, or right-click the activity bar) and can be hidden to give the diff more room (`Ctrl+B`, or click the Source Control icon in the activity bar), per-monitor DPI, and a recent folders list.
 
@@ -114,7 +118,12 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 | `Del` (changes) | Discard |
 | `Ctrl+B` | Toggle side bar |
 | `Ctrl+Shift+E` | Show Explorer |
+| `F2` / `Del` (Explorer) | Rename / delete the selected file or folder |
 | `Ctrl+P` | Go to file |
+| `Ctrl+S` | Save the file in the active tab |
+| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Undo / redo in the editor |
+| `Ctrl+X` / `Ctrl+C` / `Ctrl+V`, `Ctrl+A` | Cut / copy / paste, select all in the editor |
+| `Tab` / `Shift+Tab` (editor) | Indent / outdent |
 | `Ctrl+W` / `Ctrl+F4` | Close editor tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab`, `Ctrl+PageDown` / `Ctrl+PageUp` | Next / previous editor tab |
 | `Ctrl+O` / `Ctrl+R` / `Ctrl+Shift+N` | Open folder / recent / new window |
@@ -140,7 +149,8 @@ src/graph.rs     swimlane graph layout
 src/term.rs      ConPTY backend + VT/xterm emulator
 src/term_ui.rs   terminals in the panel and editor tabs: input, selection, painting
 src/tabs.rs      editor tabs (preview / pinned, open, switch, close)
-src/explorer.rs  Explorer view (folder tree) and the read-only text file viewer
+src/explorer.rs  Explorer view (folder tree), file operations (new, rename, delete), loading files
+src/editor.rs    text editor for files: caret, selection, undo / redo, clipboard, encodings, saving
 src/cli.rs       command line parsing / path resolution
 src/watch.rs     ReadDirectoryChangesW watcher
 src/win.rs       Win32/GDI helpers (fonts, drawing, menus, clipboard, dark mode)

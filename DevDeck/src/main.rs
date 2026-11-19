@@ -8,6 +8,7 @@ mod app;
 mod branches;
 mod cli;
 mod diff;
+mod editor;
 mod explorer;
 mod git;
 mod graph;
@@ -194,6 +195,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 if a.term_has_focus() {
                     a.term_char(wp as u16, alt);
                     true
+                } else if !alt && a.editor_focused() {
+                    a.editor_char(wp as u16);
+                    true
                 } else {
                     false
                 }
@@ -333,6 +337,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             a.edit_brush as LRESULT
         }
         WM_CLOSE => {
+            // files with unsaved changes: ask first; the answer closes the window again
+            let asked = with_app(hwnd, |a| {
+                let dirty = a.dirty_tab_keys();
+                if dirty.is_empty() {
+                    return false;
+                }
+                a.confirm_unsaved(dirty, |a| unsafe {
+                    PostMessageW(a.hwnd, WM_CLOSE, 0, 0);
+                });
+                true
+            })
+            .unwrap_or(false);
+            if asked {
+                return 0;
+            }
             with_app(hwnd, |a| {
                 let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
                 wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;

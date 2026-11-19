@@ -1,10 +1,12 @@
-//! Explorer view (the repository's working tree as a folder tree) and the read-only text
-//! file viewer it opens files in.
+//! Explorer view (the repository's working tree as a folder tree) with file operations
+//! (new file / folder, rename, delete), and the text file view it opens files in (editable,
+//! see `editor.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::app::*;
+use crate::editor::{self, EditState};
 use crate::git::{self, Group, Kind};
 use crate::ui::Menu;
 use crate::win::{self, MenuItem};
@@ -131,7 +133,7 @@ pub fn mtime(root: &Path, rel: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(root.join(rel)).and_then(|m| m.modified()).ok()
 }
 
-/// Builds the read-only text view of a file (or a message when it can't be shown).
+/// Builds the text view of a file (or a message when it can't be shown).
 pub fn load_text(root: &Path, rel: &str) -> MainView {
     let name = short_name(rel).to_string();
     let p = root.join(rel);
@@ -146,11 +148,14 @@ pub fn load_text(root: &Path, rel: &str) -> MainView {
         Ok(b) => b,
         Err(e) => return MainView::Message(name, format!("The file could not be read: {e}")),
     };
-    let Some(text) = decode_text(&bytes) else {
+    let Some((text, enc, lossless)) = editor::decode(&bytes) else {
         return MainView::Message(name, "The file is not displayed because it is binary.".into());
     };
+    let crlf = text.contains("\r\n");
     let lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
-    MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok() })
+    // a file with invalid UTF-8 / UTF-16 is shown read-only: saving would change those bytes
+    let ed = EditState::new(&lines, enc, crlf, lossless);
+    MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok(), ed })
 }
 
 impl App {
@@ -246,6 +251,10 @@ impl App {
         } else {
             self.explorer_select(i);
             self.open_file_viewer(r.path, pin);
+            // Enter / double click: the keys go to the editor
+            if pin {
+                self.focus = Focus::Main;
+            }
         }
     }
 
@@ -273,7 +282,7 @@ impl App {
     pub fn reload_text_view_if_changed(&mut self) {
         let Some(root) = self.root() else { return };
         let MainView::File(f) = &self.view else { return };
-        if f.change.is_some() {
+        if f.change.is_some() || f.ed.dirty() {
             return;
         }
         let rel = f.path.clone();
@@ -320,7 +329,7 @@ impl App {
 
     /// Context menu of Explorer row `i` (usize::MAX: empty space).
     pub fn explorer_menu(&mut self, i: usize, m: &mut Menu) -> Vec<MenuItem> {
-        let mut v = Vec::new();
+        let mut v = vec![m.it("New File...", move |a| a.explorer_new(i, false)), m.it("New Folder...", move |a| a.explorer_new(i, true)), MenuItem::Sep];
         let root = self.root();
         if let (Some(r), Some(root)) = (self.ex.rows.get(i).cloned(), root.clone()) {
             let abs = root.join(&r.path).display().to_string();
@@ -348,10 +357,206 @@ impl App {
             v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &a3)));
             v.push(m.it("Copy Relative Path", move |a| win::set_clipboard(a.hwnd, &rel)));
             v.push(MenuItem::Sep);
+            v.push(m.it("Rename...\tF2", move |a| a.explorer_rename(i)));
+            v.push(m.it("Delete\tDel", move |a| a.explorer_delete(i)));
+            v.push(MenuItem::Sep);
         }
         v.push(m.it("Refresh Explorer", |a| a.refresh()));
         v.push(m.it("Collapse Folders in Explorer", |a| a.explorer_collapse_all()));
         v
+    }
+}
+
+/// Checks a name typed for a new file / folder ('/' separated segments allowed when
+/// `nested`); returns it with '\' turned into '/', or the problem.
+pub fn validate_name(input: &str, nested: bool) -> Result<String, String> {
+    let name = input.trim().replace('\\', "/");
+    let name = name.trim_matches('/');
+    if name.is_empty() {
+        return Err("A file or folder name must be provided.".into());
+    }
+    if !nested && name.contains('/') {
+        return Err("The name can't contain '/' or '\\'.".into());
+    }
+    for seg in name.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(format!("The name '{name}' is not valid."));
+        }
+        if seg.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20) {
+            return Err(format!("The name '{seg}' is not valid: it can't contain < > : \" | ? * or control characters."));
+        }
+        if seg.ends_with('.') || seg.ends_with(' ') {
+            return Err(format!("The name '{seg}' is not valid: it can't end with a dot or a space."));
+        }
+        let stem = seg.split('.').next().unwrap_or("").trim_end().to_ascii_uppercase();
+        let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit());
+        if reserved {
+            return Err(format!("The name '{seg}' is reserved by Windows."));
+        }
+        if seg.eq_ignore_ascii_case(".git") {
+            return Err("The name '.git' is reserved by Git.".into());
+        }
+    }
+    Ok(name.to_string())
+}
+
+/// Replaces the `old` prefix of path `p` (the path itself or something inside it) with `new`.
+fn rebase_path(p: &str, old: &str, new: &str) -> Option<String> {
+    if p == old {
+        Some(new.to_string())
+    } else {
+        p.strip_prefix(old).and_then(|rest| rest.strip_prefix('/')).map(|rest| join(new, rest))
+    }
+}
+
+impl App {
+    /// Folder that new files go into for Explorer row `i` (usize::MAX: the root): the
+    /// folder itself, or a file's parent.
+    fn explorer_dir_of(&self, i: usize) -> String {
+        match self.ex.rows.get(i) {
+            Some(r) if r.dir => r.path.clone(),
+            Some(r) => r.path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default(),
+            None => String::new(),
+        }
+    }
+
+    /// Row the Explorer commands act on: the selected one, else the root.
+    pub fn explorer_target(&self) -> usize {
+        self.ex.sel_index().unwrap_or(usize::MAX)
+    }
+
+    /// Expands the folders down to `rel`, selects it and scrolls it into view.
+    fn explorer_reveal(&mut self, rel: &str) {
+        let mut p = rel;
+        while let Some((parent, _)) = p.rsplit_once('/') {
+            self.ex.open.insert(parent.to_string());
+            p = parent;
+        }
+        self.ex.sel = Some(rel.to_string());
+        self.rebuild_explorer();
+        if let Some(i) = self.ex.sel_index() {
+            self.reveal_row(Area::Explorer, i);
+        }
+    }
+
+    /// "New File..." / "New Folder..." in the folder of row `i`. Like VS Code, a name with
+    /// '/' creates the folders in between.
+    pub fn explorer_new(&mut self, i: usize, folder: bool) {
+        if self.root().is_none() {
+            return;
+        }
+        if !self.explorer_active() {
+            self.set_side_view(1);
+        }
+        let dir = self.explorer_dir_of(i);
+        let prompt = match (folder, dir.is_empty()) {
+            (false, true) => "New file name".to_string(),
+            (true, true) => "New folder name".to_string(),
+            (false, false) => format!("New file name in '{dir}'"),
+            (true, false) => format!("New folder name in '{dir}'"),
+        };
+        self.input(&prompt, "", move |a, name| {
+            let Some(root) = a.root() else { return };
+            let name = match validate_name(&name, true) {
+                Ok(n) => n,
+                Err(e) => return a.error(e),
+            };
+            let rel = join(&dir, &name);
+            let abs = root.join(&rel);
+            if std::fs::symlink_metadata(&abs).is_ok() {
+                return a.error(format!("A file or folder '{name}' already exists at this location. Choose a different name."));
+            }
+            let made = if folder {
+                std::fs::create_dir_all(&abs)
+            } else {
+                abs.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::OpenOptions::new().write(true).create_new(true).open(&abs).map(|_| ()))
+            };
+            if let Err(e) = made {
+                return a.error(format!("Unable to create '{rel}': {e}"));
+            }
+            a.explorer_reveal(&rel);
+            if !folder {
+                a.open_file_viewer(rel, true);
+                a.focus = Focus::Main;
+            }
+            a.refresh();
+        });
+    }
+
+    /// "Rename..." (F2) of row `i`. Open tabs follow the renamed file or folder.
+    pub fn explorer_rename(&mut self, i: usize) {
+        let Some(r) = self.ex.rows.get(i).cloned() else { return };
+        let parent = r.path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default();
+        let old = r.path.clone();
+        self.input(&format!("New name for '{}'", r.name), &r.name, move |a, name| {
+            let Some(root) = a.root() else { return };
+            let name = match validate_name(&name, false) {
+                Ok(n) => n,
+                Err(e) => return a.error(e),
+            };
+            let new = join(&parent, &name);
+            if new == old {
+                return;
+            }
+            // a case-only rename is allowed (the same file on Windows)
+            if !new.eq_ignore_ascii_case(&old) && std::fs::symlink_metadata(root.join(&new)).is_ok() {
+                return a.error(format!("A file or folder '{name}' already exists at this location. Choose a different name."));
+            }
+            if let Err(e) = std::fs::rename(root.join(&old), root.join(&new)) {
+                return a.error(format!("Unable to rename '{old}': {e}"));
+            }
+            a.ex.open = a.ex.open.iter().map(|p| rebase_path(p, &old, &new).unwrap_or_else(|| p.clone())).collect();
+            a.renamed_in_tabs(&old, &new);
+            a.explorer_reveal(&new);
+            a.refresh();
+        });
+    }
+
+    /// Points the file tabs under `old` to `new` (unsaved edits are kept).
+    fn renamed_in_tabs(&mut self, old: &str, new: &str) {
+        for i in 0..self.tabs.len() {
+            let v = if i == self.tab_active { &mut self.view } else { &mut self.tabs[i].view };
+            if let MainView::File(f) = v {
+                if f.change.is_some() {
+                    continue;
+                }
+                if let Some(p) = rebase_path(&f.path, old, new) {
+                    f.title = short_name(&p).to_string();
+                    f.path = p.clone();
+                    self.tabs[i].key = format!("file:{p}");
+                }
+            }
+        }
+        self.invalidate();
+    }
+
+    /// "Delete" (Del) of row `i`: moves it to the Recycle Bin after a confirmation and
+    /// closes its tabs.
+    pub fn explorer_delete(&mut self, i: usize) {
+        let Some(r) = self.ex.rows.get(i).cloned() else { return };
+        let message = if r.dir { format!("Are you sure you want to delete '{}' and its contents?", r.name) } else { format!("Are you sure you want to delete '{}'?", r.name) };
+        let detail = if r.dir { "You can restore this folder from the Recycle Bin." } else { "You can restore this file from the Recycle Bin." };
+        self.confirm(&message, detail, &["Move to Recycle Bin"], move |a, _| {
+            let Some(root) = a.root() else { return };
+            if !recycle(&root.join(&r.path)) {
+                return a.error(format!("Unable to delete '{}'.", r.path));
+            }
+            // close the tabs of the deleted files; ones with unsaved changes stay open (saving
+            // creates the file again), like VS Code
+            for k in (0..a.tabs.len()).rev() {
+                let gone = matches!(a.tab_view(k), MainView::File(f) if f.change.is_none() && rebase_path(&f.path, &r.path, "").is_some());
+                if gone && !a.tab_dirty(k) {
+                    a.close_tab_now(k);
+                }
+            }
+            let prefix = format!("{}/", r.path);
+            a.ex.open.retain(|p| p != &r.path && !p.starts_with(&prefix));
+            // select the row that takes its place
+            let next = a.ex.rows.iter().skip(i + 1).find(|x| !x.path.starts_with(&prefix)).or_else(|| if i > 0 { a.ex.rows.get(i - 1) } else { None }).map(|x| x.path.clone());
+            a.ex.sel = next;
+            a.rebuild_explorer();
+            a.refresh();
+        });
     }
 }
 
@@ -384,6 +589,24 @@ mod tests {
         let paths: Vec<(&str, u8)> = rows.iter().map(|r| (r.path.as_str(), r.depth)).collect();
         assert_eq!(paths, [("src", 0), ("src/inner", 1), ("src/inner/x.rs", 2), ("src/main.rs", 1), ("A.md", 0), ("b.txt", 0)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_new_names() {
+        assert_eq!(validate_name(" src\\a.rs ", true).as_deref(), Ok("src/a.rs"));
+        assert!(validate_name("src/a.rs", false).is_err());
+        assert!(validate_name("", true).is_err());
+        assert!(validate_name("a/../b", true).is_err());
+        assert!(validate_name("what?.txt", false).is_err());
+        assert!(validate_name("name.", false).is_err());
+        assert!(validate_name("nul.txt", false).is_err());
+        assert!(validate_name("COM1", false).is_err());
+        assert!(validate_name("COMMON.md", false).is_ok());
+        assert!(validate_name(".GIT", false).is_err());
+        assert_eq!(rebase_path("src/a/b.rs", "src/a", "lib"), Some("lib/b.rs".into()));
+        assert_eq!(rebase_path("src/ab.rs", "src/a", "lib"), None);
+        assert_eq!(rebase_path("src/a", "src/a", "lib"), Some("lib".into()));
+        assert_eq!(rebase_path("src/a/b.rs", "src/a", ""), Some("b.rs".into()));
     }
 
     #[test]

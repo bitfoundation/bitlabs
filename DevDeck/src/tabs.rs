@@ -159,9 +159,23 @@ impl App {
         self.reload_text_view_if_changed();
     }
 
-    /// Closes tab `i`; closing a terminal tab kills its terminal (unless it was just moved
-    /// to the panel).
+    /// Closes tab `i`, asking first when its file has unsaved changes.
     pub fn close_tab(&mut self, i: usize) {
+        if self.tab_dirty(i) {
+            let key = self.tabs[i].key.clone();
+            self.confirm_unsaved(vec![key.clone()], move |a| {
+                if let Some(i) = a.tabs.iter().position(|t| t.key == key) {
+                    a.close_tab_now(i);
+                }
+            });
+            return;
+        }
+        self.close_tab_now(i);
+    }
+
+    /// Closes tab `i` (unsaved changes are dropped); closing a terminal tab kills its
+    /// terminal (unless it was just moved to the panel).
+    pub fn close_tab_now(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
@@ -206,8 +220,23 @@ impl App {
         }
     }
 
+    /// Keys of the dirty tabs among `range`.
+    fn dirty_in(&self, range: impl Iterator<Item = usize>) -> Vec<String> {
+        range.filter(|&i| self.tab_dirty(i)).map(|i| self.tabs[i].key.clone()).collect()
+    }
+
     pub fn close_other_tabs(&mut self, keep: usize) {
         if keep >= self.tabs.len() {
+            return;
+        }
+        let dirty = self.dirty_in((0..self.tabs.len()).filter(|&i| i != keep));
+        if !dirty.is_empty() {
+            let key = self.tabs[keep].key.clone();
+            self.confirm_unsaved(dirty, move |a| {
+                if let Some(k) = a.tabs.iter().position(|t| t.key == key) {
+                    a.close_other_tabs(k);
+                }
+            });
             return;
         }
         self.activate_tab(keep);
@@ -222,6 +251,16 @@ impl App {
         if of >= self.tabs.len() {
             return;
         }
+        let dirty = self.dirty_in(of + 1..self.tabs.len());
+        if !dirty.is_empty() {
+            let key = self.tabs[of].key.clone();
+            self.confirm_unsaved(dirty, move |a| {
+                if let Some(k) = a.tabs.iter().position(|t| t.key == key) {
+                    a.close_tabs_right(k);
+                }
+            });
+            return;
+        }
         if self.tab_active > of {
             self.activate_tab(of);
         }
@@ -231,6 +270,11 @@ impl App {
     }
 
     pub fn close_all_tabs(&mut self) {
+        let dirty = self.dirty_in(0..self.tabs.len());
+        if !dirty.is_empty() {
+            self.confirm_unsaved(dirty, |a| a.close_all_tabs());
+            return;
+        }
         self.tabs.clear();
         self.tab_active = 0;
         self.view = MainView::Empty;

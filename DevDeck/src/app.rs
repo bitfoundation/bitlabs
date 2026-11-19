@@ -148,6 +148,8 @@ pub struct FileView {
     pub change: Option<FileChange>,
     /// Modification time when loaded (text viewer: reload when the file changes).
     pub mtime: Option<std::time::SystemTime>,
+    /// Caret, selection, undo history and save format of an editable file.
+    pub ed: crate::editor::EditState,
 }
 
 pub struct CommitView {
@@ -286,6 +288,8 @@ pub enum Hit {
     DiffRow(usize),
     DiffBlock(usize, u8),
     DiffBack,
+    /// The text of an editable file.
+    EditorText,
     CommitFile(usize),
     Conflict(usize, u8),
     Thumb(Area),
@@ -311,6 +315,7 @@ pub enum Drag {
     Thumb(Area, i32, i32),
     DiffSelect,
     TermSelect,
+    EditSelect,
 }
 
 #[derive(Clone, Copy)]
@@ -434,6 +439,13 @@ cmds! {
     ShowExplorer => "View: Show Explorer", "Ctrl+Shift+E";
     ShowScm => "View: Show Source Control", "";
     GotoFile => "Go to File...", "Ctrl+P";
+    Save => "File: Save", "Ctrl+S";
+    SaveAll => "File: Save All", "";
+    RevertFile => "File: Revert File", "";
+    ExplorerNewFile => "Explorer: New File...", "";
+    ExplorerNewFolder => "Explorer: New Folder...", "";
+    ExplorerRename => "Explorer: Rename...", "F2";
+    ExplorerDelete => "Explorer: Delete", "Del";
     ExplorerCollapse => "Explorer: Collapse Folders in Explorer", "";
     ToggleSidebarPos => "View: Toggle Primary Side Bar Position", "";
     ToggleTreeView => "Source Control: Toggle View as Tree / List", "";
@@ -692,6 +704,16 @@ impl App {
     // --------------------------------------------------------------- repo
 
     pub fn open_repo(&mut self, folder: &Path) {
+        // the open tabs go away: ask about unsaved files first
+        let dirty = self.dirty_tab_keys();
+        if !dirty.is_empty() {
+            let f = folder.to_path_buf();
+            self.confirm_unsaved(dirty, move |a| {
+                a.open_repo(&f);
+                a.layout();
+            });
+            return;
+        }
         let Some(root) = git::toplevel(folder) else {
             let f = folder.display().to_string();
             self.repo = None;
@@ -846,11 +868,27 @@ impl App {
                         t.view = view;
                         continue;
                     }
-                    if !keep_scroll {
+                    let mut view = view;
+                    if keep_scroll {
+                        if let (MainView::File(old), MainView::File(new)) = (&self.view, &mut view) {
+                            if old.path == new.path && old.ed.editable {
+                                // a reload never replaces unsaved edits (Save asks before overwriting)
+                                if old.ed.dirty() {
+                                    continue;
+                                }
+                                if new.ed.editable {
+                                    let clamp = |p: crate::editor::Pos| {
+                                        let l = p.0.min(new.lines.len() - 1);
+                                        (l, p.1.min(crate::editor::char_len(&new.lines[l])))
+                                    };
+                                    new.ed.cur = clamp(old.ed.cur);
+                                    new.ed.anchor = clamp(old.ed.anchor);
+                                }
+                            }
+                        }
+                    } else {
                         self.scroll[Area::Main as usize] = 0;
                         self.hscroll = 0;
-                    } else if let (MainView::Diff(old), MainView::Diff(_)) = (&self.view, &view) {
-                        let _ = old;
                     }
                     let prev_sel = if let MainView::Diff(d) = &self.view { d.sel } else { None };
                     self.view = view;
@@ -2328,6 +2366,21 @@ impl App {
             }
             Cmd::GotoFile => self.goto_file(),
             Cmd::ExplorerCollapse => self.explorer_collapse_all(),
+            Cmd::Save => self.save_active(),
+            Cmd::SaveAll => self.save_all(),
+            Cmd::RevertFile => self.revert_file(),
+            Cmd::ExplorerNewFile => self.explorer_new(self.explorer_target(), false),
+            Cmd::ExplorerNewFolder => self.explorer_new(self.explorer_target(), true),
+            Cmd::ExplorerRename => {
+                if let Some(i) = self.ex.sel_index() {
+                    self.explorer_rename(i);
+                }
+            }
+            Cmd::ExplorerDelete => {
+                if let Some(i) = self.ex.sel_index() {
+                    self.explorer_delete(i);
+                }
+            }
             Cmd::ClearOutput => {
                 git::clear_log();
             }
@@ -2398,9 +2451,12 @@ pub fn sanitize_branch(s: &str) -> String {
     out.trim_matches(|c| c == '/' || c == '.' || c == '-').trim_end_matches(".lock").to_string()
 }
 
-fn recycle(path: &Path) {
+/// Moves a file or folder to the Recycle Bin (deletes it when that isn't possible).
+/// Returns false when it still exists afterwards.
+pub fn recycle(path: &Path) -> bool {
     use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW};
-    let mut from: Vec<u16> = path.display().to_string().encode_utf16().collect();
+    // the shell wants backslashes
+    let mut from: Vec<u16> = path.display().to_string().replace('/', "\\").encode_utf16().collect();
     from.push(0);
     from.push(0);
     let mut op = SHFILEOPSTRUCTW {
@@ -2415,8 +2471,13 @@ fn recycle(path: &Path) {
     };
     let r = unsafe { SHFileOperationW(&mut op) };
     if r != 0 {
-        let _ = std::fs::remove_file(path);
+        if path.is_dir() {
+            let _ = std::fs::remove_dir_all(path);
+        } else {
+            let _ = std::fs::remove_file(path);
+        }
     }
+    std::fs::symlink_metadata(path).is_err()
 }
 
 pub fn diff_view_from(text: &str, f: &FileChange, kind: DiffKind, inline: bool, title: &str) -> MainView {
@@ -2444,7 +2505,7 @@ pub fn build_change_view(root: &Path, f: &FileChange, ctx: &str, inline: bool) -
             let lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
             let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
             let conflicts = diff::parse_conflicts(&refs);
-            MainView::File(FileView { title: format!("{name} (Merge Conflicts)"), path: f.path.clone(), lines, conflicts, change: Some(f.clone()), mtime: None })
+            MainView::File(FileView { title: format!("{name} (Merge Conflicts)"), path: f.path.clone(), lines, conflicts, change: Some(f.clone()), mtime: None, ed: Default::default() })
         }
         (Group::Changes, Kind::Untracked) => {
             let o = git::run(root, &["diff", "--no-index", "--no-color", "--no-ext-diff", ctx, "--", "/dev/null", &f.path], None, false);

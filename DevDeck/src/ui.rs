@@ -39,6 +39,10 @@ const I_DOC: char = '\u{E8A5}';
 const I_SC: char = '\u{E8D4}';
 const I_SEARCH: char = '\u{E721}';
 const I_FOLDER: char = '\u{E8B7}';
+const I_NEW_FILE: char = '\u{E8A5}';
+const I_NEW_FOLDER: char = '\u{E8F4}';
+/// Unsaved changes marker on an editor tab.
+const I_DIRTY: char = '\u{25CF}';
 /// Indent per tree level in the Changes view (unscaled pixels).
 const TREE_INDENT: i32 = 12;
 const I_TAG: char = '\u{E8EC}';
@@ -382,13 +386,13 @@ impl App {
         *s = (*s).clamp(0, max);
     }
 
-    fn scroll_by(&mut self, a: Area, dy: i32) {
+    pub fn scroll_by(&mut self, a: Area, dy: i32) {
         self.scroll[a as usize] += dy;
         self.clamp_scroll(a);
         self.invalidate();
     }
 
-    fn reveal_row(&mut self, a: Area, row: usize) {
+    pub fn reveal_row(&mut self, a: Area, row: usize) {
         let rh22 = if a == Area::Main { self.line_h() } else { self.s(22) };
         let top = row as i32 * rh22;
         let view = rh(&self.area_rect(a));
@@ -577,17 +581,16 @@ impl App {
         let edge = if self.st.sidebar_right { l.sidebar.left - 1 } else { l.sidebar.right };
         g.vline(edge, l.sidebar.top, l.sidebar.bottom, self.t.border);
         self.hits.push((rect(edge - self.s(2), l.sidebar.top, edge + self.s(3), l.sidebar.bottom), Hit::Sash(Sash::Sidebar)));
-        g.text_in(&rect(l.title.left + self.s(20), l.title.top, l.title.right - self.s(80), l.title.bottom), "EXPLORER", self.fonts.cap, self.t.fg, DT_LINE);
         let bs = self.s(22);
         let y = l.title.top + (rh(&l.title) - bs) / 2;
         let mut x = l.title.right - self.s(8) - bs;
         if self.repo.is_some() {
-            self.icon_button(g, xywh(x, y, bs, bs), '\u{E70E}', Hit::Cmd(Cmd::ExplorerCollapse), true);
-            x -= bs + self.s(2);
-            self.icon_button(g, xywh(x, y, bs, bs), I_REFRESH, Hit::Cmd(Cmd::Refresh), true);
-            x -= bs + self.s(2);
-            self.icon_button(g, xywh(x, y, bs, bs), I_SEARCH, Hit::Cmd(Cmd::GotoFile), true);
+            for (glyph, c) in [('\u{E70E}', Cmd::ExplorerCollapse), (I_REFRESH, Cmd::Refresh), (I_NEW_FOLDER, Cmd::ExplorerNewFolder), (I_NEW_FILE, Cmd::ExplorerNewFile), (I_SEARCH, Cmd::GotoFile)] {
+                self.icon_button(g, xywh(x, y, bs, bs), glyph, Hit::Cmd(c), true);
+                x -= bs + self.s(2);
+            }
         }
+        g.text_in(&rect(l.title.left + self.s(20), l.title.top, x + bs, l.title.bottom), "EXPLORER", self.fonts.cap, self.t.fg, DT_LINE);
         let hh = l.explorer_header;
         self.hits.push((hh, Hit::ExplorerHeader));
         g.icon(&xywh(hh.left + self.s(2), hh.top, self.s(20), rh(&hh)), I_DOWN, self.fonts.icon_small, self.t.fg);
@@ -864,7 +867,7 @@ impl App {
         }
     }
 
-    fn main_has_focus(&self) -> bool {
+    pub fn main_has_focus(&self) -> bool {
         unsafe { GetFocus() == self.hwnd }
     }
 
@@ -1233,6 +1236,7 @@ impl App {
                 g.text_in(&rect(r.left, r.top + self.s(40), r.right, r.bottom), &m, self.fonts.ui, self.t.fg_dim, DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
             }
             MainView::Diff(_) => self.paint_diff(g),
+            MainView::File(f) if f.ed.editable => self.paint_editor(g),
             MainView::File(_) => self.paint_file(g),
             MainView::Commit(_) => self.paint_commit_view(g),
             MainView::Terminal(id) => {
@@ -1298,14 +1302,20 @@ impl App {
             let fg = if active { self.t.fg_strong } else { self.t.fg_dim };
             let font = if *preview { self.fonts.ui_italic } else { self.fonts.ui };
             g.text_in(&rect(tr.left + self.s(30), tr.top, tr.right - self.s(30), tr.bottom), title, font, fg, DT_LINE);
-            // close button: always on the active tab, on hover for the others
-            if active || hovered {
+            // close button: always on the active tab, on hover for the others; a tab with
+            // unsaved changes shows a dot instead until the button is hovered
+            let dirty = self.tab_dirty(i);
+            if active || hovered || dirty {
                 let cr = xywh(tr.right - self.s(26), tr.top + (rh(&tr) - self.s(20)) / 2, self.s(20), self.s(20));
                 let hit = Hit::TabClose(i);
                 if self.hover == hit {
                     g.round_rect(&cr, self.s(5), self.t.toolbar_hover, None);
                 }
-                g.icon(&cr, I_CLOSE, self.fonts.icon_small, fg);
+                if dirty && self.hover != hit {
+                    g.text_in(&cr, &I_DIRTY.to_string(), self.fonts.ui, fg, DT_LINE | DT_CENTER);
+                } else {
+                    g.icon(&cr, I_CLOSE, self.fonts.icon_small, fg);
+                }
                 self.hits.push((cr, hit));
             }
             x = tr.right;
@@ -1751,15 +1761,32 @@ impl App {
         }
         // right side
         let mut rx = r.right - self.s(8);
-        let right_items: Vec<(String, Hit)> = vec![("Output".into(), Hit::Cmd(Cmd::ToggleOutput)), (if self.t.dark { "\u{263D} Dark".into() } else { "\u{2600} Light".into() }, Hit::Cmd(Cmd::ToggleTheme))];
+        let mut right_items: Vec<(String, Hit)> = vec![("Output".into(), Hit::Cmd(Cmd::ToggleOutput)), (if self.t.dark { "\u{263D} Dark".into() } else { "\u{2600} Light".into() }, Hit::Cmd(Cmd::ToggleTheme))];
+        if let MainView::File(f) = &self.view {
+            if f.ed.editable {
+                let (l, c) = f.ed.cur;
+                let col = crate::editor::vcol(&f.lines[l.min(f.lines.len() - 1)], c) + 1;
+                let pos = match f.sel() {
+                    Some((a, b)) => format!("Ln {}, Col {} ({} selected)", l + 1, col, crate::editor::range_len(&f.lines, a, b)),
+                    None => format!("Ln {}, Col {}", l + 1, col),
+                };
+                right_items.push((if f.ed.crlf { "CRLF" } else { "LF" }.into(), Hit::None));
+                right_items.push((f.ed.enc.label().into(), Hit::None));
+                right_items.push((pos, Hit::None));
+            } else if f.change.is_none() {
+                right_items.push(("Read-only".into(), Hit::None));
+            }
+        }
         for (text, hit) in right_items {
             let tw = g.text_w(&text, self.fonts.small) + self.s(12);
             let rr = rect(rx - tw, r.top + 1, rx, r.bottom);
-            if self.hover == hit {
+            if hit != Hit::None && self.hover == hit {
                 g.fill(&rr, self.t.toolbar_hover);
             }
             g.text_in(&rr, &text, self.fonts.small, self.t.fg, DT_LINE | DT_CENTER);
-            self.hits.push((rr, hit));
+            if hit != Hit::None {
+                self.hits.push((rr, hit));
+            }
             rx = rr.left;
         }
         if let Some(rp) = &self.repo {
@@ -1993,6 +2020,7 @@ impl App {
                         self.invalidate();
                     }
                 }
+                Drag::EditSelect => self.editor_drag(x, y),
                 Drag::DiffSelect => {
                     if let Hit::DiffRow(r) = self.hit_test(x, y) {
                         if let MainView::Diff(d) = &mut self.view {
@@ -2021,7 +2049,7 @@ impl App {
         match self.hit_test(x, y) {
             Hit::Sash(Sash::Sidebar) => Some(IDC_SIZEWE),
             Hit::Sash(_) => Some(IDC_SIZENS),
-            Hit::TermBody | Hit::EditorTerm => Some(IDC_IBEAM),
+            Hit::TermBody | Hit::EditorTerm | Hit::EditorText => Some(IDC_IBEAM),
             _ => None,
         }
     }
@@ -2128,12 +2156,30 @@ impl App {
         }
     }
 
+    /// Opens the working tree version of the files in editor tabs (the last one active), like
+    /// VS Code's "Open File". Files that no longer exist on disk (deletions) are skipped.
+    fn open_files_in_editor(&mut self, files: Vec<git::FileChange>) {
+        let Some(r) = self.root() else { return };
+        let (exist, gone): (Vec<_>, Vec<_>) = files.into_iter().partition(|f| r.join(&f.path).is_file());
+        if exist.is_empty() {
+            if let Some(f) = gone.first() {
+                self.error(format!("'{}' no longer exists on disk.", f.path));
+            }
+            return;
+        }
+        for f in exist {
+            self.open_file_viewer(f.path, true);
+        }
+        self.focus = Focus::Main;
+    }
+
     fn file_action(&mut self, files: Vec<git::FileChange>, a: u8) {
         match a {
             0 => self.stage(files),
             1 => self.unstage(files),
             2 => self.discard(files),
-            3 => {
+            3 => self.open_files_in_editor(files),
+            4 => {
                 if let Some(r) = self.root() {
                     for f in files {
                         win::shell_open(&r.join(&f.path).display().to_string());
@@ -2289,6 +2335,7 @@ impl App {
                 }
             }
             Hit::DiffBack => self.go_back(),
+            Hit::EditorText => self.editor_click(x, y, shift),
             Hit::CommitFile(i) => self.open_commit_file(i),
             Hit::Conflict(line, w) => self.resolve_conflict(line, w),
             Hit::PickRow(k) => self.accept_overlay(Some(k)),
@@ -2404,7 +2451,11 @@ impl App {
         match self.hit_test(x, y) {
             // like VS Code: the first click opened a preview tab, the double click keeps it open
             Hit::FileRow(_) | Hit::GraphRow(_) | Hit::Tab(_) => self.pin_tab(self.tab_active),
-            Hit::ExplorerRow(i) if self.ex.rows.get(i).map(|r| !r.dir).unwrap_or(false) => self.pin_tab(self.tab_active),
+            Hit::ExplorerRow(i) if self.ex.rows.get(i).map(|r| !r.dir).unwrap_or(false) => {
+                self.pin_tab(self.tab_active);
+                self.focus = Focus::Main;
+            }
+            Hit::EditorText => self.editor_dblclick(x, y),
             Hit::CommitFile(i) => {
                 self.open_commit_file(i);
                 self.pin_tab(self.tab_active);
@@ -2560,6 +2611,20 @@ impl App {
             self.show_menu(x, y, items, m);
             return;
         }
+        if hit == Hit::EditorText {
+            self.focus = Focus::Main;
+            // like VS Code, a right click outside the selection moves the caret there
+            if let Some(p) = self.editor_pos_at(x, y) {
+                if let MainView::File(f) = &mut self.view {
+                    if !f.sel().is_some_and(|(a, b)| p >= a && p <= b) {
+                        f.move_to(p, false);
+                    }
+                }
+            }
+            let items = self.editor_menu(&mut m);
+            self.show_menu(x, y, items, m);
+            return;
+        }
         if self.repo.is_some() && (contains(&self.l.explorer, x, y) || contains(&self.l.explorer_header, x, y)) {
             let i = match hit {
                 Hit::ExplorerRow(i) => {
@@ -2590,10 +2655,11 @@ impl App {
                 let group = first.group;
                 let abs = root.join(&first.path).display().to_string();
                 let rel = first.path.clone();
-                let (f1, f2, f3, f4, f5) = (files.clone(), files.clone(), files.clone(), files.clone(), files.clone());
+                let (f0, f1, f2, f3, f4, f5) = (files.clone(), files.clone(), files.clone(), files.clone(), files.clone(), files.clone());
                 let mut v = vec![
                     m.it_if("Open Changes", files.len() == 1, move |a| a.open_change(first, true)),
                     m.it("Open File", move |a| a.file_action(f1, 3)),
+                    m.it("Open with Default App", move |a| a.file_action(f0, 4)),
                     MenuItem::Sep,
                 ];
                 match group {
@@ -2767,6 +2833,7 @@ impl App {
             (0x42, true, false) => Some(Cmd::ToggleSidebar),                 // Ctrl+B
             (0x45, true, true) => Some(Cmd::ShowExplorer),                   // Ctrl+Shift+E
             (0x50, true, false) => Some(Cmd::GotoFile),                      // Ctrl+P
+            (0x53, true, false) => Some(Cmd::Save),                          // Ctrl+S
             (0x57, true, false) | (0x73, true, false) => Some(Cmd::CloseEditor), // Ctrl+W, Ctrl+F4
             (0x09, true, false) | (0x22, true, false) => Some(Cmd::NextEditor), // Ctrl+Tab, Ctrl+PageDown
             (0x09, true, true) | (0x21, true, false) => Some(Cmd::PrevEditor), // Ctrl+Shift+Tab, Ctrl+PageUp
@@ -2860,6 +2927,9 @@ impl App {
         if self.term_has_focus() {
             let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
             self.term_key(vk, ctrl, shift, alt);
+            return;
+        }
+        if self.editor_focused() && self.editor_key(vk, ctrl, shift) {
             return;
         }
         if self.global_key(vk, ctrl, shift) {
@@ -3002,6 +3072,8 @@ impl App {
                 }
             }
             0x27 => self.toggle_explorer_dir(c, Some(true)),
+            0x71 if cur.is_some() => self.explorer_rename(c),
+            0x2E if cur.is_some() => self.explorer_delete(c),
             _ => {}
         }
         if let Some(i) = self.ex.sel_index() {
