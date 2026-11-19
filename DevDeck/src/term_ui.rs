@@ -165,7 +165,7 @@ impl App {
 
     /// Starts `shell` on a new pseudo console sized to the area it will be shown in.
     fn spawn_session(&mut self, shell: Shell, editor: bool) -> TermSession {
-        let cwd = self.root().or_else(|| self.pending_init.clone()).or_else(|| std::env::var_os("USERPROFILE").map(Into::into)).unwrap_or_else(|| ".".into());
+        let cwd = self.folder().or_else(|| std::env::var_os("USERPROFILE").map(Into::into)).unwrap_or_else(|| ".".into());
         let (cols, rows) = self.grid_size_of(editor).unwrap_or((80, 24));
         let id = self.term_next_id;
         self.term_next_id += 1;
@@ -209,6 +209,11 @@ impl App {
 
     /// Opens (or activates) the editor tab of terminal `id` and focuses it.
     fn show_editor_terminal(&mut self, id: u64) {
+        // Ctrl+Alt+` goes back to the tab that was shown before the first terminal tab
+        if !matches!(self.view, MainView::Terminal(_)) {
+            self.term_editor_prev = self.tabs.get(self.tab_active).map(|t| t.key.clone());
+        }
+        self.term_editor_last = Some(id);
         // the editor area is hidden while the panel covers it
         if matches!(self.panel_mode(), PanelMode::FullHeight | PanelMode::FullScreen) {
             self.st.panel_mode = PanelMode::Normal as u8;
@@ -225,6 +230,37 @@ impl App {
         self.layout();
         self.resize_terminal();
         self.invalidate();
+    }
+
+    /// Ctrl+Alt+`, the editor area's Ctrl+`: focuses the terminal tab that is shown, else
+    /// brings back the terminal tab used last (or the first one), else opens a new terminal
+    /// in the editor area. When a terminal tab already has focus it goes back to the tab that
+    /// was active before, or to the side bar.
+    pub fn toggle_editor_terminal(&mut self) {
+        if let Some(i) = self.editor_term() {
+            if self.focus != Focus::Terminal || !self.term_editor_focus {
+                let id = self.terms[i].id;
+                self.show_editor_terminal(id);
+                return;
+            }
+            let back = self.term_editor_prev.clone().and_then(|k| self.tabs.iter().position(|t| t.key == k));
+            match back {
+                Some(ti) if ti != self.tab_active => self.activate_tab(ti),
+                _ if self.st.sidebar_visible => {
+                    self.focus = Focus::Changes;
+                    self.invalidate();
+                }
+                _ => {}
+            }
+            return;
+        }
+        let in_tab = |a: &App, id: u64| a.terms.iter().any(|t| t.id == id && t.editor) && a.tabs.iter().any(|t| t.key == term_key(id));
+        let last = self.term_editor_last.filter(|&id| in_tab(self, id));
+        let first = || self.tabs.iter().find_map(|t| t.key.strip_prefix("term:").and_then(|n| n.parse().ok())).filter(|&id| in_tab(self, id));
+        match last.or_else(first) {
+            Some(id) => self.show_editor_terminal(id),
+            None => self.new_editor_terminal(None),
+        }
     }
 
     /// Moves terminal `i` from the panel into an editor tab.
@@ -420,6 +456,9 @@ impl App {
     /// tab that is no longer shown.
     pub fn sync_term_focus(&mut self) {
         let shown = self.editor_term().is_some();
+        if let MainView::Terminal(id) = self.view {
+            self.term_editor_last = Some(id);
+        }
         if self.focus == Focus::Terminal && self.term_editor_focus && !shown {
             self.focus = Focus::Main;
         } else if self.focus == Focus::Main && shown {
@@ -573,14 +612,19 @@ impl App {
         // workbench shortcuts that win over the shell (like VS Code's defaults)
         let cmd = match (vk, ctrl, shift) {
             (0x50, true, true) | (0x70, false, false) => Some(Cmd::Palette),
+            (0xC0, true, false) if alt => Some(Cmd::ToggleEditorTerminal),
+            (0xC0, true, true) if alt => Some(Cmd::NewTerminalEditor),
             (0xC0, true, false) => Some(Cmd::ToggleTerminal),
             (0xC0, true, true) => Some(Cmd::NewTerminal),
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),
             (0x4A, true, false) => Some(Cmd::ToggleOutput),
             (0x47, true, true) => Some(Cmd::FocusCommit),
+            (0x42, true, false) if !alt => Some(Cmd::ToggleSidebar),
+            (0x45, true, true) => Some(Cmd::ShowExplorer),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),
-            (0x73, true, false) if in_editor => Some(Cmd::CloseEditor),
+            // Ctrl+W / Ctrl+F4 close a terminal tab like any other tab
+            (0x57 | 0x73, true, false) if in_editor => Some(Cmd::CloseEditor),
             // in an editor tab these switch editors, in the panel they switch terminals
             (0x22, true, false) => Some(if in_editor { Cmd::NextEditor } else { Cmd::FocusNextTerminal }),
             (0x21, true, false) => Some(if in_editor { Cmd::PrevEditor } else { Cmd::FocusPrevTerminal }),

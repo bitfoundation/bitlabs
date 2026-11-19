@@ -330,7 +330,7 @@ impl App {
                 }
             }));
         }
-        if let (Some(p), Some(root)) = (path.filter(|p| !p.is_empty()), self.root()) {
+        if let (Some(p), Some(root)) = (path.filter(|p| !p.is_empty()), self.folder()) {
             let abs = root.join(&p).display().to_string();
             v.push(MenuItem::Sep);
             v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &abs)));

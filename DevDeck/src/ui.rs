@@ -584,7 +584,8 @@ impl App {
         let bs = self.s(22);
         let y = l.title.top + (rh(&l.title) - bs) / 2;
         let mut x = l.title.right - self.s(8) - bs;
-        if self.repo.is_some() {
+        let folder = self.folder();
+        if folder.is_some() {
             for (glyph, c) in [('\u{E70E}', Cmd::ExplorerCollapse), (I_REFRESH, Cmd::Refresh), (I_NEW_FOLDER, Cmd::ExplorerNewFolder), (I_NEW_FILE, Cmd::ExplorerNewFile), (I_SEARCH, Cmd::GotoFile)] {
                 self.icon_button(g, xywh(x, y, bs, bs), glyph, Hit::Cmd(c), true);
                 x -= bs + self.s(2);
@@ -594,9 +595,13 @@ impl App {
         let hh = l.explorer_header;
         self.hits.push((hh, Hit::ExplorerHeader));
         g.icon(&xywh(hh.left + self.s(2), hh.top, self.s(20), rh(&hh)), I_DOWN, self.fonts.icon_small, self.t.fg);
-        let name = self.repo.as_ref().map(|r| r.name.to_uppercase()).unwrap_or_else(|| "NO FOLDER OPENED".into());
+        let name = match (&self.repo, &folder) {
+            (Some(r), _) => r.name.to_uppercase(),
+            (None, Some(f)) => f.file_name().map(|n| n.to_string_lossy().to_uppercase()).unwrap_or_else(|| f.display().to_string().to_uppercase()),
+            _ => "NO FOLDER OPENED".into(),
+        };
         g.text_in(&rect(hh.left + self.s(22), hh.top, hh.right - self.s(8), hh.bottom), &name, self.fonts.bold, self.t.fg, DT_LINE);
-        if self.repo.is_none() {
+        if folder.is_none() {
             let msg = "You have not yet opened a folder.";
             g.text_in(&xywh(l.sidebar.left + self.s(20), hh.bottom + self.s(10), rw(&l.sidebar) - self.s(40), self.s(20)), msg, self.fonts.ui, self.t.fg_dim, DT_LINE);
             let b = xywh(l.sidebar.left + self.s(20), hh.bottom + self.s(40), (rw(&l.sidebar) - self.s(40)).min(self.s(300)), self.s(28));
@@ -1665,7 +1670,7 @@ impl App {
         self.icon_button(g, xywh(rx, y, bs, bs), I_MORE, Hit::PanelMenu, true);
         rx -= bs + self.s(2);
         if term_tab {
-            self.icon_button(g, xywh(rx, y, bs, bs), '\u{E74D}', Hit::Cmd(Cmd::KillTerminal), true);
+            self.icon_button(g, xywh(rx, y, bs, bs), '\u{E74D}', Hit::TermKillPanel, true);
             rx -= bs + self.s(2);
             self.icon_button(g, xywh(rx, y, bs, bs), I_ADD, Hit::Cmd(Cmd::NewTerminal), true);
             rx -= self.s(4);
@@ -2382,6 +2387,12 @@ impl App {
                 self.activate_terminal(i);
             }
             Hit::TermTabKill(i) => self.kill_terminal_at(i),
+            // the panel's buttons act on the panel's terminal, never on a terminal tab
+            Hit::TermKillPanel => {
+                if let Some(i) = self.panel_term() {
+                    self.kill_terminal_at(i);
+                }
+            }
             Hit::TermBody | Hit::EditorTerm => {
                 self.focus = Focus::Terminal;
                 self.term_editor_focus = hit == Hit::EditorTerm;
@@ -2416,7 +2427,11 @@ impl App {
                 items.push(m.cmd("Select Default Profile...", Cmd::SelectShell));
                 items.push(m.cmd("Clear", Cmd::ClearTerminal));
                 items.push(m.cmd("Rename...", Cmd::RenameTerminal));
-                items.push(m.cmd("Kill Terminal", Cmd::KillTerminal));
+                items.push(m.it("Kill Terminal", |a| {
+                    if let Some(i) = a.panel_term() {
+                        a.kill_terminal_at(i);
+                    }
+                }));
                 items.push(m.cmd("Open External Terminal", Cmd::OpenTerminal));
                 self.show_menu(x, y + self.s(12), items, m);
             }
@@ -2625,7 +2640,7 @@ impl App {
             self.show_menu(x, y, items, m);
             return;
         }
-        if self.repo.is_some() && (contains(&self.l.explorer, x, y) || contains(&self.l.explorer_header, x, y)) {
+        if self.folder().is_some() && (contains(&self.l.explorer, x, y) || contains(&self.l.explorer_header, x, y)) {
             let i = match hit {
                 Hit::ExplorerRow(i) => {
                     self.explorer_select(i);
@@ -2819,7 +2834,10 @@ impl App {
 
     /// Global shortcuts (handled for the main window and the edit controls).
     pub fn global_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> bool {
+        let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
         let c = match (vk, ctrl, shift) {
+            (0xC0, true, false) if alt => Some(Cmd::ToggleEditorTerminal), // Ctrl+Alt+`
+            (0xC0, true, true) if alt => Some(Cmd::NewTerminalEditor),     // Ctrl+Alt+Shift+`
             (0x50, true, true) | (0x70, false, false) => Some(Cmd::Palette), // Ctrl+Shift+P, F1
             (0x74, false, false) => Some(Cmd::Refresh),                      // F5
             (0x4A, true, false) => Some(Cmd::ToggleOutput),                  // Ctrl+J

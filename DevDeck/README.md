@@ -87,11 +87,12 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
   - Starts in the repository folder, with 3,000 lines of scrollback (wheel or Shift+PgUp/PgDn).
   - Mouse selection (double-click selects a word). `Ctrl+C` copies the selection, otherwise it sends ^C. `Ctrl+V` / `Shift+Insert` paste, and right-click copies or pastes like Windows Terminal.
   - Multiple terminals, like VS Code: `+` (or ``Ctrl+Shift+` ``) opens another one, and with two or more a tab list appears on the right of the panel (click to switch, trash icon to kill, right-click to rename or kill). `Ctrl+PageDown` / `Ctrl+PageUp` switch between them, and terminals in the background keep running.
-  - Terminals in editor tabs, like VS Code's *Terminal in Editor Area*: *Terminal: Create New Terminal in Editor Area* (also in the terminal dropdown) opens one as an editor tab next to your diffs and files, and *Move into Editor Area* / *Move Terminal into Panel* (terminal tab list, tab right-click menu or the Command Palette) move a running terminal between the panel and the editor area without restarting it. Closing a terminal tab kills that terminal. In an editor terminal `Ctrl+PageDown` / `Ctrl+PageUp` and `Ctrl+Tab` switch editor tabs and `Ctrl+F4` closes it.
+  - Terminals in editor tabs, like VS Code's *Terminal in Editor Area*: *Terminal: Create New Terminal in Editor Area* (``Ctrl+Alt+Shift+` ``, also in the terminal dropdown) opens one as an editor tab next to your diffs and files, and *Move into Editor Area* / *Move Terminal into Panel* (terminal tab list, tab right-click menu or the Command Palette) move a running terminal between the panel and the editor area without restarting it. Closing a terminal tab kills that terminal. In an editor terminal `Ctrl+PageDown` / `Ctrl+PageUp` and `Ctrl+Tab` switch editor tabs and `Ctrl+W` / `Ctrl+F4` close it, like any other tab.
+  - ``Ctrl+Alt+` `` is the editor area's ``Ctrl+` ``: it opens a terminal tab, or brings back and focuses the one you used last. Pressed again while that terminal has focus, it returns to the tab you were on before (or to the side bar), so one key flips between your file or diff and a terminal.
   - Kill / clear / rename terminal. It is restored on startup if it was open, and pressing any key after the shell exits restarts it.
   - Panel size: the maximize button in the panel header (or `Ctrl+Shift+M`) toggles between the normal size and a maximized mode, and the "..." button (or right-clicking the header) picks the mode: Normal, Full Width (spans under the side bar too), Full Height (fills the main area) or Full Screen (covers everything but the status bar). The last maximized mode is remembered.
   - Started lazily: no shell process exists until you open the terminal. With it open and idle the app still uses 0 ms CPU and about 2.7 MB of private memory; the shell's own memory is separate (cmd ~6 MB, bash ~8 MB, Windows PowerShell ~80 MB).
-- **Explorer and file editor:** the Explorer view (top icon of the activity bar, or `Ctrl+Shift+E`) shows the repository's folder tree with git status colors and letters, folders that contain changes marked with a dot, and ignored files dimmed. Click a folder to expand it; click a file to open it in a tab (double-click or Enter keeps the tab and moves the keyboard focus to the editor). Right-click for Open, Open Changes, Open with Default App, Reveal in File Explorer, Copy Path and Copy Relative Path. *Go to File...* (`Ctrl+P`) picks any tracked or untracked file by name.
+- **Explorer and file editor:** the Explorer view (top icon of the activity bar, or `Ctrl+Shift+E`) shows the repository's folder tree with git status colors and letters, folders that contain changes marked with a dot, and ignored files dimmed. Click a folder to expand it; click a file to open it in a tab (double-click or Enter keeps the tab and moves the keyboard focus to the editor). A folder without a Git repository opens too (from the command line, *Open Folder* or Explorer's *Open with DevDeck*): the Explorer, the editor and the terminal work on it, Source Control offers *Initialize Repository*, and a repository created in it (for example `git init` in the terminal) is picked up by itself. Right-click for Open, Open Changes, Open with Default App, Reveal in File Explorer, Copy Path and Copy Relative Path. *Go to File...* (`Ctrl+P`) picks any tracked or untracked file by name.
   - **File operations:** *New File...* and *New Folder...* (title bar buttons or right-click) create an entry in the selected folder (or next to the selected file); like VS Code, a name such as `src/util/a.rs` creates the folders in between. *Rename...* (`F2`) renames a file or folder, and open tabs follow it. *Delete* (`Del`) moves it to the Recycle Bin after a confirmation. Names are checked for characters and names Windows doesn't allow.
   - **Editing:** files open in an editor with line numbers, a caret and selection (mouse, Shift+arrows, double-click selects a word), Ctrl+arrows by word, smart Home, Tab / Shift+Tab to indent or outdent lines (the indentation style is detected from the file), auto-indent on Enter, cut / copy / paste (the whole line without a selection), undo / redo and a context menu. `Ctrl+S` saves, keeping the file's encoding (UTF-8 with or without BOM, UTF-16 LE / BE) and line endings (CRLF / LF); *File: Save All* and *File: Revert File* are in the Command Palette. The status bar shows the caret position, the encoding and the line endings.
   - **Unsaved changes:** a modified tab shows a dot instead of its close button. Closing it, closing several tabs, opening another folder or closing the window asks to save, discard or cancel. A clean file reloads when it changes on disk; a modified one is never replaced, and saving it asks before overwriting changes made outside DevDeck.
@@ -105,7 +106,7 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 |---|---|
 | `Ctrl+Shift+P` / `F1` | Command palette |
 | `Ctrl+Enter` | Commit (`Ctrl+Shift+Enter` commits all) |
-| `Ctrl+Shift+G` | Focus commit message |
+| `Ctrl+Shift+G` | Show Source Control and focus the commit message |
 | `F5` | Refresh |
 | `F7` / `Shift+F7` | Next / previous change |
 | `Tab` | Cycle focus: Changes, Graph, Branches, Diff |
@@ -116,8 +117,8 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 | `Ctrl+C` (diff) | Copy selected lines |
 | `Backspace` (diff) | Back to commit |
 | `Del` (changes) | Discard |
-| `Ctrl+B` | Toggle side bar |
-| `Ctrl+Shift+E` | Show Explorer |
+| `Ctrl+B` | Toggle side bar (also from a terminal) |
+| `Ctrl+Shift+E` | Show Explorer (also from a terminal) |
 | `F2` / `Del` (Explorer) | Rename / delete the selected file or folder |
 | `Ctrl+P` | Go to file |
 | `Ctrl+S` | Save the file in the active tab |
@@ -131,6 +132,8 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 | ``Ctrl+` `` | Toggle integrated terminal |
 | `Ctrl+Shift+M` | Toggle maximized panel |
 | ``Ctrl+Shift+` `` | New terminal |
+| ``Ctrl+Alt+` `` | Toggle terminal in the editor area |
+| ``Ctrl+Alt+Shift+` `` | New terminal in the editor area |
 | `Ctrl+PageDown` / `Ctrl+PageUp` (terminal) | Next / previous terminal |
 | `Ctrl+Shift+C` | External terminal in repo |
 

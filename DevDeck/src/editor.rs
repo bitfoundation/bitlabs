@@ -970,7 +970,7 @@ impl App {
 
     /// Saves tab `i`; false (with an error toast) when it failed.
     pub fn save_tab(&mut self, i: usize) -> bool {
-        let Some(root) = self.root() else { return false };
+        let Some(root) = self.folder() else { return false };
         let Some(f) = self.tab_file_mut(i) else { return true };
         if !f.ed.editable {
             return true;
@@ -991,7 +991,7 @@ impl App {
     /// Ctrl+S: saves the active file. When the file changed on disk since it was loaded,
     /// asks before overwriting it.
     pub fn save_active(&mut self) {
-        let Some(root) = self.root() else { return };
+        let Some(root) = self.folder() else { return };
         let MainView::File(f) = &self.view else { return };
         if !f.ed.editable {
             return;

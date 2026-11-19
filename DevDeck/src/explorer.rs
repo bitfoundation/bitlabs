@@ -103,6 +103,36 @@ pub fn build_rows(root: &Path, open: &HashSet<String>) -> Vec<ERow> {
     out
 }
 
+/// Files under `root` for "Go to File..." in a folder without a repository (no .gitignore to
+/// go by): skips hidden folders and node_modules, and stops after 20,000 files.
+fn list_files(root: &Path) -> Vec<String> {
+    const MAX: usize = 20_000;
+    let mut out = Vec::new();
+    let mut stack = vec![String::new()];
+    while let Some(rel) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(root.join(&rel)) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            match e.file_type() {
+                Ok(t) if t.is_dir() => {
+                    if !name.starts_with('.') && name != "node_modules" {
+                        stack.push(path);
+                    }
+                }
+                Ok(t) if t.is_file() => {
+                    out.push(path);
+                    if out.len() >= MAX {
+                        return out;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Ignored files and folders (folders are reported once, not their contents).
 pub fn ignored(root: &Path) -> HashSet<String> {
     let o = git::run(root, &["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], None, true);
@@ -182,16 +212,16 @@ impl App {
 
     /// Re-reads the expanded folders and the git decorations.
     pub fn rebuild_explorer(&mut self) {
-        let Some(repo) = &self.repo else {
+        let Some(root) = self.folder() else {
             self.ex.rows.clear();
             return;
         };
-        let root = repo.root.clone();
         let mut deco = HashMap::new();
         let mut dir_deco: HashMap<String, Kind> = HashMap::new();
+        let files = self.repo.as_ref().map(|r| r.status.files.as_slice()).unwrap_or(&[]);
         // conflicts win over working tree changes, which win over staged ones
         for g in [Group::Staged, Group::Changes, Group::Merge] {
-            for f in repo.status.files.iter().filter(|f| f.group == g) {
+            for f in files.iter().filter(|f| f.group == g) {
                 deco.insert(f.path.clone(), (f.kind, f.letter()));
                 let mut p = f.path.as_str();
                 while let Some((parent, _)) = p.rsplit_once('/') {
@@ -260,7 +290,7 @@ impl App {
 
     /// Opens the read-only text view of `rel` in a tab.
     pub fn open_file_viewer(&mut self, rel: String, pin: bool) {
-        let Some(root) = self.root() else { return };
+        let Some(root) = self.folder() else { return };
         if self.open_tab(format!("file:{rel}"), pin) && matches!(self.view, MainView::File(_) | MainView::Message(..)) {
             return;
         }
@@ -280,7 +310,7 @@ impl App {
 
     /// Reloads the active text view when its file changed on disk (keeps the scroll position).
     pub fn reload_text_view_if_changed(&mut self) {
-        let Some(root) = self.root() else { return };
+        let Some(root) = self.folder() else { return };
         let MainView::File(f) = &self.view else { return };
         if f.change.is_some() || f.ed.dirty() {
             return;
@@ -304,9 +334,8 @@ impl App {
 
     /// "Go to File..." (Ctrl+P): picks any tracked or untracked (not ignored) file to view.
     pub fn goto_file(&mut self) {
-        let Some(root) = self.root() else { return };
-        let o = git::run(&root, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"], None, true);
-        let text = o.text();
+        let Some(root) = self.folder() else { return };
+        let text = if self.repo.is_some() { git::run(&root, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"], None, true).text() } else { list_files(&root).join("\0") };
         let mut paths: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
         paths.sort_by_key(|p| p.to_lowercase());
         paths.dedup();
@@ -330,7 +359,7 @@ impl App {
     /// Context menu of Explorer row `i` (usize::MAX: empty space).
     pub fn explorer_menu(&mut self, i: usize, m: &mut Menu) -> Vec<MenuItem> {
         let mut v = vec![m.it("New File...", move |a| a.explorer_new(i, false)), m.it("New Folder...", move |a| a.explorer_new(i, true)), MenuItem::Sep];
-        let root = self.root();
+        let root = self.folder();
         if let (Some(r), Some(root)) = (self.ex.rows.get(i).cloned(), root.clone()) {
             let abs = root.join(&r.path).display().to_string();
             let (a1, a2, a3) = (abs.clone(), abs.clone(), abs);
@@ -442,7 +471,7 @@ impl App {
     /// "New File..." / "New Folder..." in the folder of row `i`. Like VS Code, a name with
     /// '/' creates the folders in between.
     pub fn explorer_new(&mut self, i: usize, folder: bool) {
-        if self.root().is_none() {
+        if self.folder().is_none() {
             return;
         }
         if !self.explorer_active() {
@@ -456,7 +485,7 @@ impl App {
             (true, false) => format!("New folder name in '{dir}'"),
         };
         self.input(&prompt, "", move |a, name| {
-            let Some(root) = a.root() else { return };
+            let Some(root) = a.folder() else { return };
             let name = match validate_name(&name, true) {
                 Ok(n) => n,
                 Err(e) => return a.error(e),
@@ -489,7 +518,7 @@ impl App {
         let parent = r.path.rsplit_once('/').map(|(p, _)| p.to_string()).unwrap_or_default();
         let old = r.path.clone();
         self.input(&format!("New name for '{}'", r.name), &r.name, move |a, name| {
-            let Some(root) = a.root() else { return };
+            let Some(root) = a.folder() else { return };
             let name = match validate_name(&name, false) {
                 Ok(n) => n,
                 Err(e) => return a.error(e),
@@ -537,7 +566,7 @@ impl App {
         let message = if r.dir { format!("Are you sure you want to delete '{}' and its contents?", r.name) } else { format!("Are you sure you want to delete '{}'?", r.name) };
         let detail = if r.dir { "You can restore this folder from the Recycle Bin." } else { "You can restore this file from the Recycle Bin." };
         self.confirm(&message, detail, &["Move to Recycle Bin"], move |a, _| {
-            let Some(root) = a.root() else { return };
+            let Some(root) = a.folder() else { return };
             if !recycle(&root.join(&r.path)) {
                 return a.error(format!("Unable to delete '{}'.", r.path));
             }

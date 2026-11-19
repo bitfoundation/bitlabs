@@ -67,7 +67,28 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Cli {
 pub fn clean_arg(a: &str) -> String {
     let s = a.trim().trim_matches('"').trim();
     let s = s.strip_prefix("file:///").map(|x| x.replace('/', "\\")).unwrap_or_else(|| s.to_string());
-    s.replace("%20", " ")
+    let s = s.replace("%20", " ");
+    // a drive root such as Explorer's `"D:\"` arrives as `D:"`; a bare `D:` would mean the
+    // current directory on that drive
+    let b = s.as_bytes();
+    if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        return format!("{s}\\");
+    }
+    s
+}
+
+#[cfg(test)]
+mod quoting_tests {
+    use super::*;
+
+    #[test]
+    fn clean_arg_quoting() {
+        assert_eq!(clean_arg(r#"C:\repo""#), r"C:\repo");
+        assert_eq!(clean_arg(r#"D:""#), r"D:\");
+        assert_eq!(clean_arg("d:"), r"d:\");
+        assert_eq!(clean_arg("file:///C:/a%20b"), r"C:\a b");
+        assert_eq!(clean_arg("."), ".");
+    }
 }
 
 /// Strips the `\\?\` verbatim prefix produced by `canonicalize`.

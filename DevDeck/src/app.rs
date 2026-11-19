@@ -306,6 +306,8 @@ pub enum Hit {
     /// The terminal in the editor area.
     EditorTerm,
     TermShellMenu,
+    /// Trash button of the panel's toolbar: kills the panel's active terminal only.
+    TermKillPanel,
     TermTab(usize),
     TermTabKill(usize),
 }
@@ -411,7 +413,8 @@ cmds! {
     OpenTerminal => "Terminal: Open External Terminal", "Ctrl+Shift+C";
     ToggleTerminal => "View: Toggle Terminal", "Ctrl+`";
     NewTerminal => "Terminal: Create New Terminal", "Ctrl+Shift+`";
-    NewTerminalEditor => "Terminal: Create New Terminal in Editor Area", "";
+    ToggleEditorTerminal => "View: Toggle Terminal in Editor Area", "Ctrl+Alt+`";
+    NewTerminalEditor => "Terminal: Create New Terminal in Editor Area", "Ctrl+Alt+Shift+`";
     MoveTerminalToEditor => "Terminal: Move Terminal into Editor Area", "";
     MoveTerminalToPanel => "Terminal: Move Terminal into Panel", "";
     KillTerminal => "Terminal: Kill the Active Terminal Instance", "";
@@ -537,6 +540,11 @@ pub struct App {
     /// With `Focus::Terminal`: input goes to the terminal in the active editor tab, not the panel's.
     pub term_editor_focus: bool,
     pub term_next_id: u64,
+    /// Terminal tab used last, which Ctrl+Alt+` brings back.
+    pub term_editor_last: Option<u64>,
+    /// Key of the tab that was active before a terminal tab was shown, which Ctrl+Alt+`
+    /// returns to.
+    pub term_editor_prev: Option<String>,
     pub term_skip_char: bool,
     pub term_surrogate: u16,
     pub shells: Vec<crate::term::Shell>,
@@ -645,6 +653,8 @@ impl App {
             term_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             term_editor_focus: false,
             term_next_id: 1,
+            term_editor_last: None,
+            term_editor_prev: None,
             term_skip_char: false,
             term_surrogate: 0,
             shells: Vec::new(),
@@ -726,6 +736,13 @@ impl App {
             self.st.add_recent(&f);
             self.st.save();
             self.pending_init = Some(folder.to_path_buf());
+            // the folder still opens, like VS Code: the Explorer, editor and terminal work on
+            // it and Source Control offers to initialize a repository
+            self.ex = crate::explorer::Explorer::default();
+            self.watcher = Watcher::start(folder, self.hwnd, WM_FS);
+            self.st.side_view = 1;
+            self.st.sidebar_visible = true;
+            self.rebuild_explorer();
             self.update_title();
             self.invalidate();
             return;
@@ -797,8 +814,25 @@ impl App {
         self.repo.as_ref().map(|r| r.root.clone())
     }
 
+    /// The open folder: the repository's root, or a folder without a repository.
+    pub fn folder(&self) -> Option<PathBuf> {
+        self.root().or_else(|| self.pending_init.clone())
+    }
+
     pub fn refresh(&mut self) {
-        let Some(root) = self.root() else { return };
+        let Some(root) = self.root() else {
+            // a folder without a repository: a repository created in it (e.g. `git init` in
+            // the terminal) opens it, otherwise only the Explorer follows the changes
+            if let Some(f) = self.pending_init.clone() {
+                if f.join(".git").exists() && git::toplevel(&f).is_some() {
+                    self.open_repo(&f);
+                    self.layout();
+                } else if self.explorer_active() {
+                    self.rebuild_explorer();
+                }
+            }
+            return;
+        };
         if self.refreshing {
             self.refresh_pending = true;
             return;
@@ -1045,7 +1079,10 @@ impl App {
                 let b = r.status.branch.clone().unwrap_or_else(|| r.status.head.as_deref().map(|h| h[..h.len().min(8)].to_string()).unwrap_or_default());
                 format!("{} ({}) - DevDeck", r.name, b)
             }
-            None => "DevDeck".to_string(),
+            None => match &self.pending_init {
+                Some(f) => format!("{} - DevDeck", f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.display().to_string())),
+                None => "DevDeck".to_string(),
+            },
         };
         let t = win::wz(&title);
         unsafe {
@@ -2182,8 +2219,10 @@ impl App {
     }
 
     pub fn exec(&mut self, c: Cmd) {
-        let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
-        if needs_repo && self.repo.is_none() {
+        let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
+        // the Explorer and the editor work in a folder without a repository too
+        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh);
+        if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
             self.info("There are no available repositories. Open a folder first.");
             return;
         }
@@ -2251,12 +2290,12 @@ impl App {
             Cmd::Clone => self.clone_repo(),
             Cmd::Init => self.init_repo(),
             Cmd::OpenExplorer => {
-                if let Some(r) = self.root() {
+                if let Some(r) = self.folder() {
                     win::shell_open(&r.display().to_string());
                 }
             }
             Cmd::OpenTerminal => {
-                if let Some(r) = self.root() {
+                if let Some(r) = self.folder() {
                     let d = r.display().to_string();
                     win::shell_exec("cmd.exe", "", &d);
                 }
@@ -2277,6 +2316,7 @@ impl App {
             Cmd::ToggleTerminal => self.toggle_terminal(),
             Cmd::NewTerminal => self.new_terminal(None),
             Cmd::NewTerminalEditor => self.new_editor_terminal(None),
+            Cmd::ToggleEditorTerminal => self.toggle_editor_terminal(),
             Cmd::MoveTerminalToEditor => match self.panel_term() {
                 Some(i) => self.move_terminal_to_editor(i),
                 None => self.new_editor_terminal(None),
