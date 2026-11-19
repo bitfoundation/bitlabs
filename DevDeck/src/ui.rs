@@ -46,6 +46,7 @@ const I_DIRTY: char = '\u{25CF}';
 /// Indent per tree level in the Changes view (unscaled pixels).
 const TREE_INDENT: i32 = 12;
 const I_TAG: char = '\u{E8EC}';
+const I_PIN: char = '\u{E718}';
 
 pub struct Menu {
     pub acts: Vec<Option<Box<dyn FnOnce(&mut App)>>>,
@@ -67,8 +68,26 @@ impl Menu {
         self.acts.push(Some(Box::new(f)));
         win::item_checked(label, self.acts.len() - 1, checked)
     }
+    /// Menu item that runs command `c`, showing its keyboard shortcut.
     pub fn cmd(&mut self, label: &str, c: Cmd) -> MenuItem {
-        self.it(label, move |a| a.exec(c))
+        self.cmd_if(label, true, c)
+    }
+    pub fn cmd_if(&mut self, label: &str, enabled: bool, c: Cmd) -> MenuItem {
+        self.it_if(&with_key(label, c), enabled, move |a| a.exec(c))
+    }
+    pub fn check_cmd(&mut self, label: &str, checked: bool, c: Cmd) -> MenuItem {
+        self.check(&with_key(label, c), checked, move |a| a.exec(c))
+    }
+}
+
+/// Appends the keyboard shortcut of `c` to a menu label (after a tab, so the menu
+/// right-aligns it), unless the label already has one.
+fn with_key(label: &str, c: Cmd) -> String {
+    let key = crate::app::cmd_key(c);
+    if key.is_empty() || label.contains('\t') {
+        label.to_string()
+    } else {
+        format!("{label}\t{key}")
     }
 }
 
@@ -469,6 +488,7 @@ impl App {
         self.paint_status(&g);
         self.paint_toasts(&g);
         self.paint_overlay(&g);
+        self.paint_tip(&g);
         unsafe {
             BitBlt(hdc, 0, 0, w, h, self.buf.0, 0, 0, SRCCOPY);
         }
@@ -485,7 +505,8 @@ impl App {
             GetWindowRect(self.commit_edit, &mut er);
             MapWindowPoints(null_mut(), self.hwnd, &mut er as *mut RECT as *mut POINT, 2);
         }
-        let ov = self.overlay_bounds.filter(|o| o.left < er.right && er.left < o.right && o.top < er.bottom && er.top < o.bottom);
+        let hits = |o: &RECT| o.left < er.right && er.left < o.right && o.top < er.bottom && er.top < o.bottom;
+        let ov = self.overlay_bounds.filter(hits).or(self.tip_bounds.filter(hits));
         let key = ov.map(|o| [er.left, er.top, er.right, er.bottom, o.left, o.top, o.right, o.bottom]);
         if key == self.edit_clip {
             return;
@@ -1385,7 +1406,8 @@ impl App {
             // close button: always on the active tab, on hover for the others; a tab with
             // unsaved changes shows a dot instead until the button is hovered
             let dirty = self.tab_dirty(i);
-            if active || hovered || dirty {
+            let pinned = self.tabs[i].pinned;
+            if active || hovered || dirty || pinned {
                 let cr = xywh(tr.right - self.s(26), tr.top + (rh(&tr) - self.s(20)) / 2, self.s(20), self.s(20));
                 let hit = Hit::TabClose(i);
                 if self.hover == hit {
@@ -1394,7 +1416,8 @@ impl App {
                 if dirty && self.hover != hit {
                     g.text_in(&cr, &I_DIRTY.to_string(), self.fonts.ui, fg, DT_LINE | DT_CENTER);
                 } else {
-                    g.icon(&cr, I_CLOSE, self.fonts.icon_small, fg);
+                    // a pinned tab shows a pin, which unpins it when clicked
+                    g.icon(&cr, if pinned { I_PIN } else { I_CLOSE }, self.fonts.icon_small, fg);
                 }
                 self.hits.push((cr, hit));
             }
@@ -1455,7 +1478,7 @@ impl App {
         let cx = b.left + rw(&b) / 2;
         let cy = b.top + rh(&b) / 2 - self.s(80);
         draw_branch_icon(g, cx, cy, self.s(120), crate::theme::blend_colorref(self.t.editor, self.t.fg, 0.08), self.scale * 4.0);
-        let lines = [("Show All Commands", "Ctrl+Shift+P"), ("Open Folder", "Ctrl+O"), ("Open Recent", "Ctrl+R"), ("New Window", "Ctrl+Shift+N"), ("Toggle Terminal", "Ctrl+`")];
+        let lines = [("Show All Commands", "Ctrl+Shift+P"), ("Open Folder", "Ctrl+O"), ("Open Recent", "Ctrl+R"), ("New Window", "Ctrl+Shift+N"), ("Toggle Terminal", "Ctrl+`"), ("Terminal in Editor Area", "Ctrl+Shift+`")];
         let mut y = cy + self.s(100);
         for (label, key) in lines {
             g.text_in(&rect(b.left, y, cx - self.s(10), y + self.s(26)), label, self.fonts.ui, self.t.fg_dim, DT_LINE | DT_RIGHT);
@@ -2102,6 +2125,7 @@ impl App {
                     }
                 }
                 Drag::EditSelect => self.editor_drag(x, y),
+                Drag::Tab(i, start, moved) => self.drag_tab(i, start, moved, x),
                 Drag::DiffSelect => {
                     if let Hit::DiffRow(r) = self.hit_test(x, y) {
                         if let MainView::Diff(d) = &mut self.view {
@@ -2120,10 +2144,368 @@ impl App {
             return;
         }
         let h = self.hit_test(x, y);
-        if h != self.hover {
-            self.hover = h;
+        self.set_hover(h);
+    }
+
+    /// Tab drag: once the mouse moved a few pixels, the dragged tab trades places with the
+    /// tab under the mouse as soon as the mouse passes that tab's middle (so tabs of different
+    /// widths don't flip back and forth). Pinned and unpinned tabs stay in their own group.
+    fn drag_tab(&mut self, i: usize, start: i32, moved: bool, x: i32) {
+        if !moved && (x - start).abs() < self.s(6) {
+            return;
+        }
+        self.hide_tip();
+        let mut tabs: Vec<(usize, RECT)> = self.hits.iter().filter_map(|(r, h)| if let Hit::Tab(t) = h { Some((*t, *r)) } else { None }).collect();
+        tabs.sort_by_key(|(t, _)| *t);
+        let (lo, hi) = self.tab_drag_range(i);
+        let mut to = i;
+        for &(t, r) in &tabs {
+            let mid = (r.left + r.right) / 2;
+            if (t > i && x > mid && t <= hi) || (t < i && x < mid && t >= lo) {
+                // the farthest tab passed wins (fast drags skip over several tabs)
+                if (t > i && t > to) || (t < i && (to == i || t < to)) {
+                    to = t;
+                }
+            }
+        }
+        if to != i {
+            self.move_tab(i, to);
+            // until the strip repaints, lay the tabs' hit areas out in the new order so the
+            // next mouse move already sees where the tabs are now
+            if let (Some(pi), Some(pt)) = (tabs.iter().position(|(t, _)| *t == i), tabs.iter().position(|(t, _)| *t == to)) {
+                let (first, mut x) = (tabs[0].0, tabs[0].1.left);
+                let mut rs: Vec<RECT> = tabs.iter().map(|(_, r)| *r).collect();
+                let moved = rs.remove(pi);
+                rs.insert(pt, moved);
+                self.hits.retain(|(_, h)| !matches!(h, Hit::Tab(_) | Hit::TabClose(_)));
+                for (k, r) in rs.iter().enumerate() {
+                    let w = r.right - r.left;
+                    self.hits.push((rect(x, r.top, x + w, r.bottom), Hit::Tab(first + k)));
+                    x += w;
+                }
+            }
+        }
+        self.drag = Some(Drag::Tab(to, start, true));
+    }
+
+    // ------------------------------------------------------------- tooltips
+
+    /// Sets the hovered item; a tooltip for it shows after a short delay (shorter while
+    /// another tooltip is showing, so moving along a toolbar reads each button quickly).
+    pub fn set_hover(&mut self, h: Hit) {
+        if h == self.hover {
+            return;
+        }
+        let warm = self.tip.is_some();
+        self.hover = h;
+        self.hide_tip();
+        unsafe {
+            KillTimer(self.hwnd, TIMER_TIP);
+            if self.drag.is_none() && self.tooltip_text(h).is_some() {
+                SetTimer(self.hwnd, TIMER_TIP, if warm { 120 } else { 600 }, None);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Hover delay elapsed: shows the tooltip of the hovered item.
+    pub fn show_tip(&mut self) {
+        unsafe {
+            KillTimer(self.hwnd, TIMER_TIP);
+        }
+        if self.drag.is_none() && self.tooltip_text(self.hover).is_some() {
+            self.tip = Some((self.hover, self.mouse.0, self.mouse.1));
             self.invalidate();
         }
+    }
+
+    pub fn hide_tip(&mut self) {
+        unsafe {
+            KillTimer(self.hwnd, TIMER_TIP);
+        }
+        if self.tip.take().is_some() {
+            self.invalidate();
+        }
+    }
+
+    /// "Title (Shortcut)" for command `c`.
+    fn with_shortcut(title: &str, c: Cmd) -> String {
+        let key = crate::app::cmd_key(c);
+        if key.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title} ({key})")
+        }
+    }
+
+    /// Tooltip of a command button: the command's title without its category, or a text that
+    /// says what the button does in its current state.
+    fn cmd_tooltip(&self, c: Cmd) -> String {
+        let title = match c {
+            Cmd::Palette => "Show All Commands",
+            Cmd::ToggleTheme => if self.t.dark { "Switch to the Light Theme" } else { "Switch to the Dark Theme" },
+            Cmd::ToggleCompact => if self.st.compact_diff { "Show All Lines" } else { "Collapse Unchanged Regions" },
+            Cmd::ToggleInline => if self.st.inline_diff { "Show Side by Side" } else { "Show Inline" },
+            Cmd::ToggleGraphAll => {
+                return if self.st.graph_all {
+                    "Showing all branches. Click to show the current branch only".into()
+                } else {
+                    "Showing the current branch (Auto). Click to show all branches".into()
+                }
+            }
+            Cmd::TogglePanelMax => if self.panel_mode() == PanelMode::Normal { "Maximize Panel Size" } else { "Restore Panel Size" },
+            Cmd::ToggleTerminal if self.st.output_visible => "Hide Panel",
+            Cmd::About => "About DevDeck",
+            Cmd::Refresh => "Refresh",
+            Cmd::Commit => "Commit",
+            Cmd::FetchAll => "Fetch From All Remotes",
+            Cmd::Publish => "Publish Branch: push it to a remote and track it",
+            Cmd::StashView => "View Stashes",
+            _ => {
+                let t = COMMANDS.iter().find(|(k, _, _)| *k == c).map(|(_, t, _)| *t).unwrap_or("");
+                t.split_once(": ").map(|(_, rest)| rest).unwrap_or(t)
+            }
+        };
+        Self::with_shortcut(title, c)
+    }
+
+    /// Text of the tooltip for `h`, if it has one.
+    pub fn tooltip_text(&self, h: Hit) -> Option<String> {
+        let file_line = |f: &git::FileChange| {
+            let mut s = format!("{} \u{2022} {}", f.path, f.tooltip());
+            if let Some(o) = &f.orig {
+                s += &format!("\nRenamed from {o}");
+            }
+            s
+        };
+        let group_of_row = |i: usize| match self.crows.get(i) {
+            Some(CRow::Group(g)) => Some(*g),
+            Some(CRow::Dir(d)) => self.cdirs.get(*d).map(|d| d.group),
+            Some(CRow::File(f)) => self.file(*f).map(|f| f.group),
+            None => None,
+        };
+        let t: String = match h {
+            Hit::Cmd(c) => self.cmd_tooltip(c),
+            Hit::GroupRow(i) => {
+                let g = group_of_row(i)?;
+                let n = self.status().map(|s| s.count(g)).unwrap_or(0);
+                format!("{}: {n} file{}", group_label(g), if n == 1 { "" } else { "s" })
+            }
+            Hit::GroupAct(i, a) => match (a, group_of_row(i)?) {
+                (0, Group::Merge) => "Stage All Merge Changes".into(),
+                (0, _) => "Stage All Changes".into(),
+                (1, _) => "Unstage All Changes".into(),
+                _ => "Discard All Changes".into(),
+            },
+            Hit::DirRow(i) => match self.crows.get(i) {
+                Some(CRow::Dir(d)) => self.cdirs.get(*d)?.path.clone(),
+                _ => return None,
+            },
+            Hit::DirAct(_, a) => match a {
+                0 => "Stage Changes in This Folder",
+                1 => "Unstage Changes in This Folder",
+                _ => "Discard Changes in This Folder",
+            }
+            .into(),
+            Hit::FileRow(i) => match self.crows.get(i) {
+                Some(CRow::File(f)) => file_line(self.file(*f)?),
+                _ => return None,
+            },
+            Hit::FileAct(i, a) => match (a, group_of_row(i)?) {
+                (0, Group::Merge) => "Stage Changes (Mark Resolved)".into(),
+                (0, _) => "Stage Changes".into(),
+                (1, _) => "Unstage Changes".into(),
+                (2, _) => "Discard Changes".into(),
+                _ => "Open File".into(),
+            },
+            Hit::CommitBtn => {
+                let s = self.status()?;
+                let (_, _, kind) = self.action_button();
+                match kind {
+                    1 => format!("Sync Changes: pull {} and push {} commit{}", s.behind, s.ahead, if s.ahead == 1 { "" } else { "s" }),
+                    2 => format!("Publish Branch: push '{}' to a remote", s.branch.clone().unwrap_or_default()),
+                    _ if s.rebasing => "Continue Rebase".into(),
+                    _ if s.merging => "Commit the Merge (Ctrl+Enter)".into(),
+                    _ if s.count(Group::Staged) > 0 => "Commit Staged Changes (Ctrl+Enter)".into(),
+                    _ => "Commit (Ctrl+Enter)".into(),
+                }
+            }
+            Hit::CommitDrop => "More Commit Actions...".into(),
+            Hit::ActionBtn => "Views and More Actions...".into(),
+            Hit::GraphRow(i) => {
+                let c = self.commits.get(i)?;
+                let msg: Vec<&str> = c.message.trim_end().lines().take(8).collect();
+                let refs: Vec<&str> = c.refs.iter().map(|d| d.name.as_str()).collect();
+                let mut s = msg.join("\n");
+                s += &format!("\n\n{} <{}>\n{}  \u{2022}  {}", c.author, c.email, win::fmt_date(c.date), &c.hash[..10.min(c.hash.len())]);
+                if !refs.is_empty() {
+                    s += &format!("\n{}", refs.join(", "));
+                }
+                s
+            }
+            Hit::GraphMore => "Load More Commits".into(),
+            Hit::BranchRow(i) => match self.brows.get(i)? {
+                BRow::Group { label, count, .. } => format!("{label}: {count}"),
+                BRow::Ref(_) => {
+                    let r = self.branch_ref(i)?;
+                    let mut s = r.name.clone();
+                    if let Some(u) = &r.upstream {
+                        s += &format!("\nUpstream: {u}");
+                        if !r.track.is_empty() {
+                            s += &format!(" ({})", r.track);
+                        }
+                    }
+                    s += &format!("\n{}  {}", &r.sha[..8.min(r.sha.len())], r.subject);
+                    s
+                }
+            },
+            Hit::BranchesHeader => if self.st.branches_open { "Collapse Branches" } else { "Expand Branches" }.into(),
+            Hit::GraphHeader => if self.st.graph_open { "Collapse Graph" } else { "Expand Graph" }.into(),
+            Hit::PanelMenu => "Panel Size...".into(),
+            Hit::Tab(i) => {
+                let t = self.tabs.get(i)?;
+                let (title, desc) = self.tab_title(i);
+                // files and diffs: the full path (diffs add what they compare)
+                let (path, extra) = match self.tab_view(i) {
+                    MainView::Diff(d) if !d.path.is_empty() => (Some(d.path.clone()), desc.clone()),
+                    MainView::File(f) if !f.path.is_empty() => (Some(f.path.clone()), String::new()),
+                    _ => (None, String::new()),
+                };
+                let mut s = match (path, self.folder()) {
+                    (Some(p), Some(root)) => format!("{}\n{extra}", root.join(&p).display().to_string().replace('/', "\\")),
+                    _ if !desc.is_empty() && desc != title => format!("{title}\n{desc}"),
+                    _ => title,
+                };
+                if t.pinned {
+                    s += "\nPinned";
+                } else if t.preview {
+                    s += "\nPreview (double-click to keep it open)";
+                }
+                s.trim_end().to_string()
+            }
+            Hit::TabClose(i) => {
+                let t = self.tabs.get(i)?;
+                if t.pinned {
+                    "Unpin".into()
+                } else if self.tab_dirty(i) {
+                    "Close (Ctrl+W), unsaved changes".into()
+                } else {
+                    "Close (Ctrl+W)".into()
+                }
+            }
+            Hit::ExplorerRow(i) => {
+                let r = self.ex.rows.get(i)?;
+                let root = self.folder()?;
+                root.join(&r.path).display().to_string().replace('/', "\\")
+            }
+            Hit::ExplorerHeader => self.folder()?.display().to_string(),
+            Hit::ActivityView(0) => {
+                let n = self.repo.as_ref().map(|r| r.status.files.len()).unwrap_or(0);
+                let base = "Source Control (Ctrl+Shift+G)";
+                if n > 0 {
+                    format!("{base}\n{n} pending change{}", if n == 1 { "" } else { "s" })
+                } else {
+                    base.into()
+                }
+            }
+            Hit::ActivityView(_) => "Explorer (Ctrl+Shift+E)".into(),
+            Hit::DiffBlock(usize::MAX, a) => {
+                let untracked = matches!(&self.view, MainView::Diff(d) if d.kind == DiffKind::Untracked);
+                match a {
+                    0 if untracked => "Stage File",
+                    0 => "Stage Changes",
+                    1 => "Unstage Changes",
+                    2 => "Discard Changes",
+                    _ => "Open File",
+                }
+                .into()
+            }
+            Hit::DiffBlock(_, a) => match a {
+                0 => "Stage the changes of this block",
+                1 => "Unstage the changes of this block",
+                _ => "Revert this block (discards its changes)",
+            }
+            .into(),
+            Hit::DiffBack => "Back to the Commit".into(),
+            Hit::CommitFile(i) => match &self.view {
+                MainView::Commit(cv) => file_line(cv.files.get(i)?),
+                _ => return None,
+            },
+            Hit::Conflict(_, w) => match w {
+                0 => "Keep the current change (ours) and drop the incoming one",
+                1 => "Keep the incoming change (theirs) and drop the current one",
+                _ => "Keep both changes, the current one first",
+            }
+            .into(),
+            Hit::ToastClose(_) => "Close Notification".into(),
+            Hit::ToastOutput => "Show the git commands and their output".into(),
+            Hit::StatusBranch => {
+                let s = self.status()?;
+                let head = s.branch.clone().unwrap_or_else(|| format!("{} (detached)", s.head.as_deref().map(|h| &h[..h.len().min(8)]).unwrap_or("no commits")));
+                let mut t = format!("{head}\nCheckout Branch or Tag...");
+                let marks: Vec<&str> = [(s.count(Group::Changes) > 0, "* unstaged changes"), (s.count(Group::Staged) > 0, "+ staged changes"), (s.count(Group::Merge) > 0, "! merge conflicts")].into_iter().filter(|(on, _)| *on).map(|(_, m)| m).collect();
+                if !marks.is_empty() {
+                    t += &format!("\n{}", marks.join(", "));
+                }
+                t
+            }
+            Hit::StatusSync => {
+                let s = self.status()?;
+                format!("Synchronize Changes with {}\n{} incoming, {} outgoing commit{}", s.upstream.clone().unwrap_or_default(), s.behind, s.ahead, if s.ahead == 1 { "" } else { "s" })
+            }
+            Hit::Recent(i) => format!("Open {}", self.st.recent.get(i)?),
+            Hit::Welcome(id) => match id {
+                0 => "Open a folder (Ctrl+O)",
+                1 => "Clone a repository from a URL",
+                _ => "Create a Git repository in this folder",
+            }
+            .into(),
+            Hit::PanelTab(0) => "Output (Ctrl+J): the git commands DevDeck runs".into(),
+            Hit::PanelTab(_) => "Terminal (Ctrl+`)".into(),
+            Hit::TermShellMenu => "Launch Profile and Terminal Actions...".into(),
+            Hit::TermKillPanel => "Kill the Active Terminal".into(),
+            Hit::TermTab(i) => {
+                let t = self.terms.get(i)?;
+                let mut s = format!("{}\nShell: {}", self.term_display_name(i), t.shell.name);
+                if t.exited.is_some() {
+                    s += "\nThe process has exited";
+                }
+                s
+            }
+            Hit::TermTabKill(_) => "Kill Terminal".into(),
+            Hit::CaptionMin => "Minimize".into(),
+            Hit::CaptionMax => if unsafe { IsZoomed(self.hwnd) } != 0 { "Restore Down" } else { "Maximize" }.into(),
+            Hit::CaptionClose => "Close".into(),
+            Hit::None | Hit::Backdrop | Hit::Sash(_) | Hit::DiffRow(_) | Hit::EditorText | Hit::Thumb(_) | Hit::PickRow(_) | Hit::DialogBtn(_) | Hit::TermBody | Hit::EditorTerm => return None,
+        };
+        Some(t)
+    }
+
+    /// Paints the tooltip box under the mouse (above it near the bottom of the window).
+    fn paint_tip(&mut self, g: &Gfx) {
+        self.tip_bounds = None;
+        let Some((h, mx, my)) = self.tip else { return };
+        if h != self.hover {
+            return;
+        }
+        let Some(text) = self.tooltip_text(h) else { return };
+        let c = self.client();
+        let pad = self.s(7);
+        let max_w = self.s(460).min(rw(&c) - self.s(16));
+        let tw = text.lines().map(|l| g.text_w(l, self.fonts.small)).max().unwrap_or(0).min(max_w - 2 * pad);
+        let th = g.text_height(&xywh(0, 0, tw, 10000), &text, self.fonts.small, DT_WORDBREAK | DT_NOPREFIX);
+        let (w, hgt) = (tw + 2 * pad, th + 2 * pad - self.s(2));
+        let mut x = mx - self.s(4);
+        let mut y = my + self.s(22);
+        if y + hgt > c.bottom - self.s(4) {
+            y = my - hgt - self.s(10);
+        }
+        x = x.min(c.right - w - self.s(6)).max(self.s(6));
+        y = y.max(self.s(4));
+        let b = xywh(x, y, w, hgt);
+        g.round_rect(&b, self.s(4), self.t.widget_bg, Some(self.t.widget_border));
+        g.text_in(&rect(b.left + pad, b.top + pad - self.s(1), b.right - pad, b.bottom), &text, self.fonts.small, self.t.fg, DT_WORDBREAK | DT_NOPREFIX);
+        self.tip_bounds = Some(b);
     }
 
     pub fn cursor_for(&self, x: i32, y: i32) -> Option<windows_sys::core::PCWSTR> {
@@ -2131,7 +2513,47 @@ impl App {
             Hit::Sash(Sash::Sidebar) => Some(IDC_SIZEWE),
             Hit::Sash(_) => Some(IDC_SIZENS),
             Hit::TermBody | Hit::EditorTerm | Hit::EditorText => Some(IDC_IBEAM),
-            _ => None,
+            // everything that does something when clicked: buttons, links, tabs, list rows
+            Hit::Cmd(_)
+            | Hit::GroupRow(_)
+            | Hit::GroupAct(..)
+            | Hit::DirRow(_)
+            | Hit::DirAct(..)
+            | Hit::FileRow(_)
+            | Hit::FileAct(..)
+            | Hit::CommitBtn
+            | Hit::CommitDrop
+            | Hit::ActionBtn
+            | Hit::GraphRow(_)
+            | Hit::GraphMore
+            | Hit::BranchRow(_)
+            | Hit::BranchesHeader
+            | Hit::GraphHeader
+            | Hit::PanelMenu
+            | Hit::Tab(_)
+            | Hit::TabClose(_)
+            | Hit::ExplorerRow(_)
+            | Hit::ActivityView(_)
+            | Hit::DiffBlock(..)
+            | Hit::DiffBack
+            | Hit::CommitFile(_)
+            | Hit::Conflict(..)
+            | Hit::PickRow(_)
+            | Hit::DialogBtn(_)
+            | Hit::ToastClose(_)
+            | Hit::ToastOutput
+            | Hit::StatusBranch
+            | Hit::StatusSync
+            | Hit::Recent(_)
+            | Hit::Welcome(_)
+            | Hit::PanelTab(_)
+            | Hit::TermShellMenu
+            | Hit::TermKillPanel
+            | Hit::TermTab(_)
+            | Hit::TermTabKill(_) => Some(IDC_HAND),
+            // text selection in a diff, scroll bar thumbs, the caption buttons (arrow, like
+            // every Windows title bar) and empty space keep the arrow
+            Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::DiffRow(_) | Hit::Thumb(_) | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose => None,
         }
     }
 
@@ -2151,6 +2573,7 @@ impl App {
     }
 
     pub fn on_wheel(&mut self, x: i32, y: i32, delta: i32, horizontal: bool) {
+        self.hide_tip();
         let Some(a) = self.area_at(x, y) else { return };
         let term = match a {
             Area::Output if self.st.panel_terminal => Some(self.panel_term()),
@@ -2272,6 +2695,7 @@ impl App {
     }
 
     pub fn on_lbutton_down(&mut self, x: i32, y: i32, ctrl: bool, shift: bool) {
+        self.hide_tip();
         let hit = self.hit_test(x, y);
         if self.focus == Focus::Terminal && !matches!(hit, Hit::TermBody | Hit::EditorTerm | Hit::TermShellMenu | Hit::TermTab(_) | Hit::TermTabKill(_) | Hit::PanelTab(_) | Hit::Cmd(_) | Hit::Sash(_)) {
             self.focus = Focus::Changes;
@@ -2380,10 +2804,13 @@ impl App {
                 self.focus = Focus::Main;
                 self.activate_tab(i);
                 self.sync_term_focus();
+                // dragging the tab reorders it
+                self.drag = Some(Drag::Tab(i, x, false));
             }
             Hit::ActivityView(v) => self.set_side_view(v),
             Hit::ExplorerHeader => {}
             Hit::ExplorerRow(i) => self.explorer_activate(i, false),
+            Hit::TabClose(i) if self.tabs.get(i).map(|t| t.pinned).unwrap_or(false) => self.set_tab_pinned(i, false),
             Hit::TabClose(i) => self.close_tab(i),
             Hit::BranchesHeader => self.toggle_branches_section(),
             Hit::GraphHeader => self.toggle_graph_section(),
@@ -2551,15 +2978,15 @@ impl App {
     pub fn on_dblclick(&mut self, x: i32, y: i32) {
         match self.hit_test(x, y) {
             // like VS Code: the first click opened a preview tab, the double click keeps it open
-            Hit::FileRow(_) | Hit::GraphRow(_) | Hit::Tab(_) => self.pin_tab(self.tab_active),
+            Hit::FileRow(_) | Hit::GraphRow(_) | Hit::Tab(_) => self.keep_tab(self.tab_active),
             Hit::ExplorerRow(i) if self.ex.rows.get(i).map(|r| !r.dir).unwrap_or(false) => {
-                self.pin_tab(self.tab_active);
+                self.keep_tab(self.tab_active);
                 self.focus = Focus::Main;
             }
             Hit::EditorText => self.editor_dblclick(x, y),
             Hit::CommitFile(i) => {
                 self.open_commit_file(i);
-                self.pin_tab(self.tab_active);
+                self.keep_tab(self.tab_active);
             }
             Hit::BranchRow(i) if matches!(self.brows.get(i), Some(BRow::Ref(_))) => self.branch_activate(i),
             Hit::TermBody | Hit::EditorTerm => self.term_select_word(x, y),
@@ -2582,18 +3009,18 @@ impl App {
         let has = self.repo.is_some();
         let s = self.status().cloned().unwrap_or_default();
         let items = vec![
-            m.it_if("Pull", has, |a| a.exec(Cmd::Pull)),
-            m.it_if("Push", has, |a| a.exec(Cmd::Push)),
+            m.cmd_if("Pull", has, Cmd::Pull),
+            m.cmd_if("Push", has, Cmd::Push),
             m.cmd("Clone", Cmd::Clone),
-            m.it_if("Checkout to...", has, |a| a.exec(Cmd::Checkout)),
-            m.it_if("Fetch", has, |a| a.exec(Cmd::Fetch)),
+            m.cmd_if("Checkout to...", has, Cmd::Checkout),
+            m.cmd_if("Fetch", has, Cmd::Fetch),
             MenuItem::Sep,
             sub("Commit", vec![
                 m.cmd("Commit", Cmd::Commit),
                 m.cmd("Commit All", Cmd::CommitAll),
                 m.cmd("Undo Last Commit", Cmd::UndoCommit),
-                m.it_if("Abort Rebase", s.rebasing, |a| a.exec(Cmd::RebaseAbort)),
-                m.it_if("Abort Merge", s.merging, |a| a.exec(Cmd::MergeAbort)),
+                m.cmd_if("Abort Rebase", s.rebasing, Cmd::RebaseAbort),
+                m.cmd_if("Abort Merge", s.merging, Cmd::MergeAbort),
                 MenuItem::Sep,
                 m.cmd("Commit (Amend)", Cmd::CommitAmend),
                 m.cmd("Commit & Push", Cmd::CommitPush),
@@ -2644,14 +3071,14 @@ impl App {
             m.cmd("Open Folder...", Cmd::OpenFolder),
             m.cmd("Open Recent...", Cmd::OpenRecent),
             m.cmd("New Window", Cmd::NewWindow),
-            m.it_if("Open in File Explorer", has, |a| a.exec(Cmd::OpenExplorer)),
-            m.it_if("Open Terminal", has, |a| a.exec(Cmd::OpenTerminal)),
+            m.cmd_if("Open in File Explorer", has, Cmd::OpenExplorer),
+            m.cmd_if("Open Terminal", has, Cmd::OpenTerminal),
             MenuItem::Sep,
-            m.check("View as Tree", self.st.tree_view, |a| a.exec(Cmd::ToggleTreeView)),
-            m.check("Show Output", self.st.output_visible, |a| a.exec(Cmd::ToggleOutput)),
-            m.check("Dark Theme", self.st.dark, |a| a.exec(Cmd::ToggleTheme)),
+            m.check_cmd("View as Tree", self.st.tree_view, Cmd::ToggleTreeView),
+            m.check_cmd("Show Output", self.st.output_visible, Cmd::ToggleOutput),
+            m.check_cmd("Dark Theme", self.st.dark, Cmd::ToggleTheme),
             m.cmd(if self.st.sidebar_right { "Move Primary Side Bar Left" } else { "Move Primary Side Bar Right" }, Cmd::ToggleSidebarPos),
-            m.cmd("Hide Primary Side Bar\tCtrl+B", Cmd::ToggleSidebar),
+            m.cmd("Hide Primary Side Bar", Cmd::ToggleSidebar),
             m.cmd("Show All Commands...", Cmd::Palette),
         ];
         let _ = y;
@@ -2661,11 +3088,14 @@ impl App {
     /// Middle click closes a tab.
     pub fn on_mbutton_up(&mut self, x: i32, y: i32) {
         if let Hit::Tab(i) | Hit::TabClose(i) = self.hit_test(x, y) {
-            self.close_tab(i);
+            if !self.tabs[i].pinned {
+                self.close_tab(i);
+            }
         }
     }
 
     pub fn on_rbutton_up(&mut self, x: i32, y: i32) {
+        self.hide_tip();
         let hit = self.hit_test(x, y);
         if hit == Hit::TermBody || hit == Hit::EditorTerm {
             // Windows Terminal behavior: copy the selection, otherwise paste
@@ -2687,7 +3117,7 @@ impl App {
         if contains(&self.l.activity, x, y) || contains(&self.l.title, x, y) {
             let items = vec![
                 m.cmd(if self.st.sidebar_right { "Move Primary Side Bar Left" } else { "Move Primary Side Bar Right" }, Cmd::ToggleSidebarPos),
-                m.cmd(if self.st.sidebar_visible { "Hide Primary Side Bar\tCtrl+B" } else { "Show Primary Side Bar\tCtrl+B" }, Cmd::ToggleSidebar),
+                m.cmd(if self.st.sidebar_visible { "Hide Primary Side Bar" } else { "Show Primary Side Bar" }, Cmd::ToggleSidebar),
             ];
             self.show_menu(x, y, items, m);
             return;
@@ -2758,7 +3188,7 @@ impl App {
                 let rel = first.path.clone();
                 let (f0, f1, f2, f3, f4, f5) = (files.clone(), files.clone(), files.clone(), files.clone(), files.clone(), files.clone());
                 let mut v = vec![
-                    m.it_if("Open Changes", files.len() == 1, move |a| a.open_change(first, true)),
+                    m.it_if("Open Changes\tEnter", files.len() == 1, move |a| a.open_change(first, true)),
                     m.it("Open File", move |a| a.file_action(f1, 3)),
                     m.it("Open with Default App", move |a| a.file_action(f0, 4)),
                     MenuItem::Sep,
@@ -2768,7 +3198,7 @@ impl App {
                     Group::Merge => v.push(m.it("Stage Changes (Mark Resolved)", move |a| a.stage(f2))),
                     Group::Changes => {
                         v.push(m.it("Stage Changes", move |a| a.stage(f2)));
-                        v.push(m.it("Discard Changes", move |a| a.discard(f3)));
+                        v.push(m.it("Discard Changes\tDel", move |a| a.discard(f3)));
                     }
                 }
                 if group == Group::Merge {
@@ -2820,7 +3250,7 @@ impl App {
                 v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &abs2)));
                 v.push(m.it("Copy Relative Path", move |a| win::set_clipboard(a.hwnd, &rel)));
                 v.push(MenuItem::Sep);
-                v.push(m.check("View as Tree", true, |a| a.exec(Cmd::ToggleTreeView)));
+                v.push(m.check_cmd("View as Tree", true, Cmd::ToggleTreeView));
                 v
             }
             Hit::GroupRow(i) | Hit::GroupAct(i, _) => match self.crows.get(i) {
@@ -2840,7 +3270,7 @@ impl App {
                 let (h1, h2, h3, h4, h5, h6) = (c.hash.clone(), c.hash.clone(), c.hash.clone(), c.hash.clone(), c.hash.clone(), c.hash.clone());
                 let msg = c.message.clone();
                 let c2 = c.clone();
-                let mut v = vec![m.it("Open Changes", move |a| a.open_commit(c2, None, true)), MenuItem::Sep];
+                let mut v = vec![m.it("Open Changes\tEnter", move |a| a.open_commit(c2, None, true)), MenuItem::Sep];
                 for d in c.refs.iter().filter(|d| d.kind == RefKind::Head && Some(&d.name) != branch.as_ref()) {
                     let n = d.name.clone();
                     v.push(m.it(&format!("Checkout {}", d.name), move |a| a.checkout(format!("H:{n}"))));
@@ -2873,18 +3303,21 @@ impl App {
                 let mut v = Vec::new();
                 match kind {
                     DiffKind::WorkingTree | DiffKind::Untracked => {
-                        v.push(m.it_if("Stage Selected Lines", has_sel, |a| a.apply_lines(None, 0)));
+                        v.push(m.it_if("Stage Selected Lines\tS", has_sel, |a| a.apply_lines(None, 0)));
                         if kind == DiffKind::WorkingTree {
                             v.push(m.it_if("Revert Selected Lines", has_sel, |a| a.apply_lines(None, 2)));
                         }
                     }
-                    DiffKind::Index => v.push(m.it_if("Unstage Selected Lines", has_sel, |a| a.apply_lines(None, 1))),
+                    DiffKind::Index => v.push(m.it_if("Unstage Selected Lines\tU", has_sel, |a| a.apply_lines(None, 1))),
                     DiffKind::Commit => {}
                 }
                 v.push(MenuItem::Sep);
-                v.push(m.it_if("Copy", has_sel, |a| a.copy_diff_selection()));
-                v.push(m.check("Inline View", self.st.inline_diff, |a| a.exec(Cmd::ToggleInline)));
-                v.push(m.check("Collapse Unchanged Regions", self.st.compact_diff, |a| a.exec(Cmd::ToggleCompact)));
+                v.push(m.it_if("Copy\tCtrl+C", has_sel, |a| a.copy_diff_selection()));
+                v.push(m.check_cmd("Inline View", self.st.inline_diff, Cmd::ToggleInline));
+                v.push(m.check_cmd("Collapse Unchanged Regions", self.st.compact_diff, Cmd::ToggleCompact));
+                v.push(MenuItem::Sep);
+                v.push(m.cmd("Go to Next Change", Cmd::NextChange));
+                v.push(m.cmd("Go to Previous Change", Cmd::PrevChange));
                 v
             }
             _ => return,
@@ -2922,8 +3355,7 @@ impl App {
     pub fn global_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> bool {
         let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
         let c = match (vk, ctrl, shift) {
-            (0xC0, true, false) if alt => Some(Cmd::ToggleEditorTerminal), // Ctrl+Alt+`
-            (0xC0, true, true) if alt => Some(Cmd::NewTerminalEditor),     // Ctrl+Alt+Shift+`
+            (0xC0, true, false) if alt => Some(Cmd::NewTerminal),          // Ctrl+Alt+`
             (0x50, true, true) | (0x70, false, false) => Some(Cmd::Palette), // Ctrl+Shift+P, F1
             (0x74, false, false) => Some(Cmd::Refresh),                      // F5
             (0x4A, true, false) => Some(Cmd::ToggleOutput),                  // Ctrl+J
@@ -2941,7 +3373,7 @@ impl App {
             (0x57, true, false) | (0x73, true, false) => Some(Cmd::CloseEditor), // Ctrl+W, Ctrl+F4
             (0x09, true, false) | (0x22, true, false) => Some(Cmd::NextEditor), // Ctrl+Tab, Ctrl+PageDown
             (0x09, true, true) | (0x21, true, false) => Some(Cmd::PrevEditor), // Ctrl+Shift+Tab, Ctrl+PageUp
-            (0xC0, true, true) => Some(Cmd::NewTerminal),                    // Ctrl+Shift+`
+            (0xC0, true, true) => Some(Cmd::ToggleEditorTerminal),           // Ctrl+Shift+`
             (0x76, false, false) => Some(Cmd::NextChange),                   // F7
             (0x76, false, true) => Some(Cmd::PrevChange),
             (0x0D, true, _) => Some(if shift { Cmd::CommitAll } else { Cmd::Commit }),
@@ -3024,6 +3456,7 @@ impl App {
     }
 
     pub fn on_key(&mut self, vk: u16, ctrl: bool, shift: bool) {
+        self.hide_tip();
         if self.overlay.is_some() {
             self.overlay_key(vk);
             return;

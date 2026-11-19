@@ -24,6 +24,8 @@ pub const WM_TERM: u32 = WM_APP + 4;
 pub const TIMER_FS: usize = 1;
 pub const TIMER_TOAST: usize = 2;
 pub const TIMER_SPIN: usize = 3;
+/// Hover delay before a tooltip shows.
+pub const TIMER_TIP: usize = 4;
 
 pub type Then = Box<dyn FnOnce(&mut App) + Send>;
 pub type OnErr = Box<dyn FnOnce(&mut App, &GitError) -> bool + Send>;
@@ -324,6 +326,9 @@ pub enum Drag {
     DiffSelect,
     TermSelect,
     EditSelect,
+    /// Dragging editor tab `.0` to reorder it; `.1` is the x where the drag started, `.2`
+    /// whether the mouse moved far enough to count as a drag.
+    Tab(usize, i32, bool),
 }
 
 #[derive(Clone, Copy)]
@@ -365,6 +370,11 @@ macro_rules! cmds {
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         pub enum Cmd { $($name),* }
         pub const COMMANDS: &[(Cmd, &str, &str)] = &[$((Cmd::$name, $title, $key)),*];
+
+        /// Keyboard shortcut of a command ("" when it has none).
+        pub fn cmd_key(c: Cmd) -> &'static str {
+            match c { $(Cmd::$name => $key),* }
+        }
     };
 }
 
@@ -373,7 +383,7 @@ cmds! {
     Refresh => "Git: Refresh", "F5";
     Commit => "Git: Commit", "Ctrl+Enter";
     CommitAmend => "Git: Commit (Amend)", "";
-    CommitAll => "Git: Commit All", "";
+    CommitAll => "Git: Commit All", "Ctrl+Shift+Enter";
     CommitPush => "Git: Commit & Push", "";
     CommitSync => "Git: Commit & Sync", "";
     UndoCommit => "Git: Undo Last Commit", "";
@@ -422,9 +432,9 @@ cmds! {
     OpenExplorer => "File: Reveal Repository in File Explorer", "";
     OpenTerminal => "Terminal: Open External Terminal", "Ctrl+Shift+C";
     ToggleTerminal => "View: Toggle Terminal", "Ctrl+`";
-    NewTerminal => "Terminal: Create New Terminal", "Ctrl+Shift+`";
-    ToggleEditorTerminal => "View: Toggle Terminal in Editor Area", "Ctrl+Alt+`";
-    NewTerminalEditor => "Terminal: Create New Terminal in Editor Area", "Ctrl+Alt+Shift+`";
+    NewTerminal => "Terminal: Create New Terminal", "Ctrl+Alt+`";
+    ToggleEditorTerminal => "View: Toggle Terminal in Editor Area", "Ctrl+Shift+`";
+    NewTerminalEditor => "Terminal: Create New Terminal in Editor Area", "";
     MoveTerminalToEditor => "Terminal: Move Terminal into Editor Area", "";
     MoveTerminalToPanel => "Terminal: Move Terminal into Panel", "";
     KillTerminal => "Terminal: Kill the Active Terminal Instance", "";
@@ -438,6 +448,8 @@ cmds! {
     CloseOtherEditors => "View: Close Other Editors", "";
     CloseAllEditors => "View: Close All Editors", "";
     KeepEditor => "View: Keep Editor", "";
+    PinEditor => "View: Pin Editor", "";
+    UnpinEditor => "View: Unpin Editor", "";
     NextEditor => "View: Open Next Editor", "Ctrl+Tab";
     PrevEditor => "View: Open Previous Editor", "Ctrl+Shift+Tab";
     TogglePanelMax => "View: Toggle Maximized Panel", "Ctrl+Shift+M";
@@ -540,6 +552,10 @@ pub struct App {
     pub buf: (HDC, HBITMAP, i32, i32),
     pub output_seen: usize,
     pub mouse: (i32, i32),
+    /// Tooltip shown: the hovered item and the mouse position it was shown at.
+    pub tip: Option<(Hit, i32, i32)>,
+    /// Where the tooltip was painted (the commit box is cut out under it).
+    pub tip_bounds: Option<RECT>,
     pub pending_init: Option<PathBuf>,
     pub pending_file: Option<PathBuf>,
     /// Terminal instances, in the panel or in editor tabs; `term_active` is the one shown
@@ -550,9 +566,9 @@ pub struct App {
     /// With `Focus::Terminal`: input goes to the terminal in the active editor tab, not the panel's.
     pub term_editor_focus: bool,
     pub term_next_id: u64,
-    /// Terminal tab used last, which Ctrl+Alt+` brings back.
+    /// Terminal tab used last, which Ctrl+Shift+` brings back.
     pub term_editor_last: Option<u64>,
-    /// Key of the tab that was active before a terminal tab was shown, which Ctrl+Alt+`
+    /// Key of the tab that was active before a terminal tab was shown, which Ctrl+Shift+`
     /// returns to.
     pub term_editor_prev: Option<String>,
     /// Caption button (HTMINBUTTON / HTMAXBUTTON / HTCLOSE) pressed in the title bar, 0 = none.
@@ -642,6 +658,8 @@ impl App {
             toasts: Vec::new(),
             hits: Vec::new(),
             hover: Hit::None,
+            tip: None,
+            tip_bounds: None,
             drag: None,
             focus: Focus::Changes,
             commit_edit: std::ptr::null_mut(),
@@ -2240,7 +2258,7 @@ impl App {
     }
 
     pub fn exec(&mut self, c: Cmd) {
-        let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
+        let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
         // the Explorer and the editor work in a folder without a repository too
         let folder_ok = matches!(c, Cmd::GotoFile | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
@@ -2375,7 +2393,9 @@ impl App {
             Cmd::CloseEditor => self.close_active_tab(),
             Cmd::CloseOtherEditors => self.close_other_tabs(self.tab_active),
             Cmd::CloseAllEditors => self.close_all_tabs(),
-            Cmd::KeepEditor => self.pin_tab(self.tab_active),
+            Cmd::KeepEditor => self.keep_tab(self.tab_active),
+            Cmd::PinEditor => self.set_tab_pinned(self.tab_active, true),
+            Cmd::UnpinEditor => self.set_tab_pinned(self.tab_active, false),
             Cmd::NextEditor => self.cycle_tab(1),
             Cmd::PrevEditor => self.cycle_tab(-1),
             Cmd::TogglePanelMax => self.toggle_panel_max(),

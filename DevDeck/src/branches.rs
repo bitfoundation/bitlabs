@@ -318,7 +318,7 @@ impl App {
                 let name = rf.name.clone();
                 let n = || name.clone();
                 let spec = format!("{}{}", kind_prefix(rf.kind), rf.name);
-                v.push(m.it_if("Checkout", !is_cur, move |a| a.checkout(spec)));
+                v.push(m.it_if("Checkout\tEnter", !is_cur, move |a| a.checkout(spec)));
                 let nn = n();
                 v.push(m.it("Checkout (Detached)", move |a| a.checkout(format!("D:{nn}"))));
                 v.push(MenuItem::Sep);
@@ -355,7 +355,7 @@ impl App {
                         v.push(m.it_if("Unset Upstream Branch", rf.upstream.is_some(), move |a| a.git_op("Unset Upstream", vec!["branch".into(), "--unset-upstream".into(), nn])));
                         v.push(MenuItem::Sep);
                         let nn = n();
-                        v.push(m.it("Rename...", move |a| a.rename_branch_named(nn)));
+                        v.push(m.it("Rename...\tF2", move |a| a.rename_branch_named(nn)));
                         let nn = n();
                         v.push(m.it_if("Delete", !is_cur, move |a| a.delete_branch(Some(nn))));
                         let nn = n();

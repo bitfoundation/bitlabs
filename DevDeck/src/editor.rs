@@ -927,7 +927,7 @@ impl App {
                 a.editor_paste();
             }),
             MenuItem::Sep,
-            m.it_if("Delete", has_sel, |a| {
+            m.it_if("Delete\tDel", has_sel, |a| {
                 a.editor_key(0x2E, false, false);
             }),
             m.it("Select All\tCtrl+A", |a| {

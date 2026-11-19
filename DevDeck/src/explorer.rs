@@ -369,7 +369,7 @@ impl App {
                 v.push(m.it(if open { "Collapse" } else { "Expand" }, move |a| a.toggle_explorer_dir(i, Some(!open))));
             } else {
                 let (p1, p2) = (r.path.clone(), r.path.clone());
-                v.push(m.it("Open", move |a| a.open_file_viewer(p1, true)));
+                v.push(m.it("Open\tEnter", move |a| a.open_file_viewer(p1, true)));
                 let change = self.status().and_then(|s| {
                     [Group::Merge, Group::Changes, Group::Staged].iter().find_map(|g| s.files.iter().find(|f| f.group == *g && f.path == p2).cloned())
                 });
@@ -390,7 +390,7 @@ impl App {
             v.push(m.it("Delete\tDel", move |a| a.explorer_delete(i)));
             v.push(MenuItem::Sep);
         }
-        v.push(m.it("Refresh Explorer", |a| a.refresh()));
+        v.push(m.it("Refresh Explorer\tF5", |a| a.refresh()));
         v.push(m.it("Collapse Folders in Explorer", |a| a.explorer_collapse_all()));
         v
     }

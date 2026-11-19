@@ -209,7 +209,7 @@ impl App {
 
     /// Opens (or activates) the editor tab of terminal `id` and focuses it.
     fn show_editor_terminal(&mut self, id: u64) {
-        // Ctrl+Alt+` goes back to the tab that was shown before the first terminal tab
+        // Ctrl+Shift+` goes back to the tab that was shown before the first terminal tab
         if !matches!(self.view, MainView::Terminal(_)) {
             self.term_editor_prev = self.tabs.get(self.tab_active).map(|t| t.key.clone());
         }
@@ -232,7 +232,7 @@ impl App {
         self.invalidate();
     }
 
-    /// Ctrl+Alt+`, the editor area's Ctrl+`: focuses the terminal tab that is shown, else
+    /// Ctrl+Shift+`, the editor area's Ctrl+`: focuses the terminal tab that is shown, else
     /// brings back the terminal tab used last (or the first one), else opens a new terminal
     /// in the editor area. When a terminal tab already has focus it goes back to the tab that
     /// was active before, or to the side bar.
@@ -612,10 +612,9 @@ impl App {
         // workbench shortcuts that win over the shell (like VS Code's defaults)
         let cmd = match (vk, ctrl, shift) {
             (0x50, true, true) | (0x70, false, false) => Some(Cmd::Palette),
-            (0xC0, true, false) if alt => Some(Cmd::ToggleEditorTerminal),
-            (0xC0, true, true) if alt => Some(Cmd::NewTerminalEditor),
+            (0xC0, true, false) if alt => Some(Cmd::NewTerminal),
             (0xC0, true, false) => Some(Cmd::ToggleTerminal),
-            (0xC0, true, true) => Some(Cmd::NewTerminal),
+            (0xC0, true, true) => Some(Cmd::ToggleEditorTerminal),
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),
             (0x4A, true, false) => Some(Cmd::ToggleOutput),
             (0x47, true, true) => Some(Cmd::FocusCommit),

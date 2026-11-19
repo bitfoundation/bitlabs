@@ -239,19 +239,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 TrackMouseEvent(&mut tme);
             }
             with_app(hwnd, |a| {
-                let h = hit.unwrap_or(app::Hit::None);
-                if a.hover != h {
-                    a.hover = h;
-                    a.invalidate();
-                }
+                // the tooltip of a caption button shows at the mouse
+                let mut p = POINT { x: lo(lp), y: hi(lp) };
+                ScreenToClient(hwnd, &mut p);
+                a.mouse = (p.x, p.y);
+                a.set_hover(hit.unwrap_or(app::Hit::None));
             });
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_NCMOUSELEAVE => {
             with_app(hwnd, |a| {
                 if matches!(a.hover, app::Hit::CaptionMin | app::Hit::CaptionMax | app::Hit::CaptionClose) {
-                    a.hover = app::Hit::None;
-                    a.invalidate();
+                    a.set_hover(app::Hit::None);
                 }
             });
             0
@@ -343,6 +342,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     a.refresh();
                 },
                 app::TIMER_TOAST => a.tick_toasts(),
+                app::TIMER_TIP => a.show_tip(),
                 app::TIMER_SPIN => {
                     a.spin = a.spin.wrapping_add(1);
                     a.invalidate();
@@ -375,12 +375,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSELEAVE => {
-            with_app(hwnd, |a| {
-                if a.hover != app::Hit::None {
-                    a.hover = app::Hit::None;
-                    a.invalidate();
-                }
-            });
+            with_app(hwnd, |a| a.set_hover(app::Hit::None));
             0
         }
         WM_SETCURSOR => {

@@ -1,6 +1,8 @@
 //! Editor tabs for the main area (diffs, files, commits), with VS Code's preview tab:
 //! a single click opens a preview tab (italic title) that the next open replaces; a double
-//! click, double-clicking the tab or "Keep Open" pins it.
+//! click, double-clicking the tab or "Keep Open" keeps it. Pinned tabs stay at the left
+//! of the strip, show a pin instead of the close button and survive "Close Others" /
+//! "Close All", `Ctrl+W` and a middle click. Tabs are reordered by dragging them.
 
 use crate::app::*;
 use crate::ui::Menu;
@@ -13,6 +15,8 @@ pub struct EditorTab {
     /// Identity used to reuse a tab that already shows the same thing.
     pub key: String,
     pub preview: bool,
+    /// Pinned tabs come first in `App::tabs`.
+    pub pinned: bool,
     pub scroll: i32,
     pub hscroll: i32,
     /// `view_gen` of the load that fills this tab (results for other tabs are routed by it).
@@ -76,8 +80,9 @@ impl App {
                 t.scroll = self.scroll[Area::Main as usize];
                 t.hscroll = self.hscroll;
             }
-            let at = if self.tabs.is_empty() { 0 } else { self.tab_active + 1 };
-            self.tabs.insert(at, EditorTab { view: MainView::Empty, key, preview: !pin, scroll: 0, hscroll: 0, gen: 0 });
+            // new tabs go after the active one, but never among the pinned tabs
+            let at = if self.tabs.is_empty() { 0 } else { (self.tab_active + 1).max(self.pinned_count()) };
+            self.tabs.insert(at, EditorTab { view: MainView::Empty, key, preview: !pin, pinned: false, scroll: 0, hscroll: 0, gen: 0 });
             self.tab_active = at;
         }
         self.scroll[Area::Main as usize] = 0;
@@ -214,81 +219,126 @@ impl App {
         self.invalidate();
     }
 
+    /// `Ctrl+W` / `Ctrl+F4`: closes the active tab unless it is pinned (like VS Code, a pinned
+    /// tab is only closed from its menu, or after unpinning it).
     pub fn close_active_tab(&mut self) {
-        if !self.tabs.is_empty() {
+        if self.tabs.get(self.tab_active).map(|t| !t.pinned).unwrap_or(false) {
             self.close_tab(self.tab_active);
         }
     }
 
-    /// Keys of the dirty tabs among `range`.
-    fn dirty_in(&self, range: impl Iterator<Item = usize>) -> Vec<String> {
-        range.filter(|&i| self.tab_dirty(i)).map(|i| self.tabs[i].key.clone()).collect()
+    /// Closes the tabs with the given keys (asking first when some have unsaved changes).
+    fn close_keys(&mut self, keys: Vec<String>) {
+        let dirty: Vec<String> = keys.iter().filter(|k| self.tabs.iter().position(|t| &t.key == *k).map(|i| self.tab_dirty(i)).unwrap_or(false)).cloned().collect();
+        if !dirty.is_empty() {
+            self.confirm_unsaved(dirty, move |a| a.close_keys_now(&keys));
+            return;
+        }
+        self.close_keys_now(&keys);
     }
 
+    fn close_keys_now(&mut self, keys: &[String]) {
+        // the active tab goes last, so the views of the tabs in between aren't reloaded
+        let active = self.tabs.get(self.tab_active).map(|t| t.key.clone());
+        let mut keys = keys.to_vec();
+        keys.sort_by_key(|k| Some(k) == active.as_ref());
+        for k in &keys {
+            if let Some(i) = self.tabs.iter().position(|t| &t.key == k) {
+                self.close_tab_now(i);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Keys of the unpinned tabs among `range`, other than `except`.
+    fn unpinned_keys(&self, range: impl Iterator<Item = usize>, except: usize) -> Vec<String> {
+        range.filter(|&i| i != except && !self.tabs[i].pinned).map(|i| self.tabs[i].key.clone()).collect()
+    }
+
+    /// "Close Others": closes every unpinned tab but `keep`.
     pub fn close_other_tabs(&mut self, keep: usize) {
         if keep >= self.tabs.len() {
             return;
         }
-        let dirty = self.dirty_in((0..self.tabs.len()).filter(|&i| i != keep));
-        if !dirty.is_empty() {
-            let key = self.tabs[keep].key.clone();
-            self.confirm_unsaved(dirty, move |a| {
-                if let Some(k) = a.tabs.iter().position(|t| t.key == key) {
-                    a.close_other_tabs(k);
-                }
-            });
-            return;
-        }
         self.activate_tab(keep);
-        let t = self.tabs.remove(self.tab_active);
-        self.tabs = vec![t];
-        self.tab_active = 0;
-        self.prune_editor_terms();
-        self.invalidate();
+        let keys = self.unpinned_keys(0..self.tabs.len(), keep);
+        self.close_keys(keys);
     }
 
+    /// "Close to the Right": closes the unpinned tabs right of `of`.
     pub fn close_tabs_right(&mut self, of: usize) {
         if of >= self.tabs.len() {
             return;
         }
-        let dirty = self.dirty_in(of + 1..self.tabs.len());
-        if !dirty.is_empty() {
-            let key = self.tabs[of].key.clone();
-            self.confirm_unsaved(dirty, move |a| {
-                if let Some(k) = a.tabs.iter().position(|t| t.key == key) {
-                    a.close_tabs_right(k);
-                }
-            });
-            return;
-        }
-        if self.tab_active > of {
+        if self.tab_active > of && !self.tabs[self.tab_active].pinned {
             self.activate_tab(of);
         }
-        self.tabs.truncate(of + 1);
-        self.prune_editor_terms();
-        self.invalidate();
+        let keys = self.unpinned_keys(of + 1..self.tabs.len(), usize::MAX);
+        self.close_keys(keys);
     }
 
+    /// "Close All": closes every unpinned tab.
     pub fn close_all_tabs(&mut self) {
-        let dirty = self.dirty_in(0..self.tabs.len());
-        if !dirty.is_empty() {
-            self.confirm_unsaved(dirty, |a| a.close_all_tabs());
-            return;
-        }
-        self.tabs.clear();
-        self.tab_active = 0;
-        self.view = MainView::Empty;
-        self.scroll[Area::Main as usize] = 0;
-        self.hscroll = 0;
-        self.prune_editor_terms();
-        self.sync_term_focus();
-        self.invalidate();
+        let keys = self.unpinned_keys(0..self.tabs.len(), usize::MAX);
+        self.close_keys(keys);
     }
 
-    pub fn pin_tab(&mut self, i: usize) {
+    /// Keeps a preview tab open (the next file no longer replaces it).
+    pub fn keep_tab(&mut self, i: usize) {
         if let Some(t) = self.tabs.get_mut(i) {
             t.preview = false;
             self.invalidate();
+        }
+    }
+
+    pub fn pinned_count(&self) -> usize {
+        self.tabs.iter().take_while(|t| t.pinned).count()
+    }
+
+    /// Pins tab `i` (it moves to the end of the pinned tabs and is kept open) or unpins it
+    /// (it moves to the start of the unpinned tabs).
+    pub fn set_tab_pinned(&mut self, i: usize, pinned: bool) {
+        let Some(t) = self.tabs.get_mut(i) else { return };
+        if t.pinned == pinned {
+            return;
+        }
+        t.pinned = pinned;
+        t.preview = false;
+        // either way the tab lands on the boundary between the pinned and the other tabs
+        let to = self.tabs.iter().enumerate().filter(|&(k, t)| k != i && t.pinned).count();
+        self.move_tab(i, to);
+        self.invalidate();
+    }
+
+    /// Moves tab `from` to index `to` (the tabs between shift over), keeping the active tab
+    /// active.
+    pub fn move_tab(&mut self, from: usize, to: usize) {
+        let n = self.tabs.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        let t = self.tabs.remove(from);
+        self.tabs.insert(to, t);
+        let a = self.tab_active;
+        self.tab_active = if a == from {
+            to
+        } else if from < a && a <= to {
+            a - 1
+        } else if to <= a && a < from {
+            a + 1
+        } else {
+            a
+        };
+        self.invalidate();
+    }
+
+    /// The indices tab `i` can be dragged to (inclusive): its own group, pinned or not.
+    pub fn tab_drag_range(&self, i: usize) -> (usize, usize) {
+        let pc = self.pinned_count();
+        if self.tabs.get(i).map(|t| t.pinned).unwrap_or(false) {
+            (0, pc.saturating_sub(1))
+        } else {
+            (pc, self.tabs.len().saturating_sub(1))
         }
     }
 
@@ -304,18 +354,23 @@ impl App {
     pub fn tab_menu(&mut self, i: usize, m: &mut Menu) -> Vec<MenuItem> {
         let n = self.tabs.len();
         let preview = self.tabs.get(i).map(|t| t.preview).unwrap_or(false);
+        let pinned = self.tabs.get(i).map(|t| t.pinned).unwrap_or(false);
+        let others = (0..n).any(|k| k != i && !self.tabs[k].pinned);
+        let right = (i + 1..n).any(|k| !self.tabs[k].pinned);
+        let any = self.tabs.iter().any(|t| !t.pinned);
         let path = match self.tab_view(i) {
             MainView::Diff(d) => Some(d.path.clone()),
             MainView::File(f) => Some(f.path.clone()),
             _ => None,
         };
         let mut v = vec![
-            m.it("Close", move |a| a.close_tab(i)),
-            m.it_if("Close Others", n > 1, move |a| a.close_other_tabs(i)),
-            m.it_if("Close to the Right", i + 1 < n, move |a| a.close_tabs_right(i)),
-            m.it("Close All", |a| a.close_all_tabs()),
+            m.it(if pinned { "Close" } else { "Close\tCtrl+W" }, move |a| a.close_tab(i)),
+            m.it_if("Close Others", others, move |a| a.close_other_tabs(i)),
+            m.it_if("Close to the Right", right, move |a| a.close_tabs_right(i)),
+            m.it_if("Close All", any, |a| a.close_all_tabs()),
             MenuItem::Sep,
-            m.it_if("Keep Open", preview, move |a| a.pin_tab(i)),
+            m.it_if("Keep Open", preview, move |a| a.keep_tab(i)),
+            if pinned { m.it("Unpin", move |a| a.set_tab_pinned(i, false)) } else { m.it("Pin", move |a| a.set_tab_pinned(i, true)) },
         ];
         if let MainView::Terminal(id) = *self.tab_view(i) {
             v.push(MenuItem::Sep);

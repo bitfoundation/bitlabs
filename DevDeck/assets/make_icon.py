@@ -1,8 +1,10 @@
 """Renders the DevDeck app icon (assets/devdeck.ico and a 256 px PNG preview).
 
-A fanned deck of cards on a blue-violet tile; the front card carries a Git branch
-graph. Every size is drawn on its own (supersampled, then downscaled) so the small
-sizes stay crisp, and the smallest sizes use a simplified drawing.
+One bold mark on a blue-violet tile: a terminal prompt (">_") whose chevron is a
+Git branch, with commit nodes at its two ends, and a green cursor for the
+underscore. Every size is drawn on its own (supersampled, then
+downscaled) so the small sizes stay crisp, and the smallest sizes use thicker
+strokes and solid nodes.
 
     python assets/make_icon.py
 """
@@ -17,11 +19,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SIZES = [16, 20, 24, 32, 40, 48, 64, 128, 256]
 SS = 8  # supersampling factor
 
-TOP = (59, 130, 246)  # blue
-BOTTOM = (109, 40, 217)  # violet
-CARD = (248, 250, 252)
-INK = (67, 56, 202)  # indigo, for the branch graph
-ACCENT = (16, 185, 129)  # green branch head
+TOP = (37, 99, 235)  # blue-600
+BOTTOM = (109, 40, 217)  # violet-700
+MARK = (255, 255, 255)
+CURSOR = (52, 211, 153)  # emerald-400
+SHADOW = (30, 27, 75)
 
 
 def lerp(a, b, t):
@@ -43,56 +45,43 @@ def tile(n):
     return out
 
 
-def layer(img, draw_fn):
-    """Draws on a transparent layer and alpha-blends it onto `img`."""
-    lay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw_fn(ImageDraw.Draw(lay))
-    return Image.alpha_composite(img, lay)
+def mark(n, size):
+    """The ">_" mark on a transparent layer."""
+    u = n / 100.0
+    small = size <= 24
+    lay = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(lay)
+    w = (13 if small else 10) * u  # stroke width
+    nr = (10 if small else 9) * u  # node radius
+    a, b, c = (27 * u, 26 * u), (60 * u, 50 * u), (27 * u, 74 * u)
+    d.line((a, b, c), fill=MARK + (255,), width=int(w), joint="curve")
+    # round tip of the chevron
+    h = w / 2
+    d.ellipse((b[0] - h, b[1] - h, b[0] + h, b[1] + h), fill=MARK + (255,))
+    for x, y in (a, c):
+        d.ellipse((x - nr, y - nr, x + nr, y + nr), fill=MARK + (255,))
+    if not small:
+        # hollow commit nodes: punch the centers out of the layer
+        hole = nr * 0.45
+        for x, y in (a, c):
+            d.ellipse((x - hole, y - hole, x + hole, y + hole), fill=(0, 0, 0, 0))
+    # the cursor: a rounded bar under the prompt
+    y = c[1]
+    d.rounded_rectangle((58 * u, y - h, 80 * u, y + h), radius=h, fill=CURSOR + (255,))
+    return lay
 
 
 def render(size):
     n = size * SS
-    small = size <= 24
     img = tile(n)
-    u = n / 100.0  # drawing unit: 1/100 of the icon
-
-    # the deck: the cards behind the front one are fanned out to the upper right
-    fl, ft, fr, fb = 15 * u, 35 * u, 73 * u, 87 * u
-    r = 7 * u
-    backs = [(10, 0.45)] if small else [(16, 0.30), (8, 0.55)]
-    for off, alpha in backs:
-        o = off * u
-        img = layer(img, lambda d: d.rounded_rectangle((fl + o, ft - o, fr + o, fb - o), radius=r, fill=CARD + (int(255 * alpha),)))
-    # soft shadow under the front card, then the card
-    img = layer(img, lambda d: d.rounded_rectangle((fl + 1.5 * u, ft + 2 * u, fr + 1.5 * u, fb + 2 * u), radius=r, fill=(30, 27, 75, 80)))
-    d = ImageDraw.Draw(img)
-    d.rounded_rectangle((fl, ft, fr, fb), radius=r, fill=CARD + (255,))
-
-    # branch graph on the front card: a main line with a branch curving off it
-    w = (8.0 if small else 5.5) * u
-    nr = (8.0 if small else 6.0) * u
-    cx = (fl + fr) / 2
-    x0, x1 = cx - 11 * u, cx + 11 * u
-    y_top, y_mid, y_bot = ft + 13 * u, ft + 26 * u, fb - 12 * u
-    d.line((x0, y_top, x0, y_bot), fill=INK + (255,), width=int(w))
-    steps = 32
-    pts = []
-    sx, sy = x0, y_bot - 8 * u
-    ex, ey = x1, y_top + 2 * u
-    c1 = (x0, y_mid)
-    c2 = (x1, y_mid + 4 * u)
-    for i in range(steps + 1):
-        t = i / steps
-        bx = (1 - t) ** 3 * sx + 3 * (1 - t) ** 2 * t * c1[0] + 3 * (1 - t) * t * t * c2[0] + t ** 3 * ex
-        by = (1 - t) ** 3 * sy + 3 * (1 - t) ** 2 * t * c1[1] + 3 * (1 - t) * t * t * c2[1] + t ** 3 * ey
-        pts.append((bx, by))
-    d.line(pts, fill=INK + (255,), width=int(w), joint="curve")
-    for px, py, col in [(x0, y_top, INK), (x0, y_bot, INK), (x1, y_top, ACCENT)]:
-        d.ellipse((px - nr, py - nr, px + nr, py + nr), fill=col + (255,))
-        if not small:
-            hole = nr * 0.45
-            d.ellipse((px - hole, py - hole, px + hole, py + hole), fill=CARD + (255,))
-
+    m = mark(n, size)
+    # soft shadow: the mark's alpha, tinted and nudged down
+    if size >= 32:
+        alpha = m.split()[3]
+        sh = Image.new("RGBA", (n, n), SHADOW + (0,))
+        sh.putalpha(alpha.point(lambda v: v * 70 // 255))
+        img = Image.alpha_composite(img, sh.transform((n, n), Image.AFFINE, (1, 0, 0, 0, 1, -n * 0.02)))
+    img = Image.alpha_composite(img, m)
     return img.resize((size, size), Image.LANCZOS)
 
 
