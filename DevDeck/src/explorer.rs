@@ -163,6 +163,16 @@ pub fn mtime(root: &Path, rel: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(root.join(rel)).and_then(|m| m.modified()).ok()
 }
 
+/// Splits file text into lines; true when most line breaks are CRLF (the ending used when
+/// saving, so a stray CRLF doesn't turn an LF file into a CRLF one). Only the '\r' of a
+/// "\r\n" is taken off, so "a\r\r\n" and a trailing lone '\r' survive a save.
+pub fn split_lines(text: &str) -> (Vec<String>, bool) {
+    let n = text.matches('\n').count();
+    let crlf = text.matches("\r\n").count() * 2 > n;
+    let lines = text.split('\n').enumerate().map(|(k, l)| if k < n { l.strip_suffix('\r').unwrap_or(l) } else { l }.to_string()).collect();
+    (lines, crlf)
+}
+
 /// Builds the text view of a file (or a message when it can't be shown).
 pub fn load_text(root: &Path, rel: &str) -> MainView {
     let name = short_name(rel).to_string();
@@ -181,8 +191,7 @@ pub fn load_text(root: &Path, rel: &str) -> MainView {
     let Some((text, enc, lossless)) = editor::decode(&bytes) else {
         return MainView::Message(name, "The file is not displayed because it is binary.".into());
     };
-    let crlf = text.contains("\r\n");
-    let lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
+    let (lines, crlf) = split_lines(&text);
     // a file with invalid UTF-8 / UTF-16 is shown read-only: saving would change those bytes
     let ed = EditState::new(&lines, enc, crlf, lossless);
     MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok(), ed })
@@ -354,6 +363,7 @@ impl App {
             let rel = it.data.clone();
             app.open_file_viewer(rel, true);
         });
+        self.pick_rank = true;
     }
 
     /// Context menu of Explorer row `i` (usize::MAX: empty space).
@@ -361,7 +371,8 @@ impl App {
         let mut v = vec![m.it("New File...", move |a| a.explorer_new(i, false)), m.it("New Folder...", move |a| a.explorer_new(i, true)), MenuItem::Sep];
         let root = self.folder();
         if let (Some(r), Some(root)) = (self.ex.rows.get(i).cloned(), root.clone()) {
-            let abs = root.join(&r.path).display().to_string();
+            // a Windows path for the clipboard and explorer.exe (the relative path is '/' separated)
+            let abs = root.join(&r.path).display().to_string().replace('/', "\\");
             let (a1, a2, a3) = (abs.clone(), abs.clone(), abs);
             let rel = r.path.clone();
             if r.dir {
@@ -567,25 +578,37 @@ impl App {
         let detail = if r.dir { "You can restore this folder from the Recycle Bin." } else { "You can restore this file from the Recycle Bin." };
         self.confirm(&message, detail, &["Move to Recycle Bin"], move |a, _| {
             let Some(root) = a.folder() else { return };
-            if !recycle(&root.join(&r.path)) {
-                return a.error(format!("Unable to delete '{}'.", r.path));
+            let abs = root.join(&r.path);
+            if recycle(&abs) {
+                return a.explorer_deleted(i, &r.path);
             }
-            // close the tabs of the deleted files; ones with unsaved changes stay open (saving
-            // creates the file again), like VS Code
-            for k in (0..a.tabs.len()).rev() {
-                let gone = matches!(a.tab_view(k), MainView::File(f) if f.change.is_none() && rebase_path(&f.path, &r.path, "").is_some());
-                if gone && !a.tab_dirty(k) {
-                    a.close_tab_now(k);
+            // the dialog promised the Recycle Bin: deleting for good needs its own yes
+            a.confirm("Failed to delete using the Recycle Bin. Do you want to permanently delete instead?", &format!("'{}' can't be restored after this.", r.path), &["Delete Permanently"], move |a, _| {
+                if !delete_permanently(&abs) {
+                    return a.error(format!("Unable to delete '{}'.", r.path));
                 }
-            }
-            let prefix = format!("{}/", r.path);
-            a.ex.open.retain(|p| p != &r.path && !p.starts_with(&prefix));
-            // select the row that takes its place
-            let next = a.ex.rows.iter().skip(i + 1).find(|x| !x.path.starts_with(&prefix)).or_else(|| if i > 0 { a.ex.rows.get(i - 1) } else { None }).map(|x| x.path.clone());
-            a.ex.sel = next;
-            a.rebuild_explorer();
-            a.refresh();
+                a.explorer_deleted(i, &r.path);
+            });
         });
+    }
+
+    /// After deleting `path` (row `i`): closes its tabs and selects the row that takes its place.
+    fn explorer_deleted(&mut self, i: usize, path: &str) {
+        // close the tabs of the deleted files; ones with unsaved changes stay open (saving
+        // creates the file again), like VS Code
+        for k in (0..self.tabs.len()).rev() {
+            let gone = matches!(self.tab_view(k), MainView::File(f) if f.change.is_none() && rebase_path(&f.path, path, "").is_some());
+            if gone && !self.tab_dirty(k) {
+                self.close_tab_now(k);
+            }
+        }
+        let prefix = format!("{path}/");
+        self.ex.open.retain(|p| p != path && !p.starts_with(&prefix));
+        // select the row that takes its place
+        let next = self.ex.rows.iter().skip(i + 1).find(|x| !x.path.starts_with(&prefix)).or_else(|| if i > 0 { self.ex.rows.get(i - 1) } else { None }).map(|x| x.path.clone());
+        self.ex.sel = next;
+        self.rebuild_explorer();
+        self.refresh();
     }
 }
 
@@ -599,6 +622,16 @@ mod tests {
         assert_eq!(decode_text(&[0xFF, 0xFE, b'h', 0, b'i', 0]).as_deref(), Some("hi"));
         assert_eq!(decode_text(&[0xFE, 0xFF, 0, b'h', 0, b'i']).as_deref(), Some("hi"));
         assert_eq!(decode_text(&[b'a', 0, b'b']), None);
+    }
+
+    #[test]
+    fn line_endings_follow_the_majority() {
+        assert_eq!(split_lines("a\r\nb\r\nc"), (vec!["a".to_string(), "b".into(), "c".into()], true));
+        // one stray CRLF doesn't make an LF file CRLF
+        assert_eq!(split_lines("a\nb\r\nc\nd\n"), (vec!["a".to_string(), "b".into(), "c".into(), "d".into(), "".into()], false));
+        // only the '\r' of a line break goes; a lone trailing '\r' stays
+        assert_eq!(split_lines("a\r\r\nb\r"), (vec!["a\r".to_string(), "b\r".into()], true));
+        assert_eq!(split_lines(""), (vec![String::new()], false));
     }
 
     #[test]

@@ -295,11 +295,47 @@ impl Default for Pen {
 enum State {
     Ground,
     Esc,
-    EscInter,
+    /// ESC + intermediate byte(s); holds the first one (`(` designates G0).
+    EscInter(char),
     Csi,
     Osc,
     OscEsc,
 }
+
+/// Cells a character takes: 0 for combining marks, 2 for East Asian wide and emoji.
+/// A small table of the common ranges, not full Unicode (a missed char takes one cell).
+fn width(c: char) -> u8 {
+    let c = c as u32;
+    if c < 0x300 {
+        return 1;
+    }
+    const ZERO: &[(u32, u32)] = &[(0x300, 0x36F), (0x200B, 0x200F), (0x20D0, 0x20FF), (0xFE00, 0xFE0F)];
+    #[rustfmt::skip]
+    const WIDE: &[(u32, u32)] = &[
+        (0x1100, 0x115F), (0x231A, 0x231B), (0x23E9, 0x23EC), (0x23F0, 0x23F0), (0x23F3, 0x23F3), (0x25FD, 0x25FE),
+        (0x2614, 0x2615), (0x2648, 0x2653), (0x267F, 0x267F), (0x2693, 0x2693), (0x26A1, 0x26A1), (0x26AA, 0x26AB),
+        (0x26BD, 0x26BE), (0x26C4, 0x26C5), (0x26CE, 0x26CE), (0x26D4, 0x26D4), (0x26EA, 0x26EA), (0x26F2, 0x26F3),
+        (0x26F5, 0x26F5), (0x26FA, 0x26FA), (0x26FD, 0x26FD), (0x2705, 0x2705), (0x270A, 0x270B), (0x2728, 0x2728),
+        (0x274C, 0x274C), (0x274E, 0x274E), (0x2753, 0x2755), (0x2757, 0x2757), (0x2795, 0x2797), (0x27B0, 0x27B0),
+        (0x27BF, 0x27BF), (0x2B1B, 0x2B1C), (0x2B50, 0x2B50), (0x2B55, 0x2B55), (0x2E80, 0xA4CF), (0xAC00, 0xD7A3),
+        (0xF900, 0xFAFF), (0xFE30, 0xFE4F), (0xFF00, 0xFF60), (0xFFE0, 0xFFE6), (0x1F300, 0x1F64F), (0x1F680, 0x1F6FF),
+        (0x1F900, 0x1FAFF), (0x20000, 0x3FFFD),
+    ];
+    let has = |t: &[(u32, u32)]| t.iter().any(|&(a, b)| c >= a && c <= b);
+    if has(ZERO) {
+        0
+    } else if has(WIDE) {
+        2
+    } else {
+        1
+    }
+}
+
+/// VT100 DEC Special Graphics for '`'..='~' (line drawing, selected with ESC ( 0).
+const DEC_GRAPHICS: [char; 31] = [
+    '\u{25C6}', '\u{2592}', '\u{2409}', '\u{240C}', '\u{240D}', '\u{240A}', '\u{B0}', '\u{B1}', '\u{2424}', '\u{240B}', '\u{2518}', '\u{2510}', '\u{250C}', '\u{2514}', '\u{253C}', '\u{23BA}',
+    '\u{23BB}', '\u{2500}', '\u{23BC}', '\u{23BD}', '\u{251C}', '\u{2524}', '\u{2534}', '\u{252C}', '\u{2502}', '\u{2264}', '\u{2265}', '\u{3C0}', '\u{2260}', '\u{A3}', '\u{B7}',
+];
 
 pub type Line = Vec<Cell>;
 
@@ -314,7 +350,10 @@ pub struct Screen {
     pub cy: usize,
     wrap_pending: bool,
     pen: Pen,
-    saved: (usize, usize, Pen),
+    /// DECSC state: cursor, pen and pending wrap.
+    saved: (usize, usize, Pen, bool),
+    /// G0 is DEC Special Graphics (ESC ( 0): box drawing in place of '`'..='~'.
+    g0_graphics: bool,
     top: usize,
     bottom: usize,
     pub cursor_visible: bool,
@@ -324,12 +363,17 @@ pub struct Screen {
     state: State,
     params: String,
     osc: String,
+    /// The string in progress is a DCS/SOS/PM/APC: consumed, never acted on.
+    osc_skip: bool,
     utf8: Vec<u8>,
     pub title: String,
     /// Responses the emulator must send back to the application (e.g. DSR).
     pub replies: Vec<u8>,
     /// Incremented whenever lines are pushed to scrollback (used to keep selections stable).
     pub scrolled_total: u64,
+    /// Incremented per line dropped from the front of the scrollback, which shifts every
+    /// absolute line index down (selections follow it).
+    pub trimmed: u64,
 }
 
 impl Screen {
@@ -347,7 +391,8 @@ impl Screen {
             cy: 0,
             wrap_pending: false,
             pen: Pen::default(),
-            saved: (0, 0, Pen::default()),
+            saved: (0, 0, Pen::default(), false),
+            g0_graphics: false,
             top: 0,
             bottom: rows - 1,
             cursor_visible: true,
@@ -357,15 +402,32 @@ impl Screen {
             state: State::Ground,
             params: String::new(),
             osc: String::new(),
+            osc_skip: false,
             utf8: Vec::new(),
             title: String::new(),
             replies: Vec::new(),
             scrolled_total: 0,
+            trimmed: 0,
         }
     }
 
     pub fn in_alt_screen(&self) -> bool {
         self.alt_saved.is_some()
+    }
+
+    /// Erasing, inserting or deleting cells can split a wide char from its spacer cell:
+    /// blank a wide char without its spacer and a spacer without its wide char.
+    fn fix_wide_pairs(&mut self) {
+        let line = &mut self.lines[self.cy];
+        for i in 0..line.len() {
+            let lost = match line[i].ch {
+                '\0' => i == 0 || width(line[i - 1].ch) != 2,
+                c => width(c) == 2 && line.get(i + 1).is_none_or(|n| n.ch != '\0'),
+            };
+            if lost {
+                line[i].ch = ' ';
+            }
+        }
     }
 
     fn blank(&self) -> Cell {
@@ -381,14 +443,15 @@ impl Screen {
         for l in self.lines.iter_mut() {
             l.resize(cols, Cell::default());
         }
-        // shrinking: move the top lines into scrollback so the cursor stays visible
+        // shrinking: drop the lines below the cursor first (like conhost, which keeps the
+        // viewport top), then move top lines into scrollback so the cursor stays visible
         while self.lines.len() > rows {
-            if self.cy > 0 {
+            if self.lines.len() > self.cy + 1 {
+                self.lines.pop();
+            } else {
                 let l = self.lines.remove(0);
                 self.push_scrollback(l);
                 self.cy -= 1;
-            } else {
-                self.lines.pop();
             }
         }
         while self.lines.len() < rows {
@@ -421,11 +484,13 @@ impl Screen {
         self.scrolled_total += 1;
         while self.scrollback.len() > self.max_scrollback {
             self.scrollback.pop_front();
+            self.trimmed += 1;
         }
     }
 
+    // counts are clamped to the region: more would only blank it again (CSI 99999999 S)
     fn scroll_up(&mut self, n: usize) {
-        for _ in 0..n {
+        for _ in 0..n.min(self.bottom - self.top + 1) {
             let removed = self.lines.remove(self.top);
             if self.top == 0 {
                 self.push_scrollback(removed);
@@ -436,7 +501,7 @@ impl Screen {
     }
 
     fn scroll_down(&mut self, n: usize) {
-        for _ in 0..n {
+        for _ in 0..n.min(self.bottom - self.top + 1) {
             self.lines.remove(self.bottom);
             let b = self.blank();
             self.lines.insert(self.top, vec![b; self.cols]);
@@ -452,6 +517,11 @@ impl Screen {
     }
 
     fn put(&mut self, ch: char) {
+        let w = width(ch) as usize;
+        if w == 0 {
+            return;
+        }
+        let ch = if self.g0_graphics && ('`'..='~').contains(&ch) { DEC_GRAPHICS[ch as usize - 0x60] } else { ch };
         if self.wrap_pending {
             self.wrap_pending = false;
             if self.autowrap {
@@ -459,12 +529,34 @@ impl Screen {
                 self.line_feed();
             }
         }
+        // a wide char that does not fit in the last column goes to the next line
+        if w == 2 && self.cx + 1 >= self.cols {
+            if self.autowrap {
+                self.cx = 0;
+                self.line_feed();
+            } else {
+                self.cx = self.cols - 2;
+            }
+        }
         let cell = Cell { ch, fg: self.pen.fg, bg: self.pen.bg, flags: self.pen.flags };
-        self.lines[self.cy][self.cx] = cell;
-        if self.cx + 1 >= self.cols {
+        let (cx, line) = (self.cx, &mut self.lines[self.cy]);
+        // overwriting half of a wide char blanks its other half
+        if line[cx].ch == '\0' && cx > 0 && width(line[cx - 1].ch) == 2 {
+            line[cx - 1].ch = ' ';
+        }
+        if line.get(cx + w).is_some_and(|c| c.ch == '\0') {
+            line[cx + w].ch = ' ';
+        }
+        line[cx] = cell;
+        if w == 2 {
+            // spacer cell: drawn by the glyph before it, skipped when copying
+            line[cx + 1] = Cell { ch: '\0', ..cell };
+        }
+        if cx + w >= self.cols {
+            self.cx = self.cols - 1;
             self.wrap_pending = true;
         } else {
-            self.cx += 1;
+            self.cx += w;
         }
     }
 
@@ -528,39 +620,53 @@ impl Screen {
                         self.params.clear();
                         self.state = State::Csi;
                     }
-                    ']' => {
+                    // OSC, and DCS/SOS/PM/APC strings that are consumed without effect
+                    ']' | 'P' | 'X' | '^' | '_' => {
                         self.osc.clear();
+                        self.osc_skip = ch != ']';
                         self.state = State::Osc;
                     }
-                    '7' => self.saved = (self.cx, self.cy, self.pen),
-                    '8' => {
-                        self.cx = self.saved.0.min(self.cols - 1);
-                        self.cy = self.saved.1.min(self.rows - 1);
-                        self.pen = self.saved.2;
-                    }
+                    '7' => self.save_cursor(),
+                    '8' => self.restore_cursor(),
                     'M' => {
+                        self.wrap_pending = false;
                         if self.cy == self.top {
                             self.scroll_down(1);
                         } else {
                             self.cy = self.cy.saturating_sub(1);
                         }
                     }
-                    'D' => self.line_feed(),
+                    'D' => {
+                        self.wrap_pending = false;
+                        self.line_feed();
+                    }
                     'E' => {
+                        self.wrap_pending = false;
                         self.cx = 0;
                         self.line_feed();
                     }
                     'c' => {
                         let (c, r) = (self.cols, self.rows);
                         let sb = std::mem::take(&mut self.scrollback);
+                        let (scrolled, trimmed) = (self.scrolled_total, self.trimmed);
                         *self = Screen::new(c, r);
                         self.scrollback = sb;
+                        // counters only grow: the UI diffs them
+                        (self.scrolled_total, self.trimmed) = (scrolled, trimmed);
                     }
-                    '(' | ')' | '*' | '+' | '#' | '%' => self.state = State::EscInter,
+                    ' '..='/' => self.state = State::EscInter(ch),
                     _ => {}
                 }
             }
-            State::EscInter => self.state = State::Ground,
+            State::EscInter(i) => {
+                // more intermediates may follow; the next other char ends the sequence
+                if !(' '..='/').contains(&ch) {
+                    self.state = State::Ground;
+                    if i == '(' {
+                        self.g0_graphics = ch == '0';
+                    }
+                }
+            }
             State::Csi => {
                 if ('\x40'..='\x7e').contains(&ch) {
                     let params = std::mem::take(&mut self.params);
@@ -577,20 +683,40 @@ impl Screen {
                 }
                 '\x1b' => self.state = State::OscEsc,
                 c => {
-                    if self.osc.len() < 2048 {
+                    if self.osc.len() < 2048 && !self.osc_skip {
                         self.osc.push(c)
                     }
                 }
             },
             State::OscEsc => {
                 self.osc_done();
-                self.state = if ch == '\\' { State::Ground } else { State::Ground };
+                self.state = State::Ground;
+                // an ESC that is not ST ends the string and starts a new sequence
+                if ch != '\\' {
+                    self.state = State::Esc;
+                    self.handle(ch);
+                }
             }
         }
     }
 
+    fn save_cursor(&mut self) {
+        self.saved = (self.cx, self.cy, self.pen, self.wrap_pending);
+    }
+
+    fn restore_cursor(&mut self) {
+        self.cx = self.saved.0.min(self.cols - 1);
+        self.cy = self.saved.1.min(self.rows - 1);
+        self.pen = self.saved.2;
+        // a pending wrap only makes sense in the last column (the grid may have been resized)
+        self.wrap_pending = self.saved.3 && self.cx + 1 == self.cols;
+    }
+
     fn osc_done(&mut self) {
         let osc = std::mem::take(&mut self.osc);
+        if std::mem::take(&mut self.osc_skip) {
+            return;
+        }
         if let Some((code, text)) = osc.split_once(';') {
             if code == "0" || code == "2" {
                 self.title = text.chars().take(200).collect();
@@ -599,12 +725,19 @@ impl Screen {
     }
 
     fn csi(&mut self, raw: &str, f: char) {
-        let private = raw.starts_with('?') || raw.starts_with('>') || raw.starts_with('=');
-        let body = raw.trim_start_matches(['?', '>', '=']);
-        let body: String = body.chars().filter(|c| c.is_ascii_digit() || *c == ';' || *c == ':').collect();
+        let prefix = raw.chars().next().filter(|c| "<=>?".contains(*c));
+        // a prefix or intermediate bytes make it another command sharing the final byte (vim's
+        // CSI >4;2m, kitty's CSI >1u / CSI <u, DECSCUSR CSI n SP q...); of those only DEC modes,
+        // selective erase (same as erase here) and DECDSR are supported
+        let intermediate = raw.bytes().any(|b| (0x20..=0x2F).contains(&b));
+        if intermediate || prefix.is_some_and(|c| c != '?' || !"hlJKn".contains(f)) {
+            return;
+        }
+        let body: String = raw.chars().filter(|c| c.is_ascii_digit() || *c == ';' || *c == ':').collect();
         let ps: Vec<usize> = if body.is_empty() { vec![] } else { body.split(';').map(|p| p.split(':').next().unwrap_or("").parse().unwrap_or(0)).collect() };
         let p = |i: usize, d: usize| -> usize { ps.get(i).copied().filter(|&v| v != 0).unwrap_or(d) };
-        if f != 'm' {
+        // only commands that move the cursor or edit the grid cancel a pending wrap
+        if !"hlncqptms".contains(f) {
             self.wrap_pending = false;
         }
         match f {
@@ -650,7 +783,10 @@ impl Screen {
                             self.lines[r] = vec![b; self.cols];
                         }
                     }
-                    3 => self.scrollback.clear(),
+                    3 => {
+                        self.trimmed += self.scrollback.len() as u64;
+                        self.scrollback.clear();
+                    }
                     _ => {}
                 }
             }
@@ -664,6 +800,7 @@ impl Screen {
                 for c in s..e.min(self.cols) {
                     self.lines[self.cy][c] = b;
                 }
+                self.fix_wide_pairs();
             }
             'X' => {
                 let b = self.blank();
@@ -671,6 +808,7 @@ impl Screen {
                 for c in self.cx..(self.cx + n).min(self.cols) {
                     self.lines[self.cy][c] = b;
                 }
+                self.fix_wide_pairs();
             }
             'P' => {
                 let n = p(0, 1).min(self.cols - self.cx);
@@ -678,6 +816,7 @@ impl Screen {
                 let line = &mut self.lines[self.cy];
                 line.drain(self.cx..self.cx + n);
                 line.extend(std::iter::repeat(b).take(n));
+                self.fix_wide_pairs();
             }
             '@' => {
                 let n = p(0, 1).min(self.cols - self.cx);
@@ -688,10 +827,12 @@ impl Screen {
                     line.insert(self.cx, b);
                 }
                 line.truncate(cols);
+                self.fix_wide_pairs();
             }
             'L' => {
                 if self.cy >= self.top && self.cy <= self.bottom {
                     let n = p(0, 1).min(self.bottom - self.cy + 1);
+                    self.cx = 0;
                     for _ in 0..n {
                         self.lines.remove(self.bottom);
                         let b = self.blank();
@@ -702,6 +843,7 @@ impl Screen {
             'M' => {
                 if self.cy >= self.top && self.cy <= self.bottom {
                     let n = p(0, 1).min(self.bottom - self.cy + 1);
+                    self.cx = 0;
                     for _ in 0..n {
                         self.lines.remove(self.cy);
                         let b = self.blank();
@@ -710,7 +852,7 @@ impl Screen {
                 }
             }
             'S' => self.scroll_up(p(0, 1)),
-            'T' if !private => self.scroll_down(p(0, 1)),
+            'T' => self.scroll_down(p(0, 1)),
             'r' => {
                 let t = p(0, 1) - 1;
                 let b = p(1, self.rows) - 1;
@@ -724,16 +866,12 @@ impl Screen {
                 self.cx = 0;
                 self.cy = 0;
             }
-            's' => self.saved = (self.cx, self.cy, self.pen),
-            'u' => {
-                self.cx = self.saved.0.min(self.cols - 1);
-                self.cy = self.saved.1.min(self.rows - 1);
-                self.pen = self.saved.2;
-            }
+            's' => self.save_cursor(),
+            'u' => self.restore_cursor(),
             'm' => self.sgr(&ps),
             'h' | 'l' => {
                 let on = f == 'h';
-                if private {
+                if prefix == Some('?') {
                     for &m in &ps {
                         match m {
                             1 => self.app_cursor = on,
@@ -753,7 +891,7 @@ impl Screen {
                     self.replies.extend_from_slice(b"\x1b[0n");
                 }
             }
-            'c' if !private => self.replies.extend_from_slice(b"\x1b[?1;0c"),
+            'c' => self.replies.extend_from_slice(b"\x1b[?1;0c"),
             _ => {}
         }
     }
@@ -767,6 +905,9 @@ impl Screen {
                 self.lines = main;
                 self.cx = x.min(self.cols - 1);
                 self.cy = y.min(self.rows - 1);
+                // a full-screen app that quits mid line drawing must not garble the shell
+                self.g0_graphics = false;
+                self.wrap_pending = false;
             }
         }
     }
@@ -841,7 +982,8 @@ impl Screen {
 
     pub fn line_text(&self, i: usize, from: usize, to: usize) -> String {
         match self.line(i) {
-            Some(l) => l[from.min(l.len())..to.min(l.len())].iter().map(|c| c.ch).collect::<String>(),
+            // '\0' is the second cell of a wide char
+            Some(l) => l[from.min(l.len())..to.min(l.len())].iter().map(|c| c.ch).filter(|&c| c != '\0').collect::<String>(),
             None => String::new(),
         }
     }
@@ -925,7 +1067,7 @@ mod tests {
     use super::*;
 
     fn text(s: &Screen, row: usize) -> String {
-        s.lines[row].iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+        s.lines[row].iter().map(|c| c.ch).filter(|&c| c != '\0').collect::<String>().trim_end().to_string()
     }
 
     #[test]
@@ -983,6 +1125,101 @@ mod tests {
         assert_eq!(key_sequence(0x26, false, false, false, true).unwrap(), b"\x1bOA");
         assert_eq!(key_sequence(0x25, true, false, false, false).unwrap(), b"\x1b[1;5D");
         assert_eq!(key_sequence(0x2E, false, false, false, false).unwrap(), b"\x1b[3~");
+    }
+
+    #[test]
+    fn wide_and_zero_width_chars() {
+        let mut s = Screen::new(5, 3);
+        s.feed("a\u{4E2D}b".as_bytes());
+        assert_eq!(s.lines[0][1].ch, '\u{4E2D}');
+        assert_eq!(s.lines[0][2].ch, '\0');
+        assert_eq!(s.cx, 4);
+        assert_eq!(s.line_text(0, 0, 5).trim_end(), "a\u{4E2D}b");
+        // a combining mark takes no cell; a wide char that does not fit wraps first
+        s.feed("e\u{301}\u{1F600}".as_bytes());
+        assert_eq!(text(&s, 0), "a\u{4E2D}be");
+        assert_eq!(s.lines[1][0].ch, '\u{1F600}');
+        assert_eq!((s.cx, s.cy), (2, 1));
+        // overwriting half of a wide char blanks the other half
+        s.feed(b"\x1b[1;3Hx");
+        assert_eq!(s.lines[0][1].ch, ' ');
+        assert_eq!(s.lines[0][2].ch, 'x');
+        // deleting a wide char's first cell leaves no orphan spacer that later blanks a neighbour
+        let mut s = Screen::new(6, 2);
+        s.feed("a\u{4E2D}b\x1b[1;2H\x1b[P".as_bytes());
+        assert_eq!(text(&s, 0), "a b");
+        s.feed(b"\x1b[1;3Hx");
+        assert_eq!(text(&s, 0), "a x");
+    }
+
+    #[test]
+    fn prefixed_and_intermediate_csi_ignored() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"\x1b[3;4H\x1b[s\x1b[1;1H\x1b[>4;2m\x1b[>1u\x1b[<u\x1b[=1u\x1b[?u\x1b[2 q\x1b[3 A");
+        assert_eq!((s.cx, s.cy), (0, 0));
+        assert_eq!(s.pen.flags, 0);
+        s.feed(b"\x1b[2;4r\x1b[?r\x1b[5;5H\x1b[?S");
+        assert_eq!((s.top, s.bottom), (1, 3));
+        assert_eq!((s.cx, s.cy), (4, 4));
+        s.feed(b"\x1b[>c\x1b[=c");
+        assert!(s.replies.is_empty());
+        s.feed(b"\x1b[?25l\x1b[u");
+        assert!(!s.cursor_visible);
+        assert_eq!((s.cx, s.cy), (3, 2));
+    }
+
+    #[test]
+    fn dcs_and_apc_consumed() {
+        let mut s = Screen::new(20, 2);
+        s.feed(b"a\x1bP+q544e\x1b\\b\x1b_Gf=24;AAAA\x07c\x1b^pm\x1b\\d\x1bXsos\x1b\\e");
+        assert_eq!(text(&s, 0), "abcde");
+        // an ESC that is not ST ends the string and starts a new sequence
+        s.feed(b"\x1b]0;t\x1b[1;1HZ");
+        assert_eq!(text(&s, 0), "Zbcde");
+        s.feed(b"\x1b P\x1b%Gx");
+        assert_eq!(text(&s, 0), "Zxcde");
+    }
+
+    #[test]
+    fn scroll_counts_clamped() {
+        let mut s = Screen::new(10, 3);
+        s.feed(b"a\r\nb\r\nc\x1b[99999999S\x1b[99999999T");
+        assert_eq!(s.scrollback.len(), 3);
+        assert_eq!(text(&s, 0), "");
+        s.feed(b"\x1b[2;5Hx\x1b[L");
+        assert_eq!((s.cx, s.cy), (0, 1));
+    }
+
+    #[test]
+    fn pending_wrap_saved_and_kept() {
+        let mut s = Screen::new(3, 3);
+        s.feed(b"abc\x1b7\x1b[1;1H\x1b8\x1b[?25h\x1b[0md");
+        assert_eq!(text(&s, 0), "abc");
+        assert_eq!(text(&s, 1), "d");
+        s.feed(b"\x1b[3;1Hxyz\x1bMq");
+        assert_eq!(text(&s, 1), "d q");
+    }
+
+    #[test]
+    fn dec_special_graphics() {
+        let mut s = Screen::new(10, 2);
+        s.feed(b"\x1b(0lqk\x1b(Bq\x1b(0x");
+        assert_eq!(text(&s, 0), "\u{250C}\u{2500}\u{2510}q\u{2502}");
+        s.feed(b"\x1b[?1049h\x1b[?1049lq");
+        assert_eq!(s.lines[0][5].ch, 'q');
+    }
+
+    #[test]
+    fn shrink_drops_blank_rows_below_cursor() {
+        let mut s = Screen::new(10, 5);
+        s.feed(b"a\r\nb");
+        s.resize(10, 3);
+        assert!(s.scrollback.is_empty());
+        assert_eq!((text(&s, 0), s.cy), ("a".into(), 1));
+        s.feed(b"\r\nc\r\nd");
+        s.resize(10, 2);
+        assert_eq!(s.scrollback.len(), 2);
+        assert_eq!(text(&s, 1), "d");
     }
 }
 

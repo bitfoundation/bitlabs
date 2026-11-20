@@ -109,14 +109,15 @@ unsafe fn any_relevant(mut p: *const u8) -> bool {
 
 pub fn is_relevant(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
-    if p.ends_with(".lock") {
-        return false;
-    }
     if p == ".git" {
         return false;
     }
     if let Some(inner) = p.strip_prefix(".git/") {
-        return inner == "index" || inner == "head" || inner.starts_with("refs") || inner == "packed-refs" || inner == "merge_head" || inner.starts_with("rebase-") || inner == "fetch_head" || inner == "cherry_pick_head" || inner == "stash";
+        // git's own transient *.lock files; work tree ones (Cargo.lock, yarn.lock) are real edits
+        if inner.ends_with(".lock") {
+            return false;
+        }
+        return inner == "index" || inner == "head" || inner.starts_with("refs") || inner == "packed-refs" || inner == "merge_head" || inner.starts_with("rebase-") || inner == "fetch_head" || inner == "cherry_pick_head" || inner == "revert_head" || inner == "stash";
     }
     !(p.starts_with("node_modules/") || p.contains("/node_modules/"))
 }
@@ -128,6 +129,9 @@ mod tests {
         assert!(super::is_relevant("src/main.rs"));
         assert!(super::is_relevant(".git/index"));
         assert!(!super::is_relevant(".git/index.lock"));
+        assert!(!super::is_relevant(".git/refs/heads/main.lock"));
+        assert!(super::is_relevant("Cargo.lock"));
+        assert!(super::is_relevant("web/yarn.lock"));
         assert!(!super::is_relevant(".git/objects/ab/cdef"));
         assert!(super::is_relevant(".git/refs/heads/main"));
         assert!(!super::is_relevant("node_modules/x/y.js"));

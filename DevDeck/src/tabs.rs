@@ -67,9 +67,12 @@ impl App {
             }
             return true;
         }
-        let reuse = self.tabs.get(self.tab_active).map(|t| t.preview).unwrap_or(false);
-        if reuse {
-            let t = &mut self.tabs[self.tab_active];
+        // like VS Code there is one preview tab: a preview open replaces it wherever it is (a
+        // kept-open file only replaces it when it is the active tab)
+        let reuse = if pin { Some(self.tab_active).filter(|&i| self.tabs.get(i).is_some_and(|t| t.preview)) } else { self.tabs.iter().position(|t| t.preview) };
+        if let Some(i) = reuse {
+            self.activate_tab_raw(i);
+            let t = &mut self.tabs[i];
             t.key = key;
             t.preview = !pin;
         } else {
@@ -386,7 +389,8 @@ impl App {
             }));
         }
         if let (Some(p), Some(root)) = (path.filter(|p| !p.is_empty()), self.folder()) {
-            let abs = root.join(&p).display().to_string();
+            // a Windows path (the relative path is '/' separated)
+            let abs = root.join(&p).display().to_string().replace('/', "\\");
             v.push(MenuItem::Sep);
             v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &abs)));
             v.push(m.it("Copy Relative Path", move |a| win::set_clipboard(a.hwnd, &p)));

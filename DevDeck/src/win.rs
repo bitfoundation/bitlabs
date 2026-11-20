@@ -205,7 +205,16 @@ impl Gfx {
     pub fn text_cells(&self, x: i32, y: i32, chars: &[char], cell_w: i32, font: HFONT, color: u32, clip: &RECT) {
         let mut buf: Vec<u16> = Vec::with_capacity(chars.len() * 2 + 1);
         let mut dx: Vec<i32> = Vec::with_capacity(chars.len() * 2 + 1);
+        let mut x = x;
         for c in chars {
+            // '\0' is the second cell of a wide char: no glyph, its width goes to the glyph before
+            if *c == '\0' {
+                match dx.last_mut() {
+                    Some(d) => *d += cell_w,
+                    None => x += cell_w,
+                }
+                continue;
+            }
             let mut b = [0u16; 2];
             let e = c.encode_utf16(&mut b);
             if e.len() == 2 {
@@ -503,7 +512,7 @@ unsafe fn build_menu(items: &[MenuItem]) -> HMENU {
     for it in items {
         match it {
             MenuItem::Item { label, id, enabled, checked } => {
-                let l = wz(label);
+                let l = wz(&label.replace('&', "&&"));
                 let mut flags = MF_STRING;
                 if !enabled {
                     flags |= MF_GRAYED;
@@ -514,7 +523,7 @@ unsafe fn build_menu(items: &[MenuItem]) -> HMENU {
                 AppendMenuW(m, flags, *id + 1, l.as_ptr());
             }
             MenuItem::Sub { label, items } => {
-                let l = wz(label);
+                let l = wz(&label.replace('&', "&&"));
                 let sub = build_menu(items);
                 AppendMenuW(m, MF_POPUP, sub as usize, l.as_ptr());
             }
@@ -546,6 +555,15 @@ pub fn client_to_screen(hwnd: HWND, x: i32, y: i32) -> (i32, i32) {
         windows_sys::Win32::Graphics::Gdi::ClientToScreen(hwnd, &mut p);
     }
     (p.x, p.y)
+}
+
+/// Removes the WM_CHAR that TranslateMessage already queued for the key being handled, so a
+/// key consumed in WM_KEYDOWN does not also type its character.
+pub fn drop_char(hwnd: HWND) {
+    unsafe {
+        let mut m: MSG = std::mem::zeroed();
+        PeekMessageW(&mut m, hwnd, WM_CHAR, WM_CHAR, PM_REMOVE);
+    }
 }
 
 pub fn get_text(hwnd: HWND) -> String {

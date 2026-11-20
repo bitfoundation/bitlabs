@@ -536,7 +536,7 @@ impl App {
         let log = std::env::var_os("DEVDECK_TERM_LOG");
         let mut any = false;
         for t in self.terms.iter_mut() {
-            let before = t.screen.scrolled_total;
+            let (before, trimmed) = (t.screen.scrolled_total, t.screen.trimmed);
             let mut exited = false;
             while let Ok(ev) = t.rx.try_recv() {
                 any = true;
@@ -572,6 +572,11 @@ impl App {
             if t.scroll > 0 {
                 let added = (t.screen.scrolled_total - before) as usize;
                 t.scroll = (t.scroll + added).min(t.screen.scrollback.len());
+            }
+            // lines dropped from a full history shift the absolute indexes the selection uses
+            let d = (t.screen.trimmed - trimmed) as usize;
+            if d > 0 {
+                t.sel = t.sel.and_then(|(a, b)| (a.0 >= d && b.0 >= d).then(|| ((a.0 - d, a.1), (b.0 - d, b.1))));
             }
         }
         if any && (self.terminal_visible() || self.editor_term().is_some()) {
@@ -656,20 +661,37 @@ impl App {
             (0x21, true, false) => Some(if in_editor { Cmd::PrevEditor } else { Cmd::FocusPrevTerminal }),
             _ => None,
         };
+        // keys handled here must not also reach the shell as the WM_CHAR TranslateMessage queued
+        // (Ctrl+B ^B, Ctrl+J LF, Ctrl+Shift+M CR...)
         if let Some(c) = cmd {
+            win::drop_char(self.hwnd);
             self.exec(c);
             return true;
         }
         if ctrl && vk == 0x43 && (shift || self.term().map(|t| t.sel.is_some()).unwrap_or(false)) {
             // Ctrl+C copies when there is a selection, Ctrl+Shift+C always copies
             if self.term_copy() || shift {
-                self.term_skip_char = true;
+                win::drop_char(self.hwnd);
                 return true;
             }
         }
         if (ctrl && vk == 0x56) || (shift && vk == 0x2D) {
+            win::drop_char(self.hwnd);
             self.term_paste();
-            self.term_skip_char = ctrl;
+            return true;
+        }
+        // xterm keys the character messages cannot tell apart
+        let seq: Option<&[u8]> = match vk {
+            // Shift+Tab: back-tab (Claude Code mode cycling, PSReadLine completion)
+            0x09 if shift && !ctrl => Some(b"\x1b[Z"),
+            // Shift+Enter: a new line in the prompt, as Claude Code's /terminal-setup binds it
+            0x0D if shift && !ctrl && !alt && self.term().is_some_and(|t| t.shell.name == term::CLAUDE) => Some(b"\x1b\r"),
+            0x20 if ctrl && !shift && !alt => Some(b"\0"),
+            _ => None,
+        };
+        if let Some(seq) = seq {
+            win::drop_char(self.hwnd);
+            self.term_write(seq);
             return true;
         }
         if shift && (vk == 0x21 || vk == 0x22) {
@@ -686,10 +708,6 @@ impl App {
     }
 
     pub fn term_char(&mut self, ch: u16, alt: bool) {
-        if self.term_skip_char {
-            self.term_skip_char = false;
-            return;
-        }
         let s: String = if (0xD800..0xDC00).contains(&ch) {
             self.term_surrogate = ch;
             return;
@@ -697,7 +715,11 @@ impl App {
             let hi = std::mem::take(&mut self.term_surrogate);
             String::from_utf16_lossy(&[hi, ch])
         } else if ch == 0x08 {
+            // Backspace (WM_CHAR 0x08) sends DEL like xterm
             "\x7f".into()
+        } else if ch == 0x7F {
+            // Ctrl+Backspace (WM_CHAR 0x7F) sends ^H like xterm.js: deletes a word in shells
+            "\x08".into()
         } else {
             String::from_utf16_lossy(&[ch])
         };
@@ -877,7 +899,9 @@ impl App {
         if sc.cursor_visible && scroll == 0 && t.exited.is_none() {
             let x = r.left + sc.cx as i32 * cw;
             let y = r.top + sc.cy as i32 * chh;
-            let cr = rect(x, y, x + cw, y + chh);
+            // on a wide char the cursor covers both its cells
+            let wide = sc.lines[sc.cy].get(sc.cx + 1).is_some_and(|c| c.ch == '\0');
+            let cr = rect(x, y, x + if wide { 2 * cw } else { cw }, y + chh);
             if focused {
                 let cell = sc.lines[sc.cy].get(sc.cx).copied().unwrap_or_default();
                 g.fill(&cr, self.t.fg);

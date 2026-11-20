@@ -4,7 +4,8 @@
 
 use std::path::Path;
 
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetFocus};
+use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
 
 use crate::app::*;
 use crate::theme::blend_colorref;
@@ -82,6 +83,9 @@ pub struct EditState {
     seal: bool,
     /// High surrogate of a character typed as two WM_CHAR messages.
     pub surrogate: u16,
+    /// (message time, line) of the last double click: a third click on that line soon after
+    /// selects the line.
+    dbl_at: Option<(u32, usize)>,
 }
 
 impl EditState {
@@ -128,10 +132,14 @@ pub fn col_at_vcol(s: &str, target2: usize) -> usize {
     char_len(s)
 }
 
-/// Line text with tabs expanded, one char per cell.
-pub fn display_chars(s: &str) -> Vec<char> {
-    let mut out = Vec::with_capacity(s.len());
+/// Line text with tabs expanded, one char per cell, up to `max` cells (or a bit past it
+/// after a tab): painting needs the visible part only, not all of a huge one-line file.
+pub fn display_chars(s: &str, max: usize) -> Vec<char> {
+    let mut out = Vec::with_capacity(s.len().min(max));
     for ch in s.chars() {
+        if out.len() >= max {
+            break;
+        }
         if ch == '\t' {
             let n = TAB - out.len() % TAB;
             out.extend(std::iter::repeat(' ').take(n));
@@ -470,6 +478,14 @@ impl FileView {
         self.ed.seal = true;
     }
 
+    /// Selects line `l` with its line break (triple click).
+    pub fn select_line(&mut self, l: usize) {
+        let l = l.min(self.lines.len() - 1);
+        self.ed.anchor = (l, 0);
+        self.ed.cur = if l + 1 < self.lines.len() { (l + 1, 0) } else { (l, char_len(&self.lines[l])) };
+        self.ed.seal = true;
+    }
+
     pub fn select_all(&mut self) {
         let last = self.lines.len() - 1;
         self.ed.anchor = (0, 0);
@@ -521,6 +537,22 @@ impl FileView {
         let line = &self.lines[start.0];
         let indent: String = line.chars().take(start.1).take_while(|c| *c == ' ' || *c == '\t').collect();
         self.insert(&format!("\n{indent}"), EditKind::Other);
+    }
+
+    /// Ctrl+Enter / Ctrl+Shift+Enter: a new line below / above the caret's line with its
+    /// indentation, wherever the caret is in the line (one undo step).
+    pub fn newline_beside(&mut self, above: bool) {
+        let l = self.ed.cur.0;
+        let indent: String = self.lines[l].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        if above {
+            self.apply((l, 0), (l, 0), &format!("{indent}\n"), EditKind::Other);
+            let p = (l, char_len(&indent));
+            self.ed.cur = p;
+            self.ed.anchor = p;
+        } else {
+            let end = (l, char_len(&self.lines[l]));
+            self.apply(end, end, &format!("\n{indent}"), EditKind::Other);
+        }
     }
 
     /// Tab / Shift+Tab: indents or outdents the selected lines; Tab without a multi-line
@@ -586,6 +618,16 @@ impl FileView {
         }
     }
 
+    /// Pastes a whole line copied without a selection above the caret's line, like VS Code
+    /// (the caret stays on its text).
+    pub fn paste_line(&mut self, text: &str) {
+        let cur = self.ed.cur;
+        self.apply((cur.0, 0), (cur.0, 0), text, EditKind::Other);
+        let p = (cur.0 + text.matches('\n').count(), cur.1);
+        self.ed.cur = p;
+        self.ed.anchor = p;
+    }
+
     pub fn cut(&mut self) {
         if let Some((a, b)) = self.sel() {
             self.apply(a, b, "", EditKind::Other);
@@ -603,6 +645,25 @@ impl FileView {
             self.apply((l - 1, prev), (l, end), "", EditKind::Other);
         }
     }
+}
+
+/// Clipboard sequence number after the last Copy / Cut without a selection (a whole line),
+/// so pasting exactly that clipboard goes above the caret's line instead of splitting it.
+/// Any later copy, here or in another app, changes the number.
+static LINE_CLIP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+fn clipboard_seq() -> u32 {
+    unsafe { windows_sys::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+}
+
+fn set_line_clip(whole_line: bool) {
+    LINE_CLIP.store(if whole_line { clipboard_seq() } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The file was changed on disk since the view loaded it (a deleted file is just saved again).
+fn changed_on_disk(root: &Path, f: &FileView) -> bool {
+    let disk = crate::explorer::mtime(root, &f.path);
+    disk.is_some() && f.mtime.is_some() && disk != f.mtime
 }
 
 /// Writes the view's text to disk and marks it saved.
@@ -700,7 +761,15 @@ impl App {
     pub fn editor_click(&mut self, x: i32, y: i32, shift: bool) {
         self.focus = Focus::Main;
         let Some(p) = self.editor_pos_at(x, y) else { return };
+        let now = unsafe { GetMessageTime() } as u32;
         if let Some(f) = self.fv() {
+            let triple = matches!(f.ed.dbl_at.take(), Some((t, l)) if l == p.0 && now.wrapping_sub(t) <= unsafe { GetDoubleClickTime() });
+            if triple && !shift {
+                // no drag: a mouse move would shrink the line selection again
+                f.select_line(p.0);
+                self.invalidate();
+                return;
+            }
             f.move_to(p, shift);
             f.ed.want_vcol = None;
         }
@@ -724,8 +793,10 @@ impl App {
 
     pub fn editor_dblclick(&mut self, x: i32, y: i32) {
         let Some(p) = self.editor_pos_at(x, y) else { return };
+        let now = unsafe { GetMessageTime() } as u32;
         if let Some(f) = self.fv() {
             f.select_word(p);
+            f.ed.dbl_at = Some((now, p.0));
         }
         self.invalidate();
     }
@@ -853,6 +924,11 @@ impl App {
                 f.newline();
                 edited = true;
             }
+            // insert line below / above (instead of the global Commit)
+            (0x0D, true) => {
+                f.newline_beside(shift);
+                edited = true;
+            }
             (0x09, false) => {
                 f.indent(shift);
                 edited = true;
@@ -862,14 +938,16 @@ impl App {
             (0x5A, true) if !shift => edited = f.undo(),
             (0x59, true) | (0x5A, true) => edited = f.redo(),
             (0x43, true) | (0x2D, true) if !shift => {
-                let t = f.copy_text();
+                let (t, whole) = (f.copy_text(), f.sel().is_none());
                 win::set_clipboard(self.hwnd, &t);
+                set_line_clip(whole);
                 return true;
             }
             (0x58, true) | (0x2E, false) if vk == 0x58 || shift => {
-                let t = f.copy_text();
+                let (t, whole) = (f.copy_text(), f.sel().is_none());
                 f.cut();
                 win::set_clipboard(self.hwnd, &t);
+                set_line_clip(whole);
                 edited = true;
             }
             (0x56, true) if !shift => return self.editor_paste(),
@@ -893,9 +971,16 @@ impl App {
     }
 
     pub fn editor_paste(&mut self) -> bool {
-        let Some(text) = win::get_clipboard(self.hwnd) else { return true };
-        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let Some(raw) = win::get_clipboard(self.hwnd) else { return true };
+        let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let seq = LINE_CLIP.load(std::sync::atomic::Ordering::Relaxed);
+        let whole_line = seq != 0 && seq == clipboard_seq();
         if let Some(f) = self.fv() {
+            if whole_line && f.sel().is_none() {
+                f.paste_line(&text);
+                self.after_edit();
+                return true;
+            }
             f.type_text(&text);
             if text.chars().count() == 1 {
                 f.ed.seal = true;
@@ -968,12 +1053,19 @@ impl App {
         (0..self.tabs.len()).filter(|&i| self.tab_dirty(i)).map(|i| self.tabs[i].key.clone()).collect()
     }
 
-    /// Saves tab `i`; false (with an error toast) when it failed.
-    pub fn save_tab(&mut self, i: usize) -> bool {
+    /// Saves tab `i`; false (with an error toast) when it failed. Unless `force`, a file
+    /// changed on disk since it was loaded is not overwritten (Ctrl+S asks about it), so Save
+    /// All and the unsaved-changes dialog never clobber outside edits.
+    pub fn save_tab(&mut self, i: usize, force: bool) -> bool {
         let Some(root) = self.folder() else { return false };
         let Some(f) = self.tab_file_mut(i) else { return true };
         if !f.ed.editable {
             return true;
+        }
+        if !force && changed_on_disk(&root, f) {
+            let name = f.title.clone();
+            self.error(format!("'{name}' has been changed on disk since it was opened. Use Ctrl+S to overwrite it."));
+            return false;
         }
         match write_view(&root, f) {
             Ok(()) => {
@@ -993,11 +1085,11 @@ impl App {
     pub fn save_active(&mut self) {
         let Some(root) = self.folder() else { return };
         let MainView::File(f) = &self.view else { return };
-        if !f.ed.editable {
+        // like VS Code, a file without changes isn't written again
+        if !f.ed.dirty() {
             return;
         }
-        let disk = crate::explorer::mtime(&root, &f.path);
-        if disk.is_some() && f.mtime.is_some() && disk != f.mtime {
+        if changed_on_disk(&root, f) {
             let name = f.title.clone();
             self.confirm(
                 &format!("'{name}' has been changed on disk since it was opened."),
@@ -1005,18 +1097,18 @@ impl App {
                 &["Overwrite"],
                 |a, _| {
                     let i = a.tab_active;
-                    a.save_tab(i);
+                    a.save_tab(i, true);
                 },
             );
             return;
         }
         let i = self.tab_active;
-        self.save_tab(i);
+        self.save_tab(i, false);
     }
 
     pub fn save_all(&mut self) {
         for i in 0..self.tabs.len() {
-            if self.tab_dirty(i) && !self.save_tab(i) {
+            if self.tab_dirty(i) && !self.save_tab(i, false) {
                 return;
             }
         }
@@ -1055,7 +1147,7 @@ impl App {
             for k in &keys {
                 let Some(i) = a.tabs.iter().position(|t| &t.key == k) else { continue };
                 if choice == 0 {
-                    if !a.save_tab(i) {
+                    if !a.save_tab(i, false) {
                         return;
                     }
                 } else if let Some(f) = a.tab_file_mut(i) {
@@ -1107,7 +1199,7 @@ impl App {
             }
             let no_color = if li == cur.0 { self.t.fg } else { self.t.line_no };
             g.text_in(&rect(body.left, y, body.left + num_w - self.s(8), y + lh), &(li + 1).to_string(), self.fonts.mono, no_color, DT_LINE | DT_RIGHT);
-            let chars = display_chars(line);
+            let chars = display_chars(line, skip + visible);
             if skip < chars.len() {
                 let end = (skip + visible).min(chars.len());
                 g.text_cells(x0 + skip as i32 * mw, y + self.s(1), &chars[skip..end], mw, self.fonts.mono, self.t.fg, &clip);
@@ -1200,6 +1292,38 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_enter_inserts_line_below_or_above() {
+        let mut f = view("  foo(bar)\nx");
+        f.move_to((0, 6), false);
+        f.newline_beside(false);
+        assert_eq!(text(&f), "  foo(bar)\n  \nx");
+        assert_eq!(f.ed.cur, (1, 2));
+        f.undo();
+        assert_eq!(text(&f), "  foo(bar)\nx");
+        assert_eq!(f.ed.cur, (0, 6));
+        f.newline_beside(true);
+        assert_eq!(text(&f), "  \n  foo(bar)\nx");
+        assert_eq!(f.ed.cur, (0, 2));
+        f.undo();
+        assert_eq!(text(&f), "  foo(bar)\nx");
+    }
+
+    #[test]
+    fn whole_line_paste_and_line_select() {
+        let mut f = view("a\nbc");
+        f.move_to((1, 1), false);
+        f.paste_line("a\n");
+        assert_eq!(text(&f), "a\na\nbc");
+        assert_eq!(f.ed.cur, (2, 1));
+        f.undo();
+        assert_eq!(text(&f), "a\nbc");
+        f.select_line(0);
+        assert_eq!(f.selected_text().as_deref(), Some("a\n"));
+        f.select_line(1);
+        assert_eq!(f.selected_text().as_deref(), Some("bc"));
+    }
+
+    #[test]
     fn indent_and_outdent_lines() {
         let mut f = view("a\n  b\nc");
         f.move_to((0, 0), false);
@@ -1237,7 +1361,11 @@ mod tests {
         assert_eq!(col_at_vcol("\tab", 4 * 2), 1);
         assert_eq!(col_at_vcol("ab", 3), 2); // right half of 'b'
         assert_eq!(col_at_vcol("ab", 99), 2);
-        assert_eq!(display_chars("a\tb"), ['a', ' ', ' ', ' ', 'b']);
+        assert_eq!(display_chars("a\tb", 99), ['a', ' ', ' ', ' ', 'b']);
+        // cut off at the visible cells, tabs still expanded from the line start
+        assert_eq!(display_chars("a\tbcd", 5), ['a', ' ', ' ', ' ', 'b']);
+        assert_eq!(display_chars("\t\tx", 2), [' ', ' ', ' ', ' ']);
+        assert_eq!(display_chars(&"x".repeat(1 << 20), 10).len(), 10);
     }
 
     #[test]

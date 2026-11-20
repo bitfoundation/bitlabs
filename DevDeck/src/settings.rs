@@ -33,6 +33,11 @@ pub struct Settings {
     pub recent: Vec<String>,
     /// Titles of the commands run from the Command Palette, most recent first.
     pub recent_cmds: Vec<String>,
+    /// Recent folders and commands added in this window (most recent first) and folders it
+    /// removed: saving applies them to the lists in the file, which other windows update too.
+    pub added: Vec<String>,
+    pub added_cmds: Vec<String>,
+    pub forget: Vec<String>,
     pub panel_terminal: bool,
     pub terminal_shell: String,
     pub window: Option<(i32, i32, i32, i32, bool)>,
@@ -62,6 +67,9 @@ impl Default for Settings {
             confirm_sync: true,
             recent: Vec::new(),
             recent_cmds: Vec::new(),
+            added: Vec::new(),
+            added_cmds: Vec::new(),
+            forget: Vec::new(),
             panel_terminal: false,
             terminal_shell: String::new(),
             window: None,
@@ -131,6 +139,7 @@ impl Settings {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
+        let (recent, recent_cmds) = self.merged_recent();
         let b = |x: bool| if x { "1" } else { "0" };
         let mut out = String::new();
         out += &format!("dark={}\n", b(self.dark));
@@ -154,23 +163,63 @@ impl Settings {
         out += &format!("confirm_sync={}\n", b(self.confirm_sync));
         out += &format!("panel_terminal={}\n", b(self.panel_terminal));
         out += &format!("terminal_shell={}\n", self.terminal_shell);
-        out += &format!("recent={}\n", self.recent.join("|"));
-        out += &format!("recent_cmds={}\n", self.recent_cmds.join("|"));
+        out += &format!("recent={}\n", recent.join("|"));
+        out += &format!("recent_cmds={}\n", recent_cmds.join("|"));
         if let Some((x, y, w, h, m)) = self.window {
             out += &format!("window={x},{y},{w},{h},{}\n", if m { 1 } else { 0 });
         }
-        let _ = std::fs::write(p, out);
+        // write a temporary file and rename it over the settings, so a window starting at the
+        // same moment never reads a half-written file and falls back to the defaults
+        let tmp = p.with_extension(format!("{}.tmp", std::process::id()));
+        if std::fs::write(&tmp, out).is_err() || std::fs::rename(&tmp, &p).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The recent folders and commands: the file's lists (other windows add to and remove from
+    /// them too) with this window's own changes applied on top.
+    fn merged_recent(&self) -> (Vec<String>, Vec<String>) {
+        let disk = Settings::load();
+        let merge = |mine: &[String], theirs: &[String], max: usize| {
+            let mut v: Vec<String> = Vec::new();
+            for t in mine.iter().chain(theirs) {
+                if !v.iter().chain(&self.forget).any(|m| m.eq_ignore_ascii_case(t)) {
+                    v.push(t.clone());
+                }
+            }
+            v.truncate(max);
+            v
+        };
+        (merge(&self.added, &disk.recent, 15), merge(&self.added_cmds, &disk.recent_cmds, 10))
+    }
+
+    /// Picks up the recent folders and commands other windows saved (before showing them).
+    pub fn refresh_recent(&mut self) {
+        (self.recent, self.recent_cmds) = self.merged_recent();
+    }
+
+    pub fn remove_recent(&mut self, folder: &str) {
+        self.recent.retain(|r| !r.eq_ignore_ascii_case(folder));
+        self.added.retain(|r| !r.eq_ignore_ascii_case(folder));
+        self.forget.push(folder.to_string());
     }
 
     pub fn add_recent(&mut self, folder: &str) {
-        self.recent.retain(|r| !r.eq_ignore_ascii_case(folder));
+        for v in [&mut self.recent, &mut self.added, &mut self.forget] {
+            v.retain(|r| !r.eq_ignore_ascii_case(folder));
+        }
         self.recent.insert(0, folder.to_string());
         self.recent.truncate(15);
+        self.added.insert(0, folder.to_string());
+        self.added.truncate(15);
     }
 
     pub fn add_recent_cmd(&mut self, title: &str) {
         self.recent_cmds.retain(|r| r != title);
         self.recent_cmds.insert(0, title.to_string());
         self.recent_cmds.truncate(10);
+        self.added_cmds.retain(|r| r != title);
+        self.added_cmds.insert(0, title.to_string());
+        self.added_cmds.truncate(10);
     }
 }

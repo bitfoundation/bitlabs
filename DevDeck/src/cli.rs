@@ -14,6 +14,8 @@ pub struct Cli {
     pub paths: Vec<String>,
     pub help: bool,
     pub version: bool,
+    /// -n / --new-window: without paths, an empty window instead of the last folder.
+    pub new_window: bool,
     pub install_menu: bool,
     pub uninstall_menu: bool,
     pub unknown: Vec<String>,
@@ -31,7 +33,8 @@ Usage: devdeck.exe [options] [paths...]
 Options:
   -h, --help                   Print usage.
   -v, --version                Print version.
-  -n, --new-window             Accepted for compatibility (every path gets a window).
+  -n, --new-window             Open an empty window instead of the last folder
+                               (every path gets its own window anyway).
   --install-context-menu       Add \"Open with DevDeck\" to the Explorer folder menu.
   --uninstall-context-menu     Remove the Explorer folder menu entry.
 ";
@@ -48,7 +51,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Cli {
             match a.as_str() {
                 "-h" | "--help" | "/?" | "/h" => c.help = true,
                 "-v" | "--version" => c.version = true,
-                "-n" | "--new-window" | "-r" | "--reuse-window" => {}
+                "-n" | "--new-window" => c.new_window = true,
+                "-r" | "--reuse-window" => {}
                 "--install-context-menu" => c.install_menu = true,
                 "--uninstall-context-menu" => c.uninstall_menu = true,
                 _ => c.unknown.push(a),

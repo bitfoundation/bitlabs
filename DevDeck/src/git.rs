@@ -84,7 +84,8 @@ pub fn run(cwd: &Path, args: &[&str], input: Option<&[u8]>, quiet: bool) -> Outp
     let start = Instant::now();
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd)
-        .args(["-c", "core.quotepath=false", "-c", "color.ui=false"])
+        // user settings that would change the output DevDeck parses or the patches it applies
+        .args(["-c", "core.quotepath=false", "-c", "color.ui=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false", "-c", "diff.suppressBlankEmpty=false", "-c", "log.showSignature=false"])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
@@ -157,6 +158,10 @@ fn friendly_error(all: &str) -> Option<String> {
     }
     if s.contains("[rejected]") || s.contains("failed to push some refs") {
         return Some("Can't push refs to remote. Try running \"Pull\" first to integrate your changes.".into());
+    }
+    // git >= 2.33 refuses to pull diverged branches until pull.rebase is chosen
+    if s.contains("divergent branches") {
+        return Some("Your branch and its upstream have diverged. Use \"Pull (Rebase)\" or set pull.rebase in your git config.".into());
     }
     if s.contains("would be overwritten by checkout") || s.contains("commit your changes or stash them") {
         return Some("Your local changes would be overwritten. Commit or stash them first.".into());
@@ -284,6 +289,7 @@ pub struct Status {
     pub merging: bool,
     pub rebasing: bool,
     pub cherry_picking: bool,
+    pub reverting: bool,
     pub merge_msg: Option<String>,
     pub remotes: Vec<String>,
 }
@@ -387,7 +393,8 @@ pub fn status(root: &Path) -> GitResult<Status> {
     s.merging = gd.join("MERGE_HEAD").exists();
     s.rebasing = gd.join("rebase-merge").exists() || gd.join("rebase-apply").exists();
     s.cherry_picking = gd.join("CHERRY_PICK_HEAD").exists();
-    if s.merging || s.cherry_picking {
+    s.reverting = gd.join("REVERT_HEAD").exists();
+    if s.merging || s.cherry_picking || s.reverting {
         if let Ok(m) = std::fs::read_to_string(gd.join("MERGE_MSG")) {
             let msg: Vec<&str> = m.lines().filter(|l| !l.starts_with('#')).collect();
             s.merge_msg = Some(msg.join("\n").trim().to_string());
@@ -549,7 +556,7 @@ pub fn parse_log(out: &str) -> Vec<Commit> {
 pub fn log(root: &Path, refs: &[String], skip: usize, limit: usize) -> (Vec<Commit>, bool) {
     let n = format!("-n{}", limit + 1);
     let sk = format!("--skip={skip}");
-    let mut args: Vec<&str> = vec!["log", "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%B%x1e", "--decorate=full", "--topo-order", &n, &sk];
+    let mut args: Vec<&str> = vec!["log", "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%D%x1f%B%x1e", "--decorate=full", "--topo-order", "--ignore-missing", &n, &sk];
     for r in refs {
         args.push(r);
     }

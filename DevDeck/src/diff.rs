@@ -181,11 +181,29 @@ pub fn build_rows(fd: &FileDiff, inline: bool) -> (Vec<Row>, Vec<Block>) {
 /// `reverse == true`: patch is applied with `-R` onto the new side (unstaging / reverting).
 pub fn build_patch(fd: &FileDiff, selected: &HashSet<LineId>, reverse: bool) -> Option<String> {
     let mut out = String::new();
+    let has = |p: &str| fd.header.iter().any(|h| h.starts_with(p));
+    let partial = fd.hunks.iter().enumerate().any(|(hi, h)| h.lines.iter().enumerate().any(|(li, l)| matches!(l.kind, LK::Add | LK::Del) && !selected.contains(&(hi, li))));
+    // A partial patch leaves the file on both sides: staging some lines of a deleted file, or
+    // unstaging some lines of an added one, is a modification, not a deletion. Unstaging lines
+    // of a staged rename must not undo the rename, so both sides name the new path.
+    let keep_file = partial && (has("new file mode") && reverse || has("deleted file mode") && !reverse);
+    let renamed = has("rename from");
+    let side = |p: &str| fd.header.iter().find_map(|h| h.strip_prefix(p)).filter(|s| !s.starts_with('"'));
+    let path = side("+++ b/").or_else(|| side("--- a/"));
     for h in &fd.header {
-        if h.starts_with("diff --git") || h.starts_with("---") || h.starts_with("+++") || h.starts_with("new file mode") || h.starts_with("deleted file mode") || h.starts_with("old mode") || h.starts_with("new mode") {
-            out.push_str(h);
-            out.push('\n');
-        }
+        let line = match path {
+            Some(_) if keep_file && (h.starts_with("new file mode") || h.starts_with("deleted file mode")) => continue,
+            Some(p) if h.starts_with("--- ") && (renamed || keep_file && h == "--- /dev/null") => format!("--- a/{p}"),
+            Some(p) if h.starts_with("+++ ") && keep_file && h == "+++ /dev/null" => format!("+++ b/{p}"),
+            Some(p) if h.starts_with("diff --git") && renamed => {
+                let p = p.trim_end_matches('\t');
+                format!("diff --git a/{p} b/{p}")
+            }
+            _ if h.starts_with("diff --git") || h.starts_with("---") || h.starts_with("+++") || h.starts_with("new file mode") || h.starts_with("deleted file mode") || h.starts_with("old mode") || h.starts_with("new mode") => h.clone(),
+            _ => continue,
+        };
+        out.push_str(&line);
+        out.push('\n');
     }
     let mut any = false;
     let mut delta: i64 = 0;
@@ -215,6 +233,14 @@ pub fn build_patch(fd: &FileDiff, selected: &HashSet<LineId>, reverse: bool) -> 
                         Some('-')
                     } else if reverse {
                         None
+                    } else if matches!(h.lines.get(li + 1), Some(n) if n.kind == LK::NoNl) && h.lines.iter().enumerate().skip(li + 2).any(|(k, n)| n.kind == LK::Add && selected.contains(&(hi, k))) {
+                        // the old side's last line has no newline and lines are added after
+                        // it: as context the patch would be corrupt, so it gains its newline
+                        body.push_str(&format!("-{}\n{}\n+{}\n", l.text, h.lines[li + 1].text, l.text));
+                        oc += 1;
+                        nc += 1;
+                        last_kept = false;
+                        continue;
                     } else {
                         Some(' ')
                     }

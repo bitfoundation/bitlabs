@@ -125,7 +125,7 @@ impl App {
         self.status().and_then(|s| s.branch.clone())
     }
 
-    fn remotes(&self) -> Vec<String> {
+    pub fn remotes(&self) -> Vec<String> {
         self.status().map(|s| s.remotes.clone()).unwrap_or_default()
     }
 

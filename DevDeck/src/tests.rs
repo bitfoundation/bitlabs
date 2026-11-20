@@ -170,3 +170,133 @@ fn log_refs_stash_and_conflicts() {
     assert!(parent.is_some());
     assert_eq!(files[0].path, "a.txt");
 }
+
+#[test]
+fn partial_patches_of_added_deleted_renamed_and_no_newline_files() {
+    let r = TempRepo::new("partial");
+    r.write("del.txt", "d1\nd2\nd3\n");
+    r.write("ren.txt", "r1\nr2\nr3\nr4\nr5\nr6\nr7\nr8\n");
+    r.write("nonl.txt", "a\nb");
+    git::exec(r.root(), &["add", "."]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "base"]).unwrap();
+    let file = |s: &git::Status, p: &str, g: Group| s.files.iter().find(|f| f.path == p && f.group == g).unwrap().clone();
+
+    // stage one line of a deleted file: the file stays, minus that line
+    std::fs::remove_file(r.root().join("del.txt")).unwrap();
+    let s = git::status(r.root()).unwrap();
+    let fd = diff_of(r.root(), &file(&s, "del.txt", Group::Changes));
+    let patch = diff::build_patch(&fd, &select(&fd, |t| t == "d2"), false).unwrap();
+    git::exec_input(r.root(), &["apply", "--cached", "--recount", "-"], Some(patch.as_bytes())).unwrap();
+    assert_eq!(index_content(r.root(), "del.txt"), "d1\nd3\n");
+
+    // unstage one line of a staged new file: the file stays staged, minus that line
+    r.write("new.txt", "n1\nn2\nn3\n");
+    git::exec(r.root(), &["add", "new.txt"]).unwrap();
+    let s = git::status(r.root()).unwrap();
+    let fd = diff_of(r.root(), &file(&s, "new.txt", Group::Staged));
+    let patch = diff::build_patch(&fd, &select(&fd, |t| t == "n2"), true).unwrap();
+    git::exec_input(r.root(), &["apply", "--cached", "-R", "--recount", "-"], Some(patch.as_bytes())).unwrap();
+    assert_eq!(index_content(r.root(), "new.txt"), "n1\nn3\n");
+
+    // unstage one line of a staged rename: the rename is kept
+    git::exec(r.root(), &["mv", "ren.txt", "moved.txt"]).unwrap();
+    r.write("moved.txt", "r1\nr2\nr3\nr4\nR5\nr6\nr7\nr8\nr9\n");
+    git::exec(r.root(), &["add", "moved.txt"]).unwrap();
+    let s = git::status(r.root()).unwrap();
+    let fd = diff_of(r.root(), &file(&s, "moved.txt", Group::Staged));
+    let patch = diff::build_patch(&fd, &select(&fd, |t| t == "r9"), true).unwrap();
+    git::exec_input(r.root(), &["apply", "--cached", "-R", "--recount", "-"], Some(patch.as_bytes())).unwrap();
+    assert_eq!(index_content(r.root(), "moved.txt"), "r1\nr2\nr3\nr4\nR5\nr6\nr7\nr8\n");
+    assert!(git::run(r.root(), &["show", ":ren.txt"], None, true).stdout.is_empty());
+
+    // stage only a line added after a last line that had no newline
+    r.write("nonl.txt", "a\nB\nc\n");
+    let s = git::status(r.root()).unwrap();
+    let fd = diff_of(r.root(), &file(&s, "nonl.txt", Group::Changes));
+    let patch = diff::build_patch(&fd, &select(&fd, |t| t == "c"), false).unwrap();
+    git::exec_input(r.root(), &["apply", "--cached", "--recount", "-"], Some(patch.as_bytes())).unwrap();
+    assert_eq!(index_content(r.root(), "nonl.txt"), "a\nb\nc\n");
+}
+
+#[test]
+fn accept_side_on_modify_delete_conflict() {
+    let r = TempRepo::new("side");
+    r.write("a.txt", "one\n");
+    git::exec(r.root(), &["add", "."]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "base"]).unwrap();
+    git::exec(r.root(), &["checkout", "-q", "-b", "side"]).unwrap();
+    git::exec(r.root(), &["rm", "-q", "a.txt"]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "delete"]).unwrap();
+    git::exec(r.root(), &["checkout", "-q", "main"]).unwrap();
+    r.write("a.txt", "main\n");
+    git::exec(r.root(), &["commit", "-q", "-am", "modify"]).unwrap();
+
+    let conflicts = |r: &TempRepo| -> Vec<(String, String)> {
+        assert!(!git::run(r.root(), &["merge", "side"], None, true).ok());
+        let s = git::status(r.root()).unwrap();
+        s.files.iter().filter(|f| f.group == Group::Merge).map(|f| (f.path.clone(), f.xy.clone())).collect()
+    };
+    let c = conflicts(&r);
+    assert_eq!(c, vec![("a.txt".to_string(), "UD".to_string())]);
+    // ours modified it: keep the file
+    crate::app::resolve_side(r.root(), &c, "--ours").unwrap();
+    assert_eq!(git::status(r.root()).unwrap().count(Group::Merge), 0);
+    assert_eq!(r.read("a.txt"), "main\n");
+    git::exec(r.root(), &["merge", "--abort"]).unwrap();
+
+    // theirs deleted it: the resolution is the deletion
+    let c = conflicts(&r);
+    crate::app::resolve_side(r.root(), &c, "--theirs").unwrap();
+    let s = git::status(r.root()).unwrap();
+    assert_eq!(s.count(Group::Merge), 0);
+    assert!(!r.root().join("a.txt").exists());
+    assert!(s.files.iter().any(|f| f.path == "a.txt" && f.group == Group::Staged && f.kind == Kind::Deleted));
+}
+
+#[test]
+fn bracketed_paths_are_literal() {
+    let r = TempRepo::new("literal");
+    for d in ["app/[id]", "app/i"] {
+        std::fs::create_dir_all(r.root().join(d)).unwrap();
+        r.write(&format!("{d}/page.tsx"), "base\n");
+    }
+    git::exec(r.root(), &["add", "."]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "base"]).unwrap();
+    r.write("app/[id]/page.tsx", "x\n");
+    r.write("app/i/page.tsx", "y\n");
+    // as a glob, [id] would also match app/i/page.tsx and discard it too
+    crate::app::discard_paths(r.root(), &["app/[id]/page.tsx".to_string()], &[]).unwrap();
+    assert_eq!(r.read("app/[id]/page.tsx"), "base\n");
+    assert_eq!(r.read("app/i/page.tsx"), "y\n");
+}
+
+#[test]
+fn stash_restore_keeps_the_real_error() {
+    let r = TempRepo::new("stashpop");
+    let base: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+    r.write("a.txt", &base);
+    git::exec(r.root(), &["add", "."]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "base"]).unwrap();
+
+    // staged change whose patch no longer fits the index, but merges cleanly: retried without --index
+    r.write("a.txt", &base.replace("line6\n", "STASHED6\n"));
+    git::exec(r.root(), &["add", "a.txt"]).unwrap();
+    git::exec(r.root(), &["stash", "push", "-q"]).unwrap();
+    r.write("a.txt", &base.replace("line3\n", "HEAD3\n"));
+    git::exec(r.root(), &["commit", "-q", "-am", "head3"]).unwrap();
+    let o = git::run(r.root(), &["stash", "apply", "--index"], None, true);
+    assert!(!o.ok() && o.stderr.contains("Try without --index"), "{}", o.stderr);
+    crate::app::stash_restore(r.root(), "pop", None).unwrap();
+    let t = r.read("a.txt");
+    assert!(t.contains("HEAD3") && t.contains("STASHED6"), "{t}");
+    git::exec(r.root(), &["reset", "-q", "--hard"]).unwrap();
+
+    // unstaged change conflicting with a newer HEAD: the first attempt already merged with conflicts
+    r.write("a.txt", "stashed\n");
+    git::exec(r.root(), &["stash", "push", "-q"]).unwrap();
+    r.write("a.txt", "head\n");
+    git::exec(r.root(), &["commit", "-q", "-am", "head"]).unwrap();
+    let e = crate::app::stash_restore(r.root(), "pop", None).unwrap_err();
+    assert!(e.message.contains("merge conflicts"), "{}", e.message);
+    assert!(!e.stderr.contains("needs merge"), "{}", e.stderr);
+}

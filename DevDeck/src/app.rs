@@ -142,6 +142,8 @@ pub struct DiffView {
     pub max_cols: usize,
     /// Rows were built for the inline (true) or side-by-side layout.
     pub inline: bool,
+    /// First row of the change F7 / Shift+F7 went to last.
+    pub nav: Option<usize>,
 }
 
 pub struct FileView {
@@ -541,7 +543,18 @@ pub struct App {
     pub drag: Option<Drag>,
     pub focus: Focus,
     pub commit_edit: HWND,
+    /// MERGE_MSG put into the commit box, to take it back out when the merge is aborted.
+    pub merge_prefill: Option<String>,
     pub overlay_edit: HWND,
+    /// The commit box when it had the keyboard as an overlay opened: it gets it back after.
+    pub overlay_prev_focus: HWND,
+    /// The commit box or quick pick that had the keyboard when the window was deactivated.
+    pub saved_focus: HWND,
+    /// The open quick pick ranks its matches by file name (Go to File).
+    pub pick_rank: bool,
+    /// Lowercased search text of each quick pick item and the length of its name part, made
+    /// once when the pick opens instead of on every keystroke.
+    pub pick_hay: Vec<(String, usize)>,
     pub edit_brush: HBRUSH,
     pub edit_lines: i32,
     /// Area the open overlay covers (client coordinates), recorded while painting it.
@@ -577,7 +590,6 @@ pub struct App {
     pub caption_down: u32,
     /// App icon for the title bar and its size in pixels.
     pub title_icon: (windows_sys::Win32::UI::WindowsAndMessaging::HICON, i32),
-    pub term_skip_char: bool,
     pub term_surrogate: u16,
     pub shells: Vec<crate::term::Shell>,
 }
@@ -665,7 +677,12 @@ impl App {
             drag: None,
             focus: Focus::Changes,
             commit_edit: std::ptr::null_mut(),
+            merge_prefill: None,
             overlay_edit: std::ptr::null_mut(),
+            overlay_prev_focus: std::ptr::null_mut(),
+            saved_focus: std::ptr::null_mut(),
+            pick_rank: false,
+            pick_hay: Vec::new(),
             edit_brush: std::ptr::null_mut(),
             edit_lines: 1,
             overlay_bounds: None,
@@ -691,7 +708,6 @@ impl App {
             term_editor_prev: None,
             caption_down: 0,
             title_icon: (std::ptr::null_mut(), 0),
-            term_skip_char: false,
             term_surrogate: 0,
             shells: Vec::new(),
         }
@@ -750,6 +766,13 @@ impl App {
     // --------------------------------------------------------------- repo
 
     pub fn open_repo(&mut self, folder: &Path) {
+        // a recent folder that was deleted or renamed: drop it from the list, like VS Code
+        if !folder.is_dir() {
+            self.st.remove_recent(&folder.display().to_string());
+            self.st.save();
+            self.error(format!("The folder '{}' does not exist anymore.", folder.display()));
+            return;
+        }
         // the open tabs go away: ask about unsaved files first
         let dirty = self.dirty_tab_keys();
         if !dirty.is_empty() {
@@ -863,8 +886,12 @@ impl App {
                 if f.join(".git").exists() && git::toplevel(&f).is_some() {
                     self.open_repo(&f);
                     self.layout();
-                } else if self.explorer_active() {
-                    self.rebuild_explorer();
+                } else {
+                    if self.explorer_active() {
+                        self.rebuild_explorer();
+                    }
+                    // no status refresh follows here, so open files are reloaded directly
+                    self.reload_text_view_if_changed();
                 }
             }
             return;
@@ -931,6 +958,10 @@ impl App {
                     let Some(ti) = self.tabs.iter().position(|t| t.gen == gen) else { continue };
                     if ti != self.tab_active {
                         let t = &mut self.tabs[ti];
+                        // the tab was edited since the reload started: keep the edits
+                        if matches!(&t.view, MainView::File(f) if f.ed.dirty()) {
+                            continue;
+                        }
                         if !keep_scroll {
                             t.scroll = 0;
                             t.hscroll = 0;
@@ -1011,6 +1042,12 @@ impl App {
         if let Some(m) = &s.merge_msg {
             if win::get_text(self.commit_edit).trim().is_empty() && !m.is_empty() {
                 win::set_text(self.commit_edit, m);
+                self.merge_prefill = Some(m.clone());
+            }
+        } else if let Some(m) = self.merge_prefill.take() {
+            // merge/cherry-pick aborted: drop the prefilled message unless the user edited it
+            if win::get_text(self.commit_edit).replace("\r\n", "\n").trim() == m {
+                win::set_text(self.commit_edit, "");
             }
         }
         repo.status = s;
@@ -1212,7 +1249,34 @@ impl App {
 
     // ---------------------------------------------------------- overlays
 
+    /// Like VS Code, cancelling an overlay gives the keyboard back to where it was: the commit
+    /// box when it had it (a chain of overlays keeps the first one's).
+    fn remember_focus(&mut self) {
+        if self.overlay.is_none() {
+            let f = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+            self.overlay_prev_focus = if f == self.commit_edit { f } else { std::ptr::null_mut() };
+        }
+    }
+
+    fn restore_focus(&mut self) {
+        let prev = std::mem::replace(&mut self.overlay_prev_focus, std::ptr::null_mut());
+        let to = if !prev.is_null() && unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsWindowVisible(prev) } != 0 { prev } else { self.hwnd };
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(to);
+        }
+    }
+
     pub fn pick(&mut self, placeholder: &str, items: Vec<PickItem>, on_pick: impl FnOnce(&mut App, &PickItem) + 'static) {
+        self.remember_focus();
+        self.pick_rank = false;
+        // the name, the description, and both as a path ("src/ui.rs") for file picks
+        self.pick_hay = items
+            .iter()
+            .map(|it| {
+                let (name, desc) = (it.label.to_lowercase(), it.desc.to_lowercase());
+                (format!("{name} {desc} {desc}/{name}"), name.len())
+            })
+            .collect();
         let filtered = (0..items.len()).collect();
         self.overlay = Some(Overlay { kind: OverlayKind::Pick { items, filtered, sel: 0, on_pick: Some(Box::new(on_pick)) } });
         self.scroll[Area::Pick as usize] = 0;
@@ -1220,11 +1284,13 @@ impl App {
     }
 
     pub fn input(&mut self, prompt: &str, value: &str, on_ok: impl FnOnce(&mut App, String) + 'static) {
+        self.remember_focus();
         self.overlay = Some(Overlay { kind: OverlayKind::Input { prompt: format!("{prompt} (Press 'Enter' to confirm or 'Escape' to cancel)"), on_ok: Some(Box::new(on_ok)) } });
         self.show_overlay_edit(prompt, value);
     }
 
     pub fn confirm(&mut self, message: &str, detail: &str, buttons: &[&str], on_choice: impl FnOnce(&mut App, usize) + 'static) {
+        self.remember_focus();
         let mut b: Vec<String> = buttons.iter().map(|s| s.to_string()).collect();
         b.push("Cancel".into());
         self.overlay = Some(Overlay { kind: OverlayKind::Confirm { message: message.into(), detail: detail.into(), buttons: b, sel: 0, on_choice: Some(Box::new(on_choice)) } });
@@ -1237,23 +1303,27 @@ impl App {
 
     pub fn close_overlay(&mut self) {
         self.overlay = None;
+        self.pick_hay = Vec::new();
         self.hide_overlay_edit();
-        unsafe {
-            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.hwnd);
-        }
+        self.restore_focus();
         self.invalidate();
     }
 
     pub fn filter_pick(&mut self) {
-        let q = win::get_text(self.overlay_edit).to_lowercase();
+        // a path typed with backslashes matches the "dir/name" of files too
+        let q = win::get_text(self.overlay_edit).to_lowercase().replace('\\', "/");
+        let (rank, hay) = (self.pick_rank, &self.pick_hay);
         if let Some(Overlay { kind: OverlayKind::Pick { items, filtered, sel, .. } }) = &mut self.overlay {
             let words: Vec<&str> = q.split_whitespace().collect();
-            *filtered = (0..items.len())
-                .filter(|&i| {
-                    let hay = format!("{} {}", items[i].label, items[i].desc).to_lowercase();
-                    words.iter().all(|w| hay.contains(w))
-                })
-                .collect();
+            *filtered = (0..items.len()).filter(|&i| hay.get(i).is_some_and(|(h, _)| words.iter().all(|w| h.contains(w)))).collect();
+            // Go to File: names that start with, then contain, the first word come first
+            if let (true, Some(w)) = (rank, words.first()) {
+                filtered.sort_by_key(|&i| {
+                    let (h, n) = &hay[i];
+                    let name = &h[..*n];
+                    if name.starts_with(w) { 0 } else if name.contains(w) { 1 } else { 2 }
+                });
+            }
             *sel = 0;
         }
         self.scroll[Area::Pick as usize] = 0;
@@ -1262,8 +1332,12 @@ impl App {
 
     pub fn accept_overlay(&mut self, index: Option<usize>) {
         let Some(ov) = self.overlay.take() else { return };
+        self.pick_hay = Vec::new();
         let text = win::get_text(self.overlay_edit);
         self.hide_overlay_edit();
+        // the chosen item usually opens something (a file, a command's view): the keyboard goes
+        // to the window, not back to the commit box (only cancelling returns there)
+        self.overlay_prev_focus = std::ptr::null_mut();
         unsafe {
             windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.hwnd);
         }
@@ -1461,7 +1535,8 @@ impl App {
         let run = move |app: &mut App| {
             app.op("Stage", move |root| {
                 for chunk in paths.chunks(200) {
-                    let mut a = vec!["add", "-A", "--"];
+                    // literal: a file named app/[id]/x must not also match app/i/x
+                    let mut a = vec!["--literal-pathspecs", "add", "-A", "--"];
                     a.extend(chunk.iter().map(|s| s.as_str()));
                     git::exec(root, &a)?;
                 }
@@ -1490,7 +1565,8 @@ impl App {
         let has_head = self.status().map(|s| s.head.is_some()).unwrap_or(false);
         self.op("Unstage", move |root| {
             for chunk in paths.chunks(200) {
-                let mut a = if has_head { vec!["reset", "-q", "HEAD", "--"] } else { vec!["rm", "--cached", "-r", "-q", "--"] };
+                // literal: bracketed names aren't globs; -f: rm refuses "staged content different" otherwise, and --cached never touches the work tree
+                let mut a = if has_head { vec!["--literal-pathspecs", "reset", "-q", "HEAD", "--"] } else { vec!["--literal-pathspecs", "rm", "--cached", "-r", "-f", "-q", "--"] };
                 a.extend(chunk.iter().map(|s| s.as_str()));
                 git::exec(root, &a)?;
             }
@@ -1522,17 +1598,7 @@ impl App {
         };
         let detail = if untracked.is_empty() { "This is IRREVERSIBLE!" } else { "Untracked files are moved to the Recycle Bin. Tracked changes are IRREVERSIBLE!" };
         self.confirm(&msg, detail, &[&btn], move |app, _| {
-            app.op("Discard", move |root| {
-                for chunk in tracked.chunks(200) {
-                    let mut a = vec!["checkout", "-q", "--"];
-                    a.extend(chunk.iter().map(|s| s.as_str()));
-                    git::exec(root, &a)?;
-                }
-                for p in &untracked {
-                    recycle(&root.join(p));
-                }
-                Ok(String::new())
-            }, None, None);
+            app.op("Discard", move |root| discard_paths(root, &tracked, &untracked), None, None);
         });
     }
 
@@ -1543,7 +1609,7 @@ impl App {
 
     pub fn unstage_all(&mut self) {
         let has_head = self.status().map(|s| s.head.is_some()).unwrap_or(false);
-        self.op("Unstage", move |root| if has_head { git::exec(root, &["reset", "-q", "HEAD", "--", "."]) } else { git::exec(root, &["rm", "--cached", "-r", "-q", "--", "."]) }, None, None);
+        self.op("Unstage", move |root| if has_head { git::exec(root, &["reset", "-q", "HEAD", "--", "."]) } else { git::exec(root, &["rm", "--cached", "-r", "-f", "-q", "--", "."]) }, None, None);
     }
 
     pub fn discard_all(&mut self) {
@@ -1650,6 +1716,10 @@ impl App {
     // --------------------------------------------------------------- commit
 
     pub fn commit(&mut self, amend: bool, all: bool, post_cmd: u8) {
+        // Ctrl+Enter isn't disabled like the button: don't commit the same message twice
+        if self.ops.iter().any(|o| o == "Committing" || o == "Continue Rebase") {
+            return;
+        }
         let Some(s) = self.status().cloned() else {
             self.info("There are no available repositories.");
             return;
@@ -1813,8 +1883,10 @@ impl App {
         let args: Vec<String> = match k {
             "H:" => vec!["checkout".into(), "-q".into(), name.clone(), "--".into()],
             "R:" => {
-                let short = name.split_once('/').map(|x| x.1).unwrap_or(&name).to_string();
-                let local = self.repo.as_ref().and_then(|r| r.refs.iter().find(|x| x.kind == RefKind::Head && (x.upstream.as_deref() == Some(name.as_str()) || x.name == short)).map(|x| x.name.clone()));
+                let (_, short) = crate::branches::split_remote(&self.remotes(), &name);
+                // a local branch of the same name counts only when it doesn't track another
+                // remote branch; otherwise --track reports the clash instead of switching silently
+                let local = self.repo.as_ref().and_then(|r| r.refs.iter().find(|x| x.kind == RefKind::Head && (x.upstream.as_deref() == Some(name.as_str()) || x.name == short && x.upstream.is_none())).map(|x| x.name.clone()));
                 match local {
                     Some(l) => vec!["checkout".into(), "-q".into(), l, "--".into()],
                     None => vec!["checkout".into(), "-q".into(), "--track".into(), name.clone()],
@@ -1840,7 +1912,7 @@ impl App {
                     git::exec(root, &["stash", "push", "--include-untracked"])?;
                     git::exec(root, &refs)?;
                     if i == 1 {
-                        git::exec(root, &["stash", "pop", "--index"]).or_else(|_| git::exec(root, &["stash", "pop"]))?;
+                        stash_restore(root, "pop", None)?;
                     }
                     Ok(String::new())
                 }, None, None);
@@ -1864,6 +1936,8 @@ impl App {
             app.op("Branch", move |root| {
                 let mut a = vec!["checkout", "-q", "-b", name.as_str()];
                 if let Some(f) = &from {
+                    // like VS Code: a branch made from origin/x must not track origin/x (autoSetupMerge), or Push/Sync would go there
+                    a.insert(2, "--no-track");
                     a.push(f.as_str());
                 }
                 git::exec(root, &a)
@@ -1928,6 +2002,19 @@ impl App {
         self.pick(&format!("Select a branch to rebase '{cur}' onto"), items, |app, it| {
             let n = it.data[2..].to_string();
             app.git_op("Rebase", vec!["rebase".into(), n]);
+        });
+    }
+
+    /// Aborts whichever merge/rebase/cherry-pick/revert is in progress, after a confirm:
+    /// aborting throws away any conflict resolution done so far.
+    pub fn abort_op(&mut self) {
+        let Some((what, verb)) = self.status().and_then(op_in_progress) else {
+            self.info("There is no merge, rebase, cherry-pick or revert in progress.");
+            return;
+        };
+        let btn = format!("Abort {what}");
+        self.confirm(&format!("Abort the {}? Resolved conflicts will be lost.", what.to_lowercase()), "", &[&btn.clone()], move |app, _| {
+            app.git_op(&btn, vec![verb.into(), "--abort".into()]);
         });
     }
 
@@ -2099,7 +2186,7 @@ impl App {
     pub fn stash_apply(&mut self, index: usize, pop: bool) {
         let r = format!("stash@{{{index}}}");
         let verb = if pop { "pop" } else { "apply" };
-        self.op(if pop { "Stash Pop" } else { "Stash Apply" }, move |root| git::exec(root, &["stash", verb, "--index", &r]).or_else(|_| git::exec(root, &["stash", verb, &r])), None, None);
+        self.op(if pop { "Stash Pop" } else { "Stash Apply" }, move |root| stash_restore(root, verb, Some(&r)), None, None);
     }
 
     pub fn stash_view(&mut self, index: usize) {
@@ -2170,23 +2257,31 @@ impl App {
     }
 
     pub fn open_recent(&mut self) {
+        self.st.refresh_recent();
         let items: Vec<PickItem> = self.st.recent.iter().map(|r| pi(Path::new(r).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), r.clone(), '\u{E8B7}', r.clone())).collect();
         if items.is_empty() {
             self.info("No recently opened folders.");
             return;
         }
         self.pick("Select a folder to open (Ctrl+Enter opens a new window)", items, |app, it| {
-            let p = PathBuf::from(&it.data);
-            app.open_repo(&p);
+            // runs inside the Enter key's WM_KEYDOWN, so the Ctrl state is the key's
+            let ctrl = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x11) } < 0;
+            if ctrl && Path::new(&it.data).is_dir() {
+                app.new_window(Some(&it.data));
+            } else {
+                app.open_repo(&PathBuf::from(&it.data));
+            }
         });
     }
 
     pub fn new_window(&self, folder: Option<&str>) {
         if let Ok(exe) = std::env::current_exe() {
             let mut c = std::process::Command::new(exe);
-            if let Some(f) = folder {
-                c.arg(f);
-            }
+            match folder {
+                Some(f) => c.arg(f),
+                // an empty window, like VS Code, not this window's folder again
+                None => c.arg("--new-window"),
+            };
             let _ = c.spawn();
         }
     }
@@ -2251,6 +2346,7 @@ impl App {
     /// Command Palette. Like VS Code, the commands run from it last come first ("recently
     /// used"), then all the others ("other commands"); typing filters both groups in place.
     pub fn palette(&mut self) {
+        self.st.refresh_recent();
         let claude = crate::term::find_claude().is_some();
         let available: Vec<&(Cmd, &str, &str)> = COMMANDS.iter().filter(|(c, _, _)| *c != Cmd::Palette && (claude || !matches!(c, Cmd::ClaudeOpen | Cmd::ClaudeNew))).collect();
         let recent: Vec<&(Cmd, &str, &str)> = self.st.recent_cmds.iter().filter_map(|r| available.iter().find(|(_, t, _)| *t == r.as_str()).copied()).collect();
@@ -2259,7 +2355,9 @@ impl App {
         let group = |it: &mut PickItem, name: &str| it.sep = if it.sep.is_empty() { name.to_string() } else { format!("{}    {name}", it.sep) };
         let mut items: Vec<PickItem> = recent.iter().map(|e| item(e)).collect();
         let first_other = items.len();
-        items.extend(available.iter().filter(|e| !recent.contains(e)).map(|e| item(e)));
+        let mut other: Vec<PickItem> = available.iter().filter(|e| !recent.contains(e)).map(|e| item(e)).collect();
+        other.sort_by(|a, b| a.label.cmp(&b.label));
+        items.extend(other);
         if first_other > 0 {
             group(&mut items[0], "recently used");
             if let Some(it) = items.get_mut(first_other) {
@@ -2303,8 +2401,7 @@ impl App {
             Cmd::DeleteBranch => self.delete_branch(None),
             Cmd::Merge => self.merge_picker(),
             Cmd::Rebase => self.rebase_picker(),
-            Cmd::MergeAbort => self.git_op("Abort Merge", vec!["merge".into(), "--abort".into()]),
-            Cmd::RebaseAbort => self.git_op("Abort Rebase", vec!["rebase".into(), "--abort".into()]),
+            Cmd::MergeAbort | Cmd::RebaseAbort => self.abort_op(),
             Cmd::RebaseContinue => self.git_op("Continue Rebase", vec!["-c".into(), "core.editor=true".into(), "rebase".into(), "--continue".into()]),
             Cmd::Fetch => self.fetch(false, false),
             Cmd::FetchPrune => self.fetch(true, false),
@@ -2517,13 +2614,18 @@ impl App {
     pub fn goto_change(&mut self, dir: i32) {
         let lh = self.line_h();
         let body_h = crate::win::rh(&self.l.main_body) - self.s(26);
-        let MainView::Diff(d) = &self.view else { return };
+        let scroll = self.scroll[Area::Main as usize];
+        let MainView::Diff(d) = &mut self.view else { return };
         if d.blocks.is_empty() {
             return;
         }
-        let cur = (self.scroll[Area::Main as usize] / lh.max(1)) as usize;
+        // like VS Code, go from the change visited last while it is on screen, else from a
+        // third down the view (where a visited change is placed)
+        let (top, rows) = ((scroll / lh.max(1)) as usize, (body_h / lh.max(1)).max(1) as usize);
+        let cur = d.nav.filter(|&r| r >= top && r < top + rows).unwrap_or(((scroll + body_h / 3) / lh.max(1)) as usize);
         let starts: Vec<usize> = d.blocks.iter().map(|b| b.first_row).collect();
-        let target = if dir > 0 { starts.iter().copied().find(|&s| s > cur + 2).unwrap_or(starts[0]) } else { starts.iter().rev().copied().find(|&s| s + 2 < cur).unwrap_or(*starts.last().unwrap()) };
+        let target = if dir > 0 { starts.iter().copied().find(|&s| s > cur).unwrap_or(starts[0]) } else { starts.iter().rev().copied().find(|&s| s < cur).unwrap_or(*starts.last().unwrap()) };
+        d.nav = Some(target);
         let y = (target as i32 * lh - body_h / 3).max(0);
         self.scroll[Area::Main as usize] = y;
         self.clamp_scroll(Area::Main);
@@ -2553,8 +2655,107 @@ pub fn sanitize_branch(s: &str) -> String {
     out.trim_matches(|c| c == '/' || c == '.' || c == '-').trim_end_matches(".lock").to_string()
 }
 
-/// Moves a file or folder to the Recycle Bin (deletes it when that isn't possible).
-/// Returns false when it still exists afterwards.
+/// The operation in progress as (label, git subcommand), e.g. ("Cherry Pick", "cherry-pick").
+/// Rebase first: a conflicted rebase step can also leave merge/cherry-pick state behind.
+pub fn op_in_progress(s: &Status) -> Option<(&'static str, &'static str)> {
+    if s.rebasing {
+        Some(("Rebase", "rebase"))
+    } else if s.cherry_picking {
+        Some(("Cherry Pick", "cherry-pick"))
+    } else if s.reverting {
+        Some(("Revert", "revert"))
+    } else if s.merging {
+        Some(("Merge", "merge"))
+    } else {
+        None
+    }
+}
+
+/// `git stash pop|apply --index`, retried without --index only when the staged state can't be
+/// restored. Other failures (e.g. a merge that stopped on conflicts) already touched the tree,
+/// so a retry would only bury the real error under "needs merge".
+pub fn stash_restore(root: &Path, verb: &str, r: Option<&str>) -> GitResult<String> {
+    let mut a = vec!["stash", verb, "--index"];
+    a.extend(r);
+    git::exec(root, &a).or_else(|e| {
+        if !e.stderr.contains("Try without --index") {
+            return Err(e);
+        }
+        a.remove(2);
+        git::exec(root, &a)
+    })
+}
+
+/// Resolves conflicted files to one side ("--ours"/"--theirs"). When that side deleted the file
+/// (no stage for it, so checkout would fail) the resolution is the deletion.
+pub fn resolve_side(root: &Path, files: &[(String, String)], side: &str) -> GitResult<String> {
+    for (p, xy) in files {
+        // per git's unmerged codes: these lack stage 2 (ours) / stage 3 (theirs)
+        let gone = if side == "--ours" { matches!(xy.as_str(), "DD" | "UA" | "DU") } else { matches!(xy.as_str(), "DD" | "AU" | "UD") };
+        if gone {
+            git::exec(root, &["--literal-pathspecs", "rm", "-q", "--", p])?;
+        } else {
+            git::exec(root, &["--literal-pathspecs", "checkout", side, "--", p])?;
+            git::exec(root, &["--literal-pathspecs", "add", "--", p])?;
+        }
+    }
+    Ok(String::new())
+}
+
+/// Restores tracked files and recycles untracked ones; errors when some couldn't be removed
+/// (e.g. locked by another process) instead of failing silently.
+pub fn discard_paths(root: &Path, tracked: &[String], untracked: &[String]) -> GitResult<String> {
+    for chunk in tracked.chunks(200) {
+        // literal: a file named app/[id]/x must not also match app/i/x
+        let mut a = vec!["--literal-pathspecs", "checkout", "-q", "--"];
+        a.extend(chunk.iter().map(|s| s.as_str()));
+        git::exec(root, &a)?;
+    }
+    if untracked.is_empty() {
+        return Ok(String::new());
+    }
+    let abs: Vec<PathBuf> = untracked.iter().map(|p| root.join(p)).collect();
+    let exists = |p: &&PathBuf| std::fs::symlink_metadata(p).is_ok();
+    recycle_many(&abs);
+    // the shell stops at the first failure: give the rest their own try
+    let left: Vec<&PathBuf> = abs.iter().filter(exists).filter(|p| !recycle(p)).collect();
+    if left.is_empty() {
+        return Ok(String::new());
+    }
+    let names: Vec<String> = left.iter().take(3).map(|p| p.strip_prefix(root).unwrap_or(p).display().to_string()).collect();
+    let more = if left.len() > 3 { ", ..." } else { "" };
+    Err(GitError::new(format!("Could not move {} file(s) to the Recycle Bin (in use, or the path is too long): {}{more}", left.len(), names.join(", "))))
+}
+
+/// Moves many files to the Recycle Bin with one shell call (one call per file is slow).
+/// Returns false when the shell reported a failure.
+pub fn recycle_many(paths: &[PathBuf]) -> bool {
+    use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW};
+    if paths.is_empty() {
+        return true;
+    }
+    // double-NUL terminated list of NUL separated paths, with backslashes
+    let mut from: Vec<u16> = Vec::new();
+    for p in paths {
+        from.extend(p.display().to_string().replace('/', "\\").encode_utf16());
+        from.push(0);
+    }
+    from.push(0);
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: std::ptr::null_mut(),
+        wFunc: FO_DELETE,
+        pFrom: from.as_ptr(),
+        pTo: std::ptr::null(),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        fAnyOperationsAborted: 0,
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: std::ptr::null(),
+    };
+    unsafe { SHFileOperationW(&mut op) == 0 && op.fAnyOperationsAborted == 0 }
+}
+
+/// Moves a file or folder to the Recycle Bin; false when that failed. Never falls back to
+/// deleting for good: callers ask first, then use `delete_permanently`.
 pub fn recycle(path: &Path) -> bool {
     use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW};
     // the shell wants backslashes
@@ -2572,13 +2773,12 @@ pub fn recycle(path: &Path) -> bool {
         lpszProgressTitle: std::ptr::null(),
     };
     let r = unsafe { SHFileOperationW(&mut op) };
-    if r != 0 {
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(path);
-        } else {
-            let _ = std::fs::remove_file(path);
-        }
-    }
+    r == 0 && op.fAnyOperationsAborted == 0 && std::fs::symlink_metadata(path).is_err()
+}
+
+/// Deletes a file or folder for good. Returns false when it still exists afterwards.
+pub fn delete_permanently(path: &Path) -> bool {
+    let _ = if path.is_dir() { std::fs::remove_dir_all(path) } else { std::fs::remove_file(path) };
     std::fs::symlink_metadata(path).is_err()
 }
 
@@ -2588,11 +2788,19 @@ pub fn diff_view_from(text: &str, f: &FileChange, kind: DiffKind, inline: bool, 
         return MainView::Message(title.into(), "The file is not displayed because it is binary.".into());
     }
     if fd.hunks.is_empty() {
-        return MainView::Message(title.into(), "No textual changes (mode, rename or whitespace only).".into());
+        let has = |p: &str| fd.header.iter().any(|h| h.starts_with(p));
+        let msg = if has("new file mode") || f.kind == Kind::Untracked {
+            "Empty file added."
+        } else if has("deleted file mode") {
+            "Empty file deleted."
+        } else {
+            "No textual changes (mode, rename or whitespace only)."
+        };
+        return MainView::Message(title.into(), msg.into());
     }
     let (rows, blocks) = diff::build_rows(&fd, inline);
     let max_cols = fd.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3).max().unwrap_or(0);
-    MainView::Diff(DiffView { title: title.into(), desc: f.path.clone(), path: f.path.clone(), kind, change: Some(f.clone()), fd, rows, blocks, sel: None, back: None, max_cols, inline })
+    MainView::Diff(DiffView { title: title.into(), desc: f.path.clone(), path: f.path.clone(), kind, change: Some(f.clone()), fd, rows, blocks, sel: None, back: None, max_cols, inline, nav: None })
 }
 
 pub fn build_change_view(root: &Path, f: &FileChange, ctx: &str, inline: bool) -> MainView {

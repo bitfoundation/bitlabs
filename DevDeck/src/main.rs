@@ -314,6 +314,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(hwnd, |a| a.on_term_data());
             0
         }
+        WM_SYSCHAR if wp == 0x20 => DefWindowProcW(hwnd, msg, wp, lp),
         WM_CHAR | WM_SYSCHAR => {
             let alt = msg == WM_SYSCHAR;
             let handled = with_app(hwnd, |a| {
@@ -353,7 +354,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ACTIVATE => {
             let activating = (wp & 0xFFFF) != 0;
-            with_app(hwnd, |a| {
+            let minimized = (wp >> 16) & 0xFFFF != 0;
+            let restored = with_app(hwnd, |a| {
                 if activating && a.repo.is_some() {
                     unsafe {
                         SetTimer(hwnd, app::TIMER_FS, 150, None);
@@ -361,8 +363,67 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 // the title bar dims while the window is inactive
                 a.invalidate();
-            });
+                // like VS Code, Alt+Tab back returns to the commit box or quick pick that had
+                // the keyboard (DefWindowProc would focus the main window)
+                if !activating {
+                    let f = unsafe { GetFocus() };
+                    a.saved_focus = if f == a.commit_edit || f == a.overlay_edit { f } else { std::ptr::null_mut() };
+                    false
+                } else if !minimized && !a.saved_focus.is_null() && unsafe { IsWindowVisible(a.saved_focus) } != 0 {
+                    unsafe { SetFocus(a.saved_focus) };
+                    a.saved_focus = std::ptr::null_mut();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+            if restored {
+                return 0;
+            }
             DefWindowProcW(hwnd, msg, wp, lp)
+        }
+        // a lone Alt would enter the (invisible) menu bar mode and swallow the next key;
+        // Alt+Space (lp == ' ') still opens the window menu
+        WM_SYSCOMMAND if (wp & 0xFFF0) as u32 == SC_KEYMENU && lp == 0 => 0,
+        // Windows is shutting down, restarting or logging off: files with unsaved changes
+        // block it with a reason and the usual question, like closing the window
+        WM_QUERYENDSESSION => {
+            let dirty = with_app(hwnd, |a| {
+                let dirty = a.dirty_tab_keys();
+                if dirty.is_empty() {
+                    return false;
+                }
+                let reason = win::wz("Files have unsaved changes");
+                unsafe {
+                    windows_sys::Win32::System::Shutdown::ShutdownBlockReasonCreate(hwnd, reason.as_ptr());
+                }
+                if a.overlay.is_none() {
+                    a.confirm_unsaved(dirty, |a| unsafe {
+                        windows_sys::Win32::System::Shutdown::ShutdownBlockReasonDestroy(a.hwnd);
+                        PostMessageW(a.hwnd, WM_CLOSE, 0, 0);
+                    });
+                }
+                true
+            })
+            // None: a context menu or folder dialog is open (its modal loop holds the app), so
+            // unsaved files can't be checked: block too rather than risk losing them
+            .unwrap_or_else(|| {
+                let reason = win::wz("Close the open menu or dialog first");
+                unsafe { windows_sys::Win32::System::Shutdown::ShutdownBlockReasonCreate(hwnd, reason.as_ptr()) };
+                true
+            });
+            if dirty {
+                return 0;
+            }
+            windows_sys::Win32::System::Shutdown::ShutdownBlockReasonDestroy(hwnd);
+            1
+        }
+        WM_ENDSESSION => {
+            if wp != 0 {
+                with_app(hwnd, |a| save_placement(hwnd, a));
+            }
+            0
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
             InvalidateRect(hwnd, null(), 0);
@@ -426,9 +487,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let (ctrl, shift) = (key_down(VK_CONTROL), key_down(VK_SHIFT));
             if msg == WM_SYSKEYDOWN {
                 let term_focus = with_app(hwnd, |a| a.term_has_focus()).unwrap_or(false);
-                if vk == VK_F4 || !(term_focus || vk == VK_F10) {
+                // Alt+Space opens the window menu, also from the terminal
+                if vk == VK_F4 || vk == VK_SPACE || !(term_focus || vk == VK_F10) {
                     return DefWindowProcW(hwnd, msg, wp, lp);
                 }
+            }
+            // AltGr reports Ctrl+Alt: a character typed with it (Polish ą, German @ ...) must reach
+            // WM_CHAR instead of running Ctrl+letter shortcuts (Ctrl+A, Ctrl+Z ...). Ctrl+Alt+` stays a key.
+            let char_key = matches!(vk, 0x30..=0x5A | 0xBA..=0xE2) && vk != 0xC0;
+            if ctrl && char_key && key_down(VK_MENU) && with_app(hwnd, |a| a.editor_focused()).unwrap_or(false) {
+                return 0;
             }
             with_app(hwnd, |a| a.on_key(vk, ctrl, shift));
             0
@@ -473,16 +541,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if asked {
                 return 0;
             }
-            with_app(hwnd, |a| {
-                let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
-                wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
-                unsafe {
-                    GetWindowPlacement(hwnd, &mut wp);
-                }
-                let r = wp.rcNormalPosition;
-                a.st.window = Some((r.left, r.top, r.right - r.left, r.bottom - r.top, wp.showCmd == SW_SHOWMAXIMIZED as u32));
-                a.st.save();
-            });
+            with_app(hwnd, |a| save_placement(hwnd, a));
             DestroyWindow(hwnd);
             0
         }
@@ -492,6 +551,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
+}
+
+/// Remembers the window's normal position and maximized state for the next start.
+fn save_placement(hwnd: HWND, a: &mut App) {
+    let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
+    wp.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
+    let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    unsafe {
+        GetWindowPlacement(hwnd, &mut wp);
+        GetMonitorInfoW(MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY), &mut mi);
+    }
+    // rcNormalPosition is in workspace coordinates (relative to the primary work area) but
+    // CreateWindowExW takes screen coordinates: with the taskbar at the top or left the window
+    // would move by the taskbar's size on every start
+    let (dx, dy) = (mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
+    let r = wp.rcNormalPosition;
+    // closed while minimized (taskbar > Close window): keep the maximized state it restores to
+    let max = wp.showCmd == SW_SHOWMAXIMIZED as u32 || wp.showCmd == SW_SHOWMINIMIZED as u32 && wp.flags & WPF_RESTORETOMAXIMIZED != 0;
+    a.st.window = Some((r.left + dx, r.top + dy, r.right - r.left, r.bottom - r.top, max));
+    a.st.save();
 }
 
 /// Subclass for the commit message box (multi-line EDIT).
@@ -715,7 +795,7 @@ fn main() {
             }
             match target {
                 Some(t) => a.open_target(t),
-                None if had_args => {}
+                None if had_args || cli.new_window => {}
                 None => {
                     if let Some(last) = a.st.recent.first().cloned() {
                         if std::path::Path::new(&last).is_dir() && a.git_version.is_some() {

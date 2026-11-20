@@ -1847,9 +1847,9 @@ impl App {
             } else if s.branch.is_some() {
                 item(self, g, &mut x, "\u{2601} Publish", Some(Hit::Cmd(Cmd::Publish)));
             }
-            if s.merging || s.rebasing || s.cherry_picking {
-                let what = if s.rebasing { "Rebase" } else if s.cherry_picking { "Cherry Pick" } else { "Merge" };
-                item(self, g, &mut x, &format!("\u{26A0} {what} in progress"), Some(Hit::Cmd(if s.rebasing { Cmd::RebaseAbort } else { Cmd::MergeAbort })));
+            if let Some((what, _)) = crate::app::op_in_progress(&s) {
+                // abort_op confirms first and picks the right `git <op> --abort`
+                item(self, g, &mut x, &format!("\u{26A0} {what} in progress"), Some(Hit::Cmd(Cmd::MergeAbort)));
             }
             if let Some(r) = &self.repo {
                 if !r.stashes.is_empty() {
@@ -2589,7 +2589,7 @@ impl App {
         let step = if a == Area::Main { self.line_h() } else { self.s(22) };
         let amount = -(delta as f32 / 120.0 * 3.0 * step as f32) as i32;
         if horizontal && a == Area::Main {
-            self.hscroll = (self.hscroll + amount).max(0);
+            self.hscroll = (self.hscroll + amount).clamp(0, self.diff_hscroll_max());
             self.invalidate();
             return;
         }
@@ -3097,6 +3097,22 @@ impl App {
         }
     }
 
+    /// Opens the context menu of the focused list's selected row when it is in view (its
+    /// rectangle comes from the last paint). False when there is none.
+    fn context_menu_key(&mut self) -> bool {
+        let (focus_row, graph, branch, explorer) = (self.focus_row, self.graph_sel, self.branch_sel_index(), self.ex.sel_index());
+        let want = |h: &Hit| match (self.focus, h) {
+            (Focus::Changes, Hit::FileRow(i) | Hit::DirRow(i)) => focus_row == Some(*i),
+            (Focus::Graph, Hit::GraphRow(i)) => graph == Some(*i),
+            (Focus::Branches, Hit::BranchRow(i)) => branch == Some(*i),
+            (Focus::Explorer, Hit::ExplorerRow(i)) => explorer == Some(*i),
+            _ => false,
+        };
+        let Some(r) = self.hits.iter().find(|(_, h)| want(h)).map(|(r, _)| *r) else { return false };
+        self.on_rbutton_up(r.left + self.s(40), (r.top + r.bottom) / 2);
+        true
+    }
+
     pub fn on_rbutton_up(&mut self, x: i32, y: i32) {
         self.hide_tip();
         let hit = self.hit_test(x, y);
@@ -3259,10 +3275,17 @@ impl App {
             Hit::GroupRow(i) | Hit::GroupAct(i, _) => match self.crows.get(i) {
                 Some(CRow::Group(Group::Staged)) => vec![m.cmd("Unstage All Changes", Cmd::UnstageAll), m.cmd("Commit Staged", Cmd::Commit)],
                 Some(CRow::Group(Group::Changes)) => vec![m.cmd("Stage All Changes", Cmd::StageAll), m.cmd("Discard All Changes", Cmd::DiscardAll), MenuItem::Sep, m.cmd("Stash All Changes", Cmd::StashUntracked)],
-                Some(CRow::Group(Group::Merge)) => vec![m.it("Stage All Merge Changes", |a| {
-                    let files = a.status().map(|s| s.files.iter().filter(|f| f.group == Group::Merge).cloned().collect()).unwrap_or_default();
-                    a.stage(files);
-                }), m.cmd("Abort Merge", Cmd::MergeAbort)],
+                Some(CRow::Group(Group::Merge)) => {
+                    let mut v = vec![m.it("Stage All Merge Changes", |a| {
+                        let files = a.status().map(|s| s.files.iter().filter(|f| f.group == Group::Merge).cloned().collect()).unwrap_or_default();
+                        a.stage(files);
+                    })];
+                    // conflicts can also come from a stash pop, with nothing to abort
+                    if let Some((what, _)) = self.status().and_then(crate::app::op_in_progress) {
+                        v.push(m.cmd(&format!("Abort {what}"), Cmd::MergeAbort));
+                    }
+                    v
+                }
                 _ => return,
             },
             Hit::GraphRow(i) => {
@@ -3292,8 +3315,18 @@ impl App {
                     v.push(m.it(&format!("Delete Branch {}", d.name), move |a| a.delete_branch(Some(n2))));
                 }
                 v.push(MenuItem::Sep);
-                v.push(m.it_if("Cherry Pick", Some(&c.hash) != head.as_ref(), move |a| a.git_op("Cherry Pick", vec!["cherry-pick".into(), h4])));
-                v.push(m.it("Revert Commit", move |a| a.git_op("Revert", vec!["revert".into(), "--no-edit".into(), h5])));
+                // a merge commit needs the parent to diff against: the first one, like VS Code
+                let merge = c.parents.len() > 1;
+                let mainline = |mut args: Vec<String>, h: String| {
+                    if merge {
+                        args.extend(["-m".into(), "1".into()]);
+                    }
+                    args.push(h);
+                    args
+                };
+                let (pick, revert) = (mainline(vec!["cherry-pick".into()], h4), mainline(vec!["revert".into(), "--no-edit".into()], h5));
+                v.push(m.it_if("Cherry Pick", Some(&c.hash) != head.as_ref(), move |a| a.git_op("Cherry Pick", pick)));
+                v.push(m.it("Revert Commit", move |a| a.git_op("Revert", revert)));
                 v.push(MenuItem::Sep);
                 v.push(m.it("Copy Commit ID", move |a| win::set_clipboard(a.hwnd, &h6)));
                 v.push(m.it("Copy Commit Message", move |a| win::set_clipboard(a.hwnd, &msg)));
@@ -3329,23 +3362,30 @@ impl App {
     }
 
     pub fn checkout_side(&mut self, files: Vec<git::FileChange>, side: &'static str) {
-        let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
-        self.op("Resolve", move |root| {
-            for p in &paths {
-                git::exec(root, &["checkout", side, "--", p])?;
-                git::exec(root, &["add", "--", p])?;
-            }
-            Ok(String::new())
-        }, None, None);
+        let files: Vec<(String, String)> = files.iter().map(|f| (f.path.clone(), f.xy.clone())).collect();
+        self.op("Resolve", move |root| crate::app::resolve_side(root, &files, side), None, None);
+    }
+
+    /// How far the diff scrolls sideways: until its longest line is in view, roughly (the
+    /// line-number gutter is estimated). Other views (the editor) are not limited here.
+    fn diff_hscroll_max(&self) -> i32 {
+        let MainView::Diff(d) = &self.view else { return i32::MAX / 2 };
+        let width = rw(&self.l.main_body) - self.s(12);
+        let pane = if d.inline { width } else { width / 2 } - self.s(80);
+        (d.max_cols as i32 * self.fonts.mono_w - pane + self.fonts.mono_w * 4).max(0)
     }
 
     pub fn copy_diff_selection(&mut self) {
         let MainView::Diff(d) = &self.view else { return };
         let Some((a, b)) = d.sel else { return };
         let mut out = String::new();
-        for r in d.rows.iter().take(a.max(b) + 1).skip(a.min(b)) {
-            if let Some((hi, li)) = r.right.or(r.left) {
-                out.push_str(d.fd.hunks[hi].lines[li].text.trim_end_matches('\r'));
+        let rows = || d.rows.iter().take(a.max(b) + 1).skip(a.min(b)).filter_map(|r| r.right.or(r.left));
+        // like VS Code, copy the modified text: deleted lines only when nothing else is selected
+        let only_del = rows().all(|(hi, li)| d.fd.hunks[hi].lines[li].kind == LK::Del);
+        for (hi, li) in rows() {
+            let l = &d.fd.hunks[hi].lines[li];
+            if l.kind != LK::Del || only_del {
+                out.push_str(l.text.trim_end_matches('\r'));
                 out.push_str("\r\n");
             }
         }
@@ -3391,6 +3431,9 @@ impl App {
     }
 
     pub fn overlay_key(&mut self, vk: u16) -> bool {
+        // PageUp / PageDown move by the rows in view, like VS Code
+        let page = (self.pick_visible_rows().max(2) - 1) as usize;
+        let shift = unsafe { (GetKeyState(0x10) as u16 & 0x8000) != 0 };
         let Some(ov) = &mut self.overlay else { return false };
         match &mut ov.kind {
             OverlayKind::Pick { filtered, sel, .. } => {
@@ -3406,8 +3449,8 @@ impl App {
                             *sel = (*sel + 1) % n;
                         }
                     }
-                    0x21 => *sel = sel.saturating_sub(10),
-                    0x22 => *sel = (*sel + 10).min(n.saturating_sub(1)),
+                    0x21 => *sel = sel.saturating_sub(page),
+                    0x22 => *sel = (*sel + page).min(n.saturating_sub(1)),
                     0x0D => {
                         self.accept_overlay(None);
                         return true;
@@ -3437,6 +3480,7 @@ impl App {
             OverlayKind::Confirm { buttons, sel, .. } => {
                 let n = buttons.len();
                 match vk {
+                    0x09 if shift => *sel = (*sel + n - 1) % n,
                     0x25 | 0x26 => *sel = (*sel + n - 1) % n,
                     0x27 | 0x28 | 0x09 => *sel = (*sel + 1) % n,
                     0x0D | 0x20 => {
@@ -3465,6 +3509,10 @@ impl App {
             self.overlay_key(vk);
             return;
         }
+        // Shift+F10 / the Menu key: the context menu of the focused row, like VS Code
+        if (vk == 0x79 && shift || vk == 0x5D) && !self.term_has_focus() && self.context_menu_key() {
+            return;
+        }
         if self.term_has_focus() {
             let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
             self.term_key(vk, ctrl, shift, alt);
@@ -3478,15 +3526,15 @@ impl App {
         }
         match vk {
             0x09 => {
-                self.focus = match self.focus {
-                    _ if self.st.sidebar_visible && self.st.side_view == 1 => if self.focus == Focus::Explorer { Focus::Main } else { Focus::Explorer },
-                    Focus::Explorer => Focus::Changes,
-                    // visual order, skipping collapsed sections
-                    Focus::Changes if self.st.graph_open => Focus::Graph,
-                    Focus::Changes | Focus::Graph if self.st.branches_open => Focus::Branches,
-                    Focus::Changes | Focus::Graph | Focus::Branches => Focus::Main,
-                    Focus::Main => Focus::Changes,
-                    Focus::Terminal => Focus::Changes,
+                // visual order, skipping collapsed sections; Shift+Tab goes backwards
+                let order: Vec<Focus> = if self.st.sidebar_visible && self.st.side_view == 1 {
+                    vec![Focus::Explorer, Focus::Main]
+                } else {
+                    [Some(Focus::Changes), self.st.graph_open.then_some(Focus::Graph), self.st.branches_open.then_some(Focus::Branches), Some(Focus::Main)].into_iter().flatten().collect()
+                };
+                self.focus = match order.iter().position(|f| *f == self.focus) {
+                    Some(p) => order[(p + if shift { order.len() - 1 } else { 1 }) % order.len()],
+                    None => order[0],
                 };
                 // a terminal tab in the editor area takes the keys when the editor gets focus
                 self.sync_term_focus();
@@ -3675,7 +3723,7 @@ impl App {
         let cur = self.graph_sel.unwrap_or(0);
         let next = match vk {
             0x26 => cur.saturating_sub(1),
-            0x28 => (cur + 1).min(n - 1),
+            0x28 => if self.graph_sel.is_none() { 0 } else { (cur + 1).min(n - 1) },
             0x24 => 0,
             0x23 => n - 1,
             0x0D => {
@@ -3721,7 +3769,7 @@ impl App {
             (0x25, _) => {
                 self.hscroll = (self.hscroll - self.fonts.mono_w * 8).max(0);
             }
-            (0x27, _) => self.hscroll += self.fonts.mono_w * 8,
+            (0x27, _) => self.hscroll = (self.hscroll + self.fonts.mono_w * 8).min(self.diff_hscroll_max()),
             (0x43, true) => self.copy_diff_selection(),
             (0x08, _) => self.go_back(),
             (0x1B, _) => {

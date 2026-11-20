@@ -38,17 +38,16 @@ pub fn compute(commits: &[Commit], head_branch: Option<&str>, upstream: Option<&
         let input: Vec<Lane> = rows.last().map(|r| r.output.clone()).unwrap_or_default();
         let mut output: Vec<Lane> = Vec::new();
         let mut first_added = false;
-        if !c.parents.is_empty() {
-            for node in &input {
-                if node.id == c.hash {
-                    if !first_added {
-                        output.push(Lane { id: c.parents[0].clone(), color: label_color(c).unwrap_or(node.color) });
-                        first_added = true;
-                    }
-                    continue;
+        // the other lanes carry on past a root commit too (orphan branches, unrelated histories)
+        for node in &input {
+            if node.id == c.hash {
+                if !first_added && !c.parents.is_empty() {
+                    output.push(Lane { id: c.parents[0].clone(), color: label_color(c).unwrap_or(node.color) });
+                    first_added = true;
                 }
-                output.push(node.clone());
+                continue;
             }
+            output.push(node.clone());
         }
         let start = if first_added { 1 } else { 0 };
         for i in start..c.parents.len() {

@@ -106,11 +106,12 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 | Key | Action |
 |---|---|
 | `Ctrl+Shift+P` / `F1` | Command palette |
-| `Ctrl+Enter` | Commit (`Ctrl+Shift+Enter` commits all) |
+| `Ctrl+Enter` | Commit (`Ctrl+Shift+Enter` commits all); in the editor, insert a line below (above with Shift) |
 | `Ctrl+Shift+G` | Show Source Control and focus the commit message |
 | `F5` | Refresh |
 | `F7` / `Shift+F7` | Next / previous change |
-| `Tab` | Cycle focus: Changes, Graph, Branches, Diff |
+| `Tab` / `Shift+Tab` | Cycle focus: Changes, Graph, Branches, Diff (backwards with Shift) |
+| `Shift+F10` / Menu key | Context menu of the selected row |
 | `↑ ↓ Enter Space` | Navigate and open in lists (Enter on a branch checks it out) |
 | `← →` (changes tree, branches) | Collapse / expand folder or group, or go to the parent |
 | `F2` (branches) | Rename branch |
@@ -135,7 +136,7 @@ the startup crash (`DrawTextW` reading past non NUL-terminated strings) was foun
 | ``Ctrl+Alt+` `` | New terminal |
 | ``Ctrl+Shift+` `` | Toggle terminal in the editor area |
 | `Ctrl+PageDown` / `Ctrl+PageUp` (terminal) | Next / previous terminal |
-| `Ctrl+Shift+A` | Open Claude Code (when installed) |
+| `Ctrl+Shift+A` | Open Claude Code (when installed); in it, `Shift+Enter` inserts a newline and `Shift+Tab` cycles modes |
 | `Ctrl+Shift+C` | External terminal in repo |
 
 Settings (theme, layout, side bar position, recent folders) are stored in `%APPDATA%\DevDeck\settings.ini`. Settings from the app's previous name, GitGui (`%APPDATA%\GitGui`), are copied over on the first start.
