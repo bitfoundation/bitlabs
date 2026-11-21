@@ -484,8 +484,8 @@ cmds! {
     RenameTerminal => "Terminal: Rename...", "";
     SelectShell => "Terminal: Select Default Profile", "";
     ClearTerminal => "Terminal: Clear", "";
-    ClaudeOpen => "Claude Code: Open", "Ctrl+Shift+A";
-    ClaudeNew => "Claude Code: New Session", "";
+    ClaudeOpen => "Claude Code: Open", "";
+    ClaudeNew => "Claude Code: New Session", "Ctrl+Shift+A";
     ToggleOutput => "View: Toggle Output", "Ctrl+J";
     CloseEditor => "View: Close Editor", "Ctrl+W";
     CloseOtherEditors => "View: Close Other Editors", "";

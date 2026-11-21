@@ -467,7 +467,7 @@ impl App {
         }
     }
 
-    /// Ctrl+Shift+A, "Claude Code: Open": focuses the running Claude Code session (the
+    /// "Claude Code: Open": focuses the running Claude Code session (the
     /// terminal tab used last first, then any other, in the editor area or the panel), else
     /// starts one in an editor tab in the open folder.
     pub fn open_claude(&mut self) {
@@ -485,7 +485,7 @@ impl App {
         self.invalidate();
     }
 
-    /// "Claude Code: New Session": starts Claude Code in a new editor tab.
+    /// Ctrl+Shift+A, "Claude Code: New Session": starts Claude Code in a new editor tab.
     pub fn new_claude_session(&mut self) {
         match term::find_claude() {
             Some(shell) => self.new_editor_terminal(Some(shell)),
@@ -678,7 +678,7 @@ impl App {
             (0x47, true, true) => Some(Cmd::FocusCommit),
             (0x42, true, false) if !alt => Some(Cmd::ToggleSidebar),
             (0x45, true, true) => Some(Cmd::ShowExplorer),
-            (0x41, true, true) => Some(Cmd::ClaudeOpen),
+            (0x41, true, true) => Some(Cmd::ClaudeNew),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),
             // Ctrl+W / Ctrl+F4 close a terminal tab like any other tab

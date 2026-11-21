@@ -3663,7 +3663,7 @@ impl App {
             (0x4E, true, true) => Some(Cmd::NewWindow),                      // Ctrl+Shift+N
             (0x47, true, true) => Some(Cmd::FocusCommit),                    // Ctrl+Shift+G
             (0x43, true, true) => Some(Cmd::OpenTerminal),                   // Ctrl+Shift+C
-            (0x41, true, true) => Some(Cmd::ClaudeOpen),                     // Ctrl+Shift+A
+            (0x41, true, true) => Some(Cmd::ClaudeNew),                      // Ctrl+Shift+A
             (0xC0, true, false) => Some(Cmd::ToggleTerminal),                // Ctrl+`
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),                 // Ctrl+Shift+M
             (0x42, true, false) => Some(Cmd::ToggleSidebar),                 // Ctrl+B
