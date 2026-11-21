@@ -1,0 +1,466 @@
+using BlazorProfiler.Events;
+
+namespace BlazorProfiler.Storage;
+
+/// <summary>A query over stored events.</summary>
+public sealed class EventQuery
+{
+    /// <summary>Inclusive lower bound on <see cref="ProfilerEvent.EndTimestamp"/>.</summary>
+    public long? From { get; set; }
+
+    /// <summary>Inclusive upper bound on <see cref="ProfilerEvent.Timestamp"/>.</summary>
+    public long? To { get; set; }
+
+    /// <summary>Restricts results to these kinds.</summary>
+    public IReadOnlySet<ProfilerEventKind>? Kinds { get; set; }
+
+    /// <summary>Restricts results to one operation.</summary>
+    public long? OperationId { get; set; }
+
+    /// <summary>Restricts results to one component type.</summary>
+    public string? ComponentType { get; set; }
+
+    /// <summary>The maximum number of results (most recent events win when the limit is reached).</summary>
+    public int Limit { get; set; } = int.MaxValue;
+
+    internal bool Matches(ProfilerEvent e)
+    {
+        if (From is { } from && e.EndTimestamp < from)
+        {
+            return false;
+        }
+
+        if (To is { } to && e.Timestamp > to)
+        {
+            return false;
+        }
+
+        if (Kinds is not null && !Kinds.Contains(e.Kind))
+        {
+            return false;
+        }
+
+        if (OperationId is { } operation && e.OperationId != operation)
+        {
+            return false;
+        }
+
+        if (ComponentType is not null)
+        {
+            var type = e switch
+            {
+                ComponentEvent c => c.ComponentType,
+                HttpRequestEvent h => h.OriginComponentType,
+                JSInteropEvent j => j.OriginComponentType,
+                _ => null,
+            };
+            if (!string.Equals(type, ComponentType, StringComparison.Ordinal))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+/// <summary>Events read after a sequence cursor, with the cursor's state determined in the same read.</summary>
+public sealed class EventRange
+{
+    /// <summary>The events, in storage order.</summary>
+    public required List<ProfilerEvent> Events { get; init; }
+
+    /// <summary>
+    /// The sequence number of the last returned event: the cursor for the next read. When no event is returned, the
+    /// effective cursor (the clear's sequence number after a reset).
+    /// </summary>
+    public long LastSequence { get; init; }
+
+    /// <summary>
+    /// The cursor predates the last clear or was not produced by the store, so data the caller loaded with it no longer
+    /// exists and must be discarded. Reading restarted at the first event after the clear.
+    /// </summary>
+    public bool Reset { get; init; }
+
+    /// <summary>Events after the cursor were evicted by retention limits before they could be read.</summary>
+    public bool Gap { get; init; }
+}
+
+/// <summary>Stores the raw events of one session.</summary>
+/// <remarks>Implementations are not required to be thread-safe; the owning session serializes access.</remarks>
+public interface IProfilerEventStore
+{
+    /// <summary>The number of retained events.</summary>
+    int Count { get; }
+
+    /// <summary>The approximate memory retained by events.</summary>
+    long EstimatedBytes { get; }
+
+    /// <summary>The total number of events appended since creation or the last clear.</summary>
+    long TotalAppended { get; }
+
+    /// <summary>The number of events evicted because of retention limits.</summary>
+    long EvictedCount { get; }
+
+    /// <summary>The sequence number of the oldest retained event (sequence numbers start at 1).</summary>
+    long OldestSequence { get; }
+
+    /// <summary>
+    /// The sequence number of the most recent event. Sequence numbers increase monotonically for the lifetime of the store
+    /// and are not reused after <see cref="Clear"/>, so a cursor can never point at an unrelated event.
+    /// </summary>
+    long LastSequence { get; }
+
+    /// <summary>
+    /// The sequence number consumed by the most recent <see cref="Clear"/> (zero when the store was never cleared). Every
+    /// event at or below it was removed by the clear; a cursor below it predates the clear.
+    /// </summary>
+    long ClearedSequence { get; }
+
+    /// <summary>Appends an event, evicting old events as required by the retention limits.</summary>
+    void Append(ProfilerEvent profilerEvent, long now);
+
+    /// <summary>Evicts events older than the retention age.</summary>
+    void EvictExpired(long now);
+
+    /// <summary>Removes every event.</summary>
+    void Clear();
+
+    /// <summary>
+    /// Replaces a retained event with another instance (for example an enriched copy) at the same position. Returns
+    /// <see langword="false"/> when <paramref name="original"/> is not retained.
+    /// </summary>
+    bool Replace(ProfilerEvent original, ProfilerEvent replacement);
+
+    /// <summary>Returns the events matching <paramref name="query"/> in storage order.</summary>
+    List<ProfilerEvent> Query(EventQuery query);
+
+    /// <summary>
+    /// Returns up to <paramref name="max"/> events whose sequence number is greater than <paramref name="afterSequence"/>,
+    /// together with the sequence number of the last returned event and the state of the cursor. A cursor that is ahead of
+    /// the store (not produced by it) or predates the last clear restarts at the oldest event retained since the clear.
+    /// </summary>
+    EventRange GetAfter(long afterSequence, int max);
+
+    /// <summary>Returns the retained events of one operation.</summary>
+    IReadOnlyList<ProfilerEvent> GetOperation(long operationId);
+
+    /// <summary>Copies all retained events in storage order.</summary>
+    ProfilerEvent[] ToArray();
+}
+
+/// <summary>
+/// A bounded, in-memory ring buffer of events with count, memory, and age limits, plus an operation index.
+/// </summary>
+public sealed class BoundedEventStore : IProfilerEventStore
+{
+    private const int InitialCapacity = 256;
+
+    private readonly int _maxEvents;
+    private readonly long _maxBytes;
+    private readonly long _maxAgeTicks;
+    private readonly Dictionary<long, OperationEvents> _byOperation = [];
+
+    private ProfilerEvent[] _buffer;
+    private int _head; // index of the oldest event
+    private int _count;
+    private long _appended; // since creation or the last clear
+    private long _lastSequence; // monotonic for the lifetime of the store
+    private long _clearedSequence;
+    private long _bytes;
+    private long _evicted;
+
+    /// <summary>Creates a store.</summary>
+    /// <param name="maxEvents">The maximum number of retained events.</param>
+    /// <param name="maxBytes">The approximate maximum retained memory.</param>
+    /// <param name="maxAgeTicks">The maximum event age in clock ticks.</param>
+    public BoundedEventStore(int maxEvents, long maxBytes, long maxAgeTicks)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxEvents, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxBytes, 1);
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxAgeTicks, 1);
+        _maxEvents = maxEvents;
+        _maxBytes = maxBytes;
+        _maxAgeTicks = maxAgeTicks;
+        _buffer = new ProfilerEvent[Math.Min(InitialCapacity, maxEvents)];
+    }
+
+    /// <inheritdoc />
+    public int Count => _count;
+
+    /// <inheritdoc />
+    public long EstimatedBytes => _bytes;
+
+    /// <inheritdoc />
+    public long TotalAppended => _appended;
+
+    /// <inheritdoc />
+    public long EvictedCount => _evicted;
+
+    /// <inheritdoc />
+    public long OldestSequence => _lastSequence - _count + 1;
+
+    /// <inheritdoc />
+    public long LastSequence => _lastSequence;
+
+    /// <inheritdoc />
+    public long ClearedSequence => _clearedSequence;
+
+    /// <inheritdoc />
+    public void Append(ProfilerEvent profilerEvent, long now)
+    {
+        var size = profilerEvent.EstimateSize();
+        while (_count > 0 && (_count >= _maxEvents || _bytes + size > _maxBytes))
+        {
+            EvictOldest();
+        }
+
+        if (_count == _buffer.Length)
+        {
+            Grow();
+        }
+
+        _buffer[(_head + _count) % _buffer.Length] = profilerEvent;
+        _count++;
+        _appended++;
+        _lastSequence++;
+        _bytes += size;
+
+        if (profilerEvent.OperationId != 0)
+        {
+            if (!_byOperation.TryGetValue(profilerEvent.OperationId, out var list))
+            {
+                list = new OperationEvents();
+                _byOperation[profilerEvent.OperationId] = list;
+            }
+
+            list.Items.Add(profilerEvent);
+        }
+
+        EvictExpired(now);
+    }
+
+    /// <inheritdoc />
+    public void EvictExpired(long now)
+    {
+        var cutoff = now - _maxAgeTicks;
+        while (_count > 1 && _buffer[_head].EndTimestamp < cutoff)
+        {
+            EvictOldest();
+        }
+    }
+
+    /// <inheritdoc />
+    public void Clear()
+    {
+        Array.Clear(_buffer);
+        _head = 0;
+        _count = 0;
+        _bytes = 0;
+        _appended = 0;
+        _evicted = 0;
+        _byOperation.Clear();
+
+        // The clear consumes a sequence number of its own: every cursor handed out before it is below it, every cursor
+        // handed out after it is at or above it, so readers can always tell whether their data predates the clear.
+        _lastSequence++;
+        _clearedSequence = _lastSequence;
+    }
+
+    /// <inheritdoc />
+    public bool Replace(ProfilerEvent original, ProfilerEvent replacement)
+    {
+        ArgumentNullException.ThrowIfNull(original);
+        ArgumentNullException.ThrowIfNull(replacement);
+
+        // Replacements target recent events, so search from the newest.
+        for (var i = _count - 1; i >= 0; i--)
+        {
+            var index = (_head + i) % _buffer.Length;
+            if (!ReferenceEquals(_buffer[index], original))
+            {
+                continue;
+            }
+
+            _buffer[index] = replacement;
+            _bytes = Math.Max(0, _bytes - original.EstimateSize() + replacement.EstimateSize());
+            if (original.OperationId != 0 && _byOperation.TryGetValue(original.OperationId, out var list))
+            {
+                list.Replace(original, replacement);
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <inheritdoc />
+    public List<ProfilerEvent> Query(EventQuery query)
+    {
+        var results = new List<ProfilerEvent>();
+        for (var i = 0; i < _count; i++)
+        {
+            var e = _buffer[(_head + i) % _buffer.Length];
+            if (query.Matches(e))
+            {
+                results.Add(e);
+            }
+        }
+
+        if (results.Count > query.Limit)
+        {
+            results.RemoveRange(0, results.Count - query.Limit);
+        }
+
+        return results;
+    }
+
+    /// <inheritdoc />
+    public EventRange GetAfter(long afterSequence, int max)
+    {
+        // Sequence numbers are never reused, so a cursor ahead of the store (not produced by it) or below the last clear
+        // means the caller's data no longer exists. A fresh reader (cursor 0) has nothing to discard.
+        var reset = afterSequence > _lastSequence || (afterSequence > 0 && afterSequence < _clearedSequence);
+        if (afterSequence > _lastSequence || afterSequence < _clearedSequence)
+        {
+            // Restart at the clear, so every event appended since is returned.
+            afterSequence = _clearedSequence;
+        }
+
+        var oldest = OldestSequence;
+        var startSequence = Math.Max(afterSequence + 1, oldest);
+        var results = new List<ProfilerEvent>(Math.Clamp((int)Math.Min(max, _lastSequence - startSequence + 1), 0, 4096));
+        var lastSequence = afterSequence;
+        for (var sequence = startSequence; sequence <= _lastSequence && results.Count < max; sequence++)
+        {
+            var logical = (int)(sequence - oldest);
+            results.Add(_buffer[(_head + logical) % _buffer.Length]);
+            lastSequence = sequence;
+        }
+
+        return new EventRange
+        {
+            Events = results,
+            LastSequence = lastSequence,
+            Reset = reset,
+
+            // Events between the cursor and the oldest retained event were evicted before the caller could read them.
+            Gap = _count > 0 && afterSequence + 1 < oldest,
+        };
+    }
+
+    /// <inheritdoc />
+    public IReadOnlyList<ProfilerEvent> GetOperation(long operationId) =>
+        _byOperation.TryGetValue(operationId, out var list) ? list.ToArray() : [];
+
+    /// <inheritdoc />
+    public ProfilerEvent[] ToArray()
+    {
+        var result = new ProfilerEvent[_count];
+        for (var i = 0; i < _count; i++)
+        {
+            result[i] = _buffer[(_head + i) % _buffer.Length];
+        }
+
+        return result;
+    }
+
+    private void EvictOldest()
+    {
+        var e = _buffer[_head];
+        _buffer[_head] = null!;
+        _head = (_head + 1) % _buffer.Length;
+        _count--;
+        _evicted++;
+        _bytes -= e.EstimateSize();
+        if (_bytes < 0)
+        {
+            _bytes = 0;
+        }
+
+        if (e.OperationId != 0 && _byOperation.TryGetValue(e.OperationId, out var list))
+        {
+            list.RemoveOldest(e);
+            if (list.Count == 0)
+            {
+                _byOperation.Remove(e.OperationId);
+            }
+        }
+    }
+
+    private void Grow()
+    {
+        var newCapacity = (int)Math.Min((long)_buffer.Length * 2, _maxEvents);
+        if (newCapacity <= _buffer.Length)
+        {
+            newCapacity = _buffer.Length + 1;
+        }
+
+        var newBuffer = new ProfilerEvent[newCapacity];
+        for (var i = 0; i < _count; i++)
+        {
+            newBuffer[i] = _buffer[(_head + i) % _buffer.Length];
+        }
+
+        _buffer = newBuffer;
+        _head = 0;
+    }
+
+    /// <summary>
+    /// The retained events of one operation. Events are evicted in insertion order, so removal advances a start offset
+    /// instead of shifting the list, keeping eviction O(1) amortized for large operations.
+    /// </summary>
+    private sealed class OperationEvents
+    {
+        public List<ProfilerEvent> Items { get; } = new(4);
+
+        private int _start;
+
+        public int Count => Items.Count - _start;
+
+        public void RemoveOldest(ProfilerEvent e)
+        {
+            if (_start < Items.Count && ReferenceEquals(Items[_start], e))
+            {
+                Items[_start] = null!;
+                _start++;
+            }
+            else
+            {
+                var index = Items.IndexOf(e, _start);
+                if (index < 0)
+                {
+                    return;
+                }
+
+                Items.RemoveAt(index);
+            }
+
+            if (_start > 32 && _start * 2 > Items.Count)
+            {
+                Items.RemoveRange(0, _start);
+                _start = 0;
+            }
+        }
+
+        public void Replace(ProfilerEvent original, ProfilerEvent replacement)
+        {
+            for (var i = Items.Count - 1; i >= _start; i--)
+            {
+                if (ReferenceEquals(Items[i], original))
+                {
+                    Items[i] = replacement;
+                    return;
+                }
+            }
+        }
+
+        public ProfilerEvent[] ToArray()
+        {
+            var result = new ProfilerEvent[Count];
+            Items.CopyTo(_start, result, 0, result.Length);
+            return result;
+        }
+    }
+}

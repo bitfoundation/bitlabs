@@ -1,0 +1,70 @@
+name: BlazorProfiler
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'BlazorProfiler/**'
+      - '.github/workflows/blazorprofiler.yml'
+  pull_request:
+    paths:
+      - 'BlazorProfiler/**'
+      - '.github/workflows/blazorprofiler.yml'
+  workflow_dispatch:
+    inputs:
+      benchmarks:
+        description: Run the benchmark suite
+        type: boolean
+        default: false
+
+defaults:
+  run:
+    working-directory: BlazorProfiler
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: BlazorProfiler/global.json
+      - name: Restore
+        run: dotnet restore
+      - name: Build
+        run: dotnet build --no-restore -c Release
+      - name: Unit and integration tests
+        run: |
+          dotnet test tests/BlazorProfiler.Core.Tests --no-build -c Release
+          dotnet test tests/BlazorProfiler.Tests --no-build -c Release
+          dotnet test tests/BlazorProfiler.Server.Tests --no-build -c Release
+      - name: Install Playwright browsers
+        run: pwsh tests/BlazorProfiler.E2E.Tests/bin/Release/net10.0/playwright.ps1 install --with-deps chromium firefox webkit
+      - name: End-to-end tests
+        run: dotnet test tests/BlazorProfiler.E2E.Tests --no-build -c Release
+      - name: Pack
+        run: dotnet pack BlazorProfiler.slnx --no-build -c Release -o artifacts/packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blazorprofiler-packages
+          path: BlazorProfiler/artifacts/packages
+
+  benchmarks:
+    # On demand, and on pull requests labelled "benchmarks-blazorprofiler". Allocations per operation are gated against the committed baseline.
+    if: (github.event_name == 'workflow_dispatch' && inputs.benchmarks) || (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'benchmarks-blazorprofiler'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: BlazorProfiler/global.json
+      - name: Run benchmarks
+        run: dotnet run -c Release --project benchmarks/BlazorProfiler.Benchmarks -- --job short --filter "*" --exporters github json
+      - name: Check allocations against the baseline
+        shell: pwsh
+        run: ./benchmarks/check-allocations.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: blazorprofiler-benchmarks
+          path: BlazorProfiler/BenchmarkDotNet.Artifacts/results

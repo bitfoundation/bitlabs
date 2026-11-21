@@ -1,0 +1,678 @@
+using System.Globalization;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using BlazorProfiler.Analysis;
+using BlazorProfiler.Api;
+using BlazorProfiler.Export;
+using BlazorProfiler.Storage;
+using BlazorProfiler.Testing;
+
+namespace BlazorProfiler.Cli;
+
+/// <summary>The command-line interface. Exit codes: 0 success, 1 violations found, 2 invalid usage or input.</summary>
+internal static class TraceCli
+{
+    public const int Success = 0;
+    public const int Violations = 1;
+    public const int UsageError = 2;
+
+    public const string Usage = """
+        blazor-profiler: analyze BlazorProfiler traces (.bptrace or .json exports).
+
+        Usage:
+          blazor-profiler check <trace> [--fail-on <severity>] [--ignore <ids>] [--budget <file>]
+                                        [--format text|markdown|sarif|github] [--output <file>]
+              Re-analyzes the trace with the current rules. Fails (exit code 1) when a finding at or above the
+              --fail-on severity (default: medium) remains, or when a budget limit is exceeded.
+          blazor-profiler report <trace> [--output <file>]
+              Writes a Markdown report.
+          blazor-profiler compare <baseline> <current> [--threshold <percent>] [--include-timings]
+                                  [--format text|markdown] [--output <file>]
+              Compares key metrics. Fails when a count (renders, batches, requests, queries, interop calls, retained
+              components) grows by more than --threshold percent (default 10). Durations fail only with --include-timings.
+              Per-component render counts (and, with --include-timings, render p95) are compared as well.
+          blazor-profiler leaks <trace> [<trace>...] [--format markdown|json] [--fail-on-leaks] [--output <file>]
+              Groups retained components (BP5004) across traces by leak signature (component type and likely retainers),
+              so a leak seen in many runs is listed once with how often it occurred. With --fail-on-leaks, fails (exit
+              code 1) when any is found.
+          blazor-profiler mcp <trace> [<trace>...] [--allow-control]
+              Serves the traces to a coding agent as a Model Context Protocol server over standard input and output
+              (newline-delimited JSON-RPC). Configure it in the agent as: command "blazor-profiler", args ["mcp", "<trace>"].
+
+        Severities: info, low, medium, high, critical. Rule ids: comma-separated, for example BP1006,BP3003.
+        Budget file (JSON): { "maxComponentRenders": 50, "maxDatabaseCommands": 3, "maxRetainedComponents": 0,
+                              "maxRendersByComponent": { "MyApp.Components.Row": 20 } }
+        """;
+
+    public static Task<int> RunAsync(string[] args, TextWriter output, TextWriter error, CancellationToken cancellationToken = default) =>
+        RunAsync(args, TextReader.Null, output, error, cancellationToken);
+
+    public static async Task<int> RunAsync(string[] args, TextReader input, TextWriter output, TextWriter error, CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
+            {
+                await output.WriteLineAsync(Usage).ConfigureAwait(false);
+                return args.Length == 0 ? UsageError : Success;
+            }
+
+            var options = Options.Parse(args.Skip(1).ToArray());
+            return args[0] switch
+            {
+                "check" => await CheckAsync(options, output, cancellationToken).ConfigureAwait(false),
+                "report" => await ReportAsync(options, output, cancellationToken).ConfigureAwait(false),
+                "compare" => await CompareAsync(options, output, cancellationToken).ConfigureAwait(false),
+                "leaks" => await LeaksAsync(options, output, cancellationToken).ConfigureAwait(false),
+                "mcp" => await McpAsync(options, input, output, error, cancellationToken).ConfigureAwait(false),
+                _ => throw new CliException($"Unknown command '{args[0]}'."),
+            };
+        }
+        catch (CliException ex)
+        {
+            await error.WriteLineAsync($"error: {ex.Message}").ConfigureAwait(false);
+            await error.WriteLineAsync("Run 'blazor-profiler --help' for usage.").ConfigureAwait(false);
+            return UsageError;
+        }
+        catch (Exception ex) when (ex is TraceImportException or IOException or UnauthorizedAccessException or JsonException)
+        {
+            await error.WriteLineAsync($"error: {ex.Message}").ConfigureAwait(false);
+            return UsageError;
+        }
+    }
+
+    private static async Task<int> CheckAsync(Options options, TextWriter output, CancellationToken cancellationToken)
+    {
+        var path = options.Positional(0, "trace");
+        var (document, summary, report) = await AnalyzeAsync(path, cancellationToken).ConfigureAwait(false);
+        var failOn = options.Severity("--fail-on", DiagnosticSeverity.Medium);
+        var ignored = new HashSet<string>(options.List("--ignore"), StringComparer.OrdinalIgnoreCase);
+        var failing = report.Findings.Where(f => f.Suppression is null && f.Severity >= failOn && !ignored.Contains(f.RuleId)).ToList();
+        var budgetViolations = options.Value("--budget") is { } budgetPath ? LoadBudget(budgetPath).Check(summary) : [];
+
+        var format = options.Value("--format") ?? "text";
+        var text = format switch
+        {
+            "text" => CheckText(document, report, failing, budgetViolations, failOn),
+            "markdown" or "md" => MarkdownReportExporter.Render(WithFindings(document, report)) + BudgetMarkdown(budgetViolations),
+            "sarif" => Sarif(report, failing, ignored),
+            "github" => GitHubAnnotations(report, failing, budgetViolations, ignored),
+            _ => throw new CliException($"Unknown format '{format}'."),
+        };
+
+        await WriteAsync(options, output, text, cancellationToken).ConfigureAwait(false);
+        return failing.Count > 0 || budgetViolations.Count > 0 ? Violations : Success;
+    }
+
+    private static async Task<int> ReportAsync(Options options, TextWriter output, CancellationToken cancellationToken)
+    {
+        var (document, _, report) = await AnalyzeAsync(options.Positional(0, "trace"), cancellationToken).ConfigureAwait(false);
+        await WriteAsync(options, output, MarkdownReportExporter.Render(WithFindings(document, report)), cancellationToken).ConfigureAwait(false);
+        return Success;
+    }
+
+    private static async Task<int> CompareAsync(Options options, TextWriter output, CancellationToken cancellationToken)
+    {
+        var (baselineDocument, baseline, _) = await AnalyzeAsync(options.Positional(0, "baseline"), cancellationToken).ConfigureAwait(false);
+        var (currentDocument, current, _) = await AnalyzeAsync(options.Positional(1, "current"), cancellationToken).ConfigureAwait(false);
+        var threshold = options.Number("--threshold", 10) / 100;
+        var includeTimings = options.Flag("--include-timings");
+        var rows = Compare(baseline, current, threshold, includeTimings);
+        var markdown = options.Value("--format") is "markdown" or "md";
+        var text = new StringBuilder();
+        text.Append("Baseline: ").AppendLine(Describe(baselineDocument.Metadata));
+        text.Append("Current:  ").AppendLine(Describe(currentDocument.Metadata));
+        foreach (var warning in EnvironmentWarnings(baselineDocument.Metadata, currentDocument.Metadata))
+        {
+            text.Append(markdown ? "> **Warning:** " : "warning: ").AppendLine(warning);
+        }
+
+        text.AppendLine();
+        if (markdown)
+        {
+            text.AppendLine("| Metric | Baseline | Current | Change | |").AppendLine("|---|---:|---:|---:|---|");
+        }
+
+        foreach (var row in rows)
+        {
+            var change = row.Baseline == 0 ? (row.Current == 0 ? "0%" : "new") : ((row.Current - row.Baseline) / row.Baseline).ToString("+0%;-0%;0%", CultureInfo.InvariantCulture);
+            var status = row.Regressed ? "REGRESSION" : row.Improved ? "improved" : string.Empty;
+            text.AppendLine(markdown
+                ? $"| {row.Name} | {row.Format(row.Baseline)} | {row.Format(row.Current)} | {change} | {status} |"
+                : $"{row.Name,-28} {row.Format(row.Baseline),12} {row.Format(row.Current),12} {change,8}  {status}");
+        }
+
+        var componentRows = CompareComponents(baseline, current, threshold, includeTimings);
+        if (componentRows.Count > 0)
+        {
+            text.AppendLine();
+            text.AppendLine(markdown ? "| Component metric | Baseline | Current | Change | |" : "Components (largest changes):");
+            if (markdown)
+            {
+                text.AppendLine("|---|---:|---:|---:|---|");
+            }
+
+            foreach (var row in componentRows)
+            {
+                var change = row.Baseline == 0 ? "new" : ((row.Current - row.Baseline) / row.Baseline).ToString("+0%;-0%;0%", CultureInfo.InvariantCulture);
+                var status = row.Regressed ? "REGRESSION" : row.Improved ? "improved" : string.Empty;
+                text.AppendLine(markdown
+                    ? $"| {row.Name} | {row.Format(row.Baseline)} | {row.Format(row.Current)} | {change} | {status} |"
+                    : $"  {row.Name,-48} {row.Format(row.Baseline),10} {row.Format(row.Current),10} {change,8}  {status}");
+            }
+        }
+
+        rows.AddRange(componentRows);
+        var regressions = rows.Count(r => r.Regressed);
+        text.AppendLine().AppendLine(regressions == 0 ? "No regressions." : $"{regressions} regression(s) above {threshold * 100:0.#}%.");
+        await WriteAsync(options, output, text.ToString(), cancellationToken).ConfigureAwait(false);
+        return regressions > 0 ? Violations : Success;
+    }
+
+    internal static List<ComparisonRow> Compare(SessionSummary baseline, SessionSummary current, double threshold, bool includeTimings)
+    {
+        static string Count(double v) => DiagnosticContext.FormatNumber(v);
+        static string Ms(double v) => DiagnosticContext.FormatMs(v);
+        static string Bytes(double v) => DiagnosticContext.FormatBytes(v);
+        var metrics = new (string Name, Func<SessionSummary, double> Value, Func<double, string> Format, bool Deterministic)[]
+        {
+            ("Render batches", s => s.RenderBatches.Durations.Count, Count, true),
+            ("Components updated", s => s.RenderBatches.TotalUpdatedComponents, Count, true),
+            ("Component renders", s => s.Components.Sum(c => c.Renders.Count), Count, true),
+            ("Parameter updates", s => s.Components.Sum(c => c.ParametersSets.Count), Count, true),
+            ("HTTP requests", s => s.Endpoints.Sum(e => e.Durations.Count), Count, true),
+            ("Database commands", s => s.Queries.Sum(q => q.Durations.Count), Count, true),
+            ("JS interop calls", s => s.Interop.Sum(i => i.Durations.Count), Count, true),
+            ("Retained components", s => s.Components.Sum(c => c.Retained), Count, true),
+            ("Event handler p95", s => s.Handlers.Select(h => h.Durations.P95Ms).DefaultIfEmpty().Max(), Ms, false),
+            ("Render batch p95", s => s.RenderBatches.Durations.P95Ms, Ms, false),
+            ("Browser interaction p95", s => s.BrowserInteractions.P95Ms, Ms, false),
+            ("Allocated", s => s.Runtime.AllocatedBytes, Bytes, false),
+        };
+
+        var rows = new List<ComparisonRow>();
+        foreach (var (name, value, format, deterministic) in metrics)
+        {
+            var a = value(baseline);
+            var b = value(current);
+            var grew = b > a * (1 + threshold) && b - a >= (deterministic ? 1 : 0.001);
+            var shrank = b < a * (1 - threshold);
+            rows.Add(new ComparisonRow(name, a, b, format, grew && (deterministic || includeTimings), shrank));
+        }
+
+        return rows;
+    }
+
+    private static string Describe(TraceMetadata m)
+    {
+        var parts = new List<string>();
+        if (m.AppName is not null)
+        {
+            parts.Add(m.AppVersion is null ? m.AppName : $"{m.AppName} {m.AppVersion}");
+        }
+
+        parts.Add(m.BuildConfiguration ?? "build unknown");
+        if (m.Runtime is not null)
+        {
+            parts.Add(m.Runtime);
+        }
+
+        if (m.ProcessorCount is { } processors)
+        {
+            parts.Add($"{processors} CPU");
+        }
+
+        parts.Add(m.Source ?? "unknown source");
+        return string.Join(", ", parts);
+    }
+
+    /// <summary>Differences between the environments of two traces that make timing comparisons unreliable.</summary>
+    internal static List<string> EnvironmentWarnings(TraceMetadata baseline, TraceMetadata current)
+    {
+        var warnings = new List<string>();
+        if (baseline.BuildConfiguration is { } a && current.BuildConfiguration is { } b && a != b)
+        {
+            warnings.Add($"The traces come from different builds ({a} vs. {b}); Debug builds are much slower, so timings are not comparable.");
+        }
+
+        if (baseline.Source is { } sa && current.Source is { } sb && sa != sb)
+        {
+            warnings.Add($"The traces come from different hosting models ({sa} vs. {sb}).");
+        }
+
+        if (baseline.Runtime is { } ra && current.Runtime is { } rb && ra != rb)
+        {
+            warnings.Add($"The traces come from different runtimes ({ra} vs. {rb}).");
+        }
+
+        if (baseline.ProcessorCount is { } pa && current.ProcessorCount is { } pb && pa != pb)
+        {
+            warnings.Add($"The traces come from machines with different processor counts ({pa} vs. {pb}); timings may differ for that reason alone.");
+        }
+
+        return warnings;
+    }
+
+    /// <summary>
+    /// Compares component types present in both sessions: render counts (or parameter updates for components without
+    /// instrumentation), and render p95 when timings are included. Only rows that changed by more than the threshold are
+    /// returned, largest relative change first (at most 20).
+    /// </summary>
+    internal static List<ComparisonRow> CompareComponents(SessionSummary baseline, SessionSummary current, double threshold, bool includeTimings)
+    {
+        static string Count(double v) => DiagnosticContext.FormatNumber(v);
+        static string Ms(double v) => DiagnosticContext.FormatMs(v);
+        var before = baseline.Components.ToDictionary(c => c.ComponentType, StringComparer.Ordinal);
+        var rows = new List<(ComparisonRow Row, double Change)>();
+        foreach (var after in current.Components)
+        {
+            var name = DiagnosticContext.ShortType(after.ComponentType);
+            if (!before.TryGetValue(after.ComponentType, out var was))
+            {
+                var count = after.Instrumented ? after.Renders.Count : after.ParametersSets.Count;
+                if (count >= 10)
+                {
+                    rows.Add((new ComparisonRow($"{name} {(after.Instrumented ? "renders" : "parameter updates")} (new)", 0, count, Count, false, false), double.MaxValue));
+                }
+
+                continue;
+            }
+
+            var instrumented = after.Instrumented && was.Instrumented;
+            var a = instrumented ? was.Renders.Count : was.ParametersSets.Count;
+            var b = instrumented ? after.Renders.Count : after.ParametersSets.Count;
+            if (a > 0 && Math.Abs(b - a) >= 1 && Math.Abs(b - a) / a > threshold)
+            {
+                rows.Add((new ComparisonRow($"{name} {(instrumented ? "renders" : "parameter updates")}", a, b, Count, b > a, b < a), Math.Abs(b - a) / a));
+            }
+
+            // Allocations per render repeat for the same data and the same renders, so they are compared without
+            // --include-timings, but only when the render counts are comparable: the mean includes one-time costs (the
+            // render tree buffer growing) that weigh more when there are fewer renders.
+            var comparableRenders = was.RendersWithAllocations >= 5 && after.RendersWithAllocations >= 5
+                && Math.Max(was.RendersWithAllocations, after.RendersWithAllocations) <= 1.25 * Math.Min(was.RendersWithAllocations, after.RendersWithAllocations);
+            if (comparableRenders && was.MeanRenderAllocatedBytes is { } allocatedBefore && after.MeanRenderAllocatedBytes is { } allocatedAfter)
+            {
+                var delta = allocatedAfter - allocatedBefore;
+                if (Math.Abs(delta) >= 1024 && Math.Abs(delta) / Math.Max(1, allocatedBefore) > threshold)
+                {
+                    rows.Add((new ComparisonRow($"{name} alloc/render", allocatedBefore, allocatedAfter, v => DiagnosticContext.FormatBytes(v), delta > 0, delta < 0), Math.Abs(delta) / Math.Max(1, allocatedBefore)));
+                }
+            }
+
+            if (includeTimings && instrumented && was.Renders.Count >= 5 && after.Renders.Count >= 5 && was.Renders.P95Ms > 0)
+            {
+                var pa = was.Renders.P95Ms;
+                var pb = after.Renders.P95Ms;
+
+                // Sub-millisecond differences are noise, whatever their relative size.
+                if (Math.Abs(pb - pa) >= 0.5 && Math.Abs(pb - pa) / pa > threshold)
+                {
+                    rows.Add((new ComparisonRow($"{name} render p95", pa, pb, Ms, pb > pa, pb < pa), Math.Abs(pb - pa) / pa));
+                }
+            }
+        }
+
+        return [.. rows.OrderByDescending(r => r.Row.Regressed).ThenByDescending(r => r.Change).Take(20).Select(r => r.Row)];
+    }
+
+    private static async Task<int> LeaksAsync(Options options, TextWriter output, CancellationToken cancellationToken)
+    {
+        var paths = options.AllPositional;
+        if (paths.Count == 0)
+        {
+            throw new CliException("Missing argument <trace>.");
+        }
+
+        // Traces are named by file name, or by path when names repeat (CI artifacts: run1/trace.bptrace, run2/trace.bptrace).
+        var names = paths.GroupBy(p => Path.GetFileName(p), StringComparer.Ordinal).Where(g => g.Count() > 1).Select(g => g.Key).ToHashSet(StringComparer.Ordinal);
+        var sources = new List<LeakSource>();
+        foreach (var path in paths)
+        {
+            var document = await ReadAsync(path, cancellationToken).ConfigureAwait(false);
+            var clock = new FixedProfilerClock(document.Clock.Frequency, document.Clock.AnchorTimestamp, document.Clock.AnchorTime);
+            var start = document.Events.Count > 0 ? document.Events.Min(e => e.Timestamp) : document.Clock.AnchorTimestamp;
+
+            // Each trace has its own instance identifiers.
+            var name = Path.GetFileName(path);
+            sources.Add(new LeakSource(names.Contains(name) ? path : name, "trace:" + path, clock, start, [.. document.Events.OfType<Events.ComponentRetainedEvent>()]));
+        }
+
+        var report = LeakGrouping.Group(sources);
+        var text = (options.Value("--format") ?? "markdown") switch
+        {
+            "markdown" or "md" or "text" => LeakGrouping.ToMarkdown(report, int.MaxValue),
+            "json" => JsonSerializer.Serialize(report, ProfilerJsonContext.Default.LeakReport),
+            var other => throw new CliException($"Unknown format '{other}'."),
+        };
+
+        await WriteAsync(options, output, text, cancellationToken).ConfigureAwait(false);
+        return options.Flag("--fail-on-leaks") && report.Groups.Count > 0 ? Violations : Success;
+    }
+
+    private static async Task<TraceDocument> ReadAsync(string path, CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path))
+        {
+            throw new CliException($"File not found: {path}");
+        }
+
+        await using var stream = File.OpenRead(path);
+        return await TraceImporter.ReadAsync(stream, new TraceImportOptions { MaxInputBytes = 1L << 31, MaxDecompressedBytes = 4L << 30, MaxEvents = 10_000_000 }, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>The clock of a trace file.</summary>
+    private sealed class FixedProfilerClock(long frequency, long anchorTimestamp, DateTimeOffset anchorTime) : IProfilerClock
+    {
+        public long Frequency { get; } = frequency;
+
+        public long AnchorTimestamp { get; } = anchorTimestamp;
+
+        public DateTimeOffset AnchorTime { get; } = anchorTime;
+
+        public long GetTimestamp() => AnchorTimestamp;
+    }
+
+    private static async Task<int> McpAsync(Options options, TextReader input, TextWriter output, TextWriter error, CancellationToken cancellationToken)
+    {
+        var paths = options.AllPositional;
+        if (paths.Count == 0)
+        {
+            throw new CliException("Missing argument <trace>.");
+        }
+
+        using var host = new ProfilerHost(new ProfilerOptions { Enabled = true, AutoStartSession = false });
+        foreach (var path in paths)
+        {
+            if (!File.Exists(path))
+            {
+                throw new CliException($"File not found: {path}");
+            }
+
+            TraceDocument document;
+            await using (var stream = File.OpenRead(path))
+            {
+                document = await TraceImporter.ReadAsync(stream, new TraceImportOptions { MaxInputBytes = 1L << 31, MaxDecompressedBytes = 4L << 30, MaxEvents = 10_000_000 }, cancellationToken).ConfigureAwait(false);
+            }
+
+            document.Metadata.SessionName ??= Path.GetFileNameWithoutExtension(path);
+            host.AddImportedSession(document);
+        }
+
+        var api = new ProfilerApi(host, "trace");
+        var server = new ProfilerMcpServer(api, new ProfilerMcpOptions { AllowControl = options.Flag("--allow-control") });
+        await error.WriteLineAsync($"blazor-profiler MCP server: {paths.Count} trace(s) loaded; reading JSON-RPC from standard input.").ConfigureAwait(false);
+        await ServeMcpAsync(server, input, output, cancellationToken).ConfigureAwait(false);
+        return Success;
+    }
+
+    /// <summary>Serves newline-delimited JSON-RPC messages (the MCP stdio transport) until the input ends.</summary>
+    internal static async Task ServeMcpAsync(ProfilerMcpServer server, TextReader input, TextWriter output, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var line = await input.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+            if (line is null)
+            {
+                break;
+            }
+
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            var response = await server.HandleAsync(line, ProfilerApiAccess.Full, cancellationToken).ConfigureAwait(false);
+            if (response is not null)
+            {
+                // Responses must not contain embedded newlines; Utf8JsonWriter output is compact.
+                await output.WriteAsync(response + "\n").ConfigureAwait(false);
+                await output.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static async Task<(TraceDocument Document, SessionSummary Summary, DiagnosticReport Report)> AnalyzeAsync(string path, CancellationToken cancellationToken)
+    {
+        if (!File.Exists(path))
+        {
+            throw new CliException($"File not found: {path}");
+        }
+
+        TraceDocument document;
+        await using (var stream = File.OpenRead(path))
+        {
+            document = await TraceImporter.ReadAsync(stream, new TraceImportOptions { MaxInputBytes = 1L << 31, MaxDecompressedBytes = 4L << 30, MaxEvents = 10_000_000 }, cancellationToken).ConfigureAwait(false);
+        }
+
+        var options = new ProfilerOptions { Enabled = true, AutoStartSession = false };
+        using var host = new ProfilerHost(options);
+        var session = host.AddImportedSession(document);
+        return (document, session.GetSummary(), host.Diagnostics.Analyze(session));
+    }
+
+    private static TraceDocument WithFindings(TraceDocument document, DiagnosticReport report)
+    {
+        document.Findings = [.. report.Findings];
+        return document;
+    }
+
+    private static string CheckText(TraceDocument document, DiagnosticReport report, List<DiagnosticFinding> failing, IReadOnlyList<string> budgetViolations, DiagnosticSeverity failOn)
+    {
+        var text = new StringBuilder();
+        text.Append(CultureInfo.InvariantCulture, $"{document.Metadata.SessionName ?? "trace"}: {report.AnalyzedEvents} events, {report.Findings.Count} finding(s), {failing.Count} at or above {failOn}.").AppendLine();
+        foreach (var f in report.Findings.OrderByDescending(f => f.Severity))
+        {
+            var marker = failing.Contains(f) ? "FAIL" : f.Suppression is null ? "    " : "skip";
+            text.Append(CultureInfo.InvariantCulture, $"{marker} [{f.Severity}] {f.RuleId} {f.Title}").AppendLine();
+            text.Append("       ").AppendLine(f.Summary);
+            if (failing.Contains(f))
+            {
+                text.Append("       Fix: ").AppendLine(f.Recommendation);
+            }
+        }
+
+        foreach (var violation in budgetViolations)
+        {
+            text.Append("FAIL [Budget] ").AppendLine(violation);
+        }
+
+        foreach (var (rule, message) in report.RuleErrors)
+        {
+            text.Append(CultureInfo.InvariantCulture, $"warn rule {rule} failed: {message}").AppendLine();
+        }
+
+        return text.ToString();
+    }
+
+    private static string BudgetMarkdown(IReadOnlyList<string> violations) =>
+        violations.Count == 0 ? string.Empty : Environment.NewLine + "## Budget violations" + Environment.NewLine + Environment.NewLine + string.Concat(violations.Select(v => "- " + v + Environment.NewLine));
+
+    internal static string Sarif(DiagnosticReport report, List<DiagnosticFinding> failing, HashSet<string> ignored)
+    {
+        var rules = new JsonArray();
+        foreach (var rule in report.Rules.OrderBy(r => r.Id, StringComparer.Ordinal))
+        {
+            rules.Add(new JsonObject
+            {
+                ["id"] = rule.Id,
+                ["name"] = string.Concat(rule.Title.Split(' ', StringSplitOptions.RemoveEmptyEntries).Select(w => char.ToUpperInvariant(w[0]) + w[1..])).Replace("-", string.Empty, StringComparison.Ordinal),
+                ["shortDescription"] = new JsonObject { ["text"] = rule.Title },
+                ["fullDescription"] = new JsonObject { ["text"] = rule.Description },
+                ["helpUri"] = DocumentationRecommendationProvider.BaseUrl + rule.Id.ToLowerInvariant(),
+            });
+        }
+
+        var results = new JsonArray();
+        foreach (var f in report.Findings.Where(f => f.Suppression is null && !ignored.Contains(f.RuleId)))
+        {
+            var result = new JsonObject
+            {
+                ["ruleId"] = f.RuleId,
+                ["level"] = !failing.Contains(f) ? "note" : f.Severity >= DiagnosticSeverity.High ? "error" : "warning",
+                ["message"] = new JsonObject { ["text"] = $"{f.Title}. {f.Summary} Suggested fix: {f.Recommendation}" },
+                ["partialFingerprints"] = new JsonObject { ["blazorProfiler/v1"] = f.Fingerprint },
+                ["properties"] = new JsonObject { ["severity"] = f.Severity.ToString(), ["confidence"] = f.Confidence.ToString(), ["category"] = f.Category.ToString() },
+            };
+            var location = f.ComponentType ?? f.Subject;
+            if (location is not null)
+            {
+                result["locations"] = new JsonArray(new JsonObject
+                {
+                    ["logicalLocations"] = new JsonArray(new JsonObject { ["fullyQualifiedName"] = location, ["kind"] = f.ComponentType is null ? "member" : "type" }),
+                });
+            }
+
+            results.Add(result);
+        }
+
+        var sarif = new JsonObject
+        {
+            ["$schema"] = "https://json.schemastore.org/sarif-2.1.0.json",
+            ["version"] = "2.1.0",
+            ["runs"] = new JsonArray(new JsonObject
+            {
+                ["tool"] = new JsonObject
+                {
+                    ["driver"] = new JsonObject
+                    {
+                        ["name"] = "BlazorProfiler",
+                        ["version"] = TraceDocumentBuilder.ProfilerVersion,
+                        ["informationUri"] = "https://github.com/bitfoundation/bitlabs/tree/main/BlazorProfiler",
+                        ["rules"] = rules,
+                    },
+                },
+                ["results"] = results,
+            }),
+        };
+        return sarif.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+    }
+
+    internal static string GitHubAnnotations(DiagnosticReport report, List<DiagnosticFinding> failing, IReadOnlyList<string> budgetViolations, HashSet<string> ignored)
+    {
+        static string Escape(string value) => value.Replace("%", "%25", StringComparison.Ordinal).Replace("\r", "%0D", StringComparison.Ordinal).Replace("\n", "%0A", StringComparison.Ordinal);
+        static string EscapeProperty(string value) => Escape(value).Replace(":", "%3A", StringComparison.Ordinal).Replace(",", "%2C", StringComparison.Ordinal);
+        var text = new StringBuilder();
+        foreach (var f in report.Findings.Where(f => f.Suppression is null && !ignored.Contains(f.RuleId)))
+        {
+            var level = !failing.Contains(f) ? "notice" : f.Severity >= DiagnosticSeverity.High ? "error" : "warning";
+            text.Append("::").Append(level).Append(" title=").Append(EscapeProperty($"{f.RuleId} {f.Title}")).Append("::").AppendLine(Escape($"{f.Summary} Suggested fix: {f.Recommendation}"));
+        }
+
+        foreach (var violation in budgetViolations)
+        {
+            text.Append("::error title=Profiler budget::").AppendLine(Escape(violation));
+        }
+
+        return text.ToString();
+    }
+
+    private static ProfilerBudget LoadBudget(string path)
+    {
+        if (!File.Exists(path))
+        {
+            throw new CliException($"Budget file not found: {path}");
+        }
+
+        var node = JsonNode.Parse(File.ReadAllText(path)) as JsonObject ?? throw new CliException("The budget file must contain a JSON object.");
+        double? Get(string name) => node.FirstOrDefault(p => string.Equals(p.Key, name, StringComparison.OrdinalIgnoreCase)).Value?.GetValue<double>();
+        var budget = new ProfilerBudget
+        {
+            MaxRenderBatches = Get("maxRenderBatches"),
+            MaxComponentRenders = Get("maxComponentRenders"),
+            MaxUpdatedComponents = Get("maxUpdatedComponents"),
+            MaxHttpRequests = Get("maxHttpRequests"),
+            MaxFailedHttpRequests = Get("maxFailedHttpRequests"),
+            MaxDatabaseCommands = Get("maxDatabaseCommands"),
+            MaxInteropCalls = Get("maxInteropCalls"),
+            MaxRetainedComponents = Get("maxRetainedComponents"),
+            MaxHandlerP95Ms = Get("maxHandlerP95Ms"),
+            MaxRenderBatchP95Ms = Get("maxRenderBatchP95Ms"),
+            MaxAllocatedBytes = Get("maxAllocatedBytes"),
+        };
+        if (node.FirstOrDefault(p => string.Equals(p.Key, "maxRendersByComponent", StringComparison.OrdinalIgnoreCase)).Value is JsonObject perComponent)
+        {
+            foreach (var (type, value) in perComponent)
+            {
+                budget.WithMaxRenders(type, value?.GetValue<double>() ?? throw new CliException($"maxRendersByComponent['{type}'] must be a number."));
+            }
+        }
+
+        return budget;
+    }
+
+    private static async Task WriteAsync(Options options, TextWriter output, string text, CancellationToken cancellationToken)
+    {
+        if (options.Value("--output") is { } file)
+        {
+            await File.WriteAllTextAsync(file, text, new UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await output.WriteAsync(text).ConfigureAwait(false);
+        }
+    }
+
+    internal sealed record ComparisonRow(string Name, double Baseline, double Current, Func<double, string> Format, bool Regressed, bool Improved);
+
+    private sealed class CliException(string message) : Exception(message);
+
+    /// <summary>Parsed arguments: positional values, <c>--name value</c> options, and <c>--flag</c> switches.</summary>
+    private sealed class Options
+    {
+        private static readonly HashSet<string> s_flags = new(StringComparer.Ordinal) { "--include-timings", "--allow-control", "--fail-on-leaks" };
+        private readonly List<string> _positional = [];
+        private readonly Dictionary<string, string> _values = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _switches = new(StringComparer.Ordinal);
+
+        public static Options Parse(string[] args)
+        {
+            var options = new Options();
+            for (var i = 0; i < args.Length; i++)
+            {
+                var arg = args[i];
+                if (!arg.StartsWith("--", StringComparison.Ordinal))
+                {
+                    options._positional.Add(arg);
+                }
+                else if (s_flags.Contains(arg))
+                {
+                    options._switches.Add(arg);
+                }
+                else if (i + 1 < args.Length)
+                {
+                    options._values[arg] = args[++i];
+                }
+                else
+                {
+                    throw new CliException($"Option {arg} requires a value.");
+                }
+            }
+
+            return options;
+        }
+
+        public string Positional(int index, string name) =>
+            index < _positional.Count ? _positional[index] : throw new CliException($"Missing argument <{name}>.");
+
+        public IReadOnlyList<string> AllPositional => _positional;
+
+        public string? Value(string name) => _values.GetValueOrDefault(name);
+
+        public bool Flag(string name) => _switches.Contains(name);
+
+        public IEnumerable<string> List(string name) =>
+            Value(name)?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) ?? [];
+
+        public double Number(string name, double fallback) =>
+            Value(name) is not { } text ? fallback
+            : double.TryParse(text.TrimEnd('%'), NumberStyles.Float, CultureInfo.InvariantCulture, out var value) && value >= 0 ? value
+            : throw new CliException($"{name} must be a non-negative number.");
+
+        public DiagnosticSeverity Severity(string name, DiagnosticSeverity fallback) =>
+            Value(name) is not { } text ? fallback
+            : Enum.TryParse<DiagnosticSeverity>(text, ignoreCase: true, out var severity) && Enum.IsDefined(severity) ? severity
+            : throw new CliException($"{name} must be one of info, low, medium, high, critical.");
+    }
+}

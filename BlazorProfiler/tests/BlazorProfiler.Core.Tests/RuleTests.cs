@@ -1,0 +1,952 @@
+using BlazorProfiler.Analysis;
+using BlazorProfiler.Analysis.Rules;
+using BlazorProfiler.Events;
+
+namespace BlazorProfiler.Core.Tests;
+
+public class RuleTests
+{
+    private static DiagnosticReport Analyze(IEnumerable<ProfilerEvent> events, Action<ProfilerOptions>? configure = null)
+    {
+        var (host, session, _) = TestHost.WithSession(configure);
+        foreach (var e in events)
+        {
+            host.Emit(e);
+        }
+
+        return host.Diagnostics.Analyze(session);
+    }
+
+    private static List<DiagnosticFinding> Findings(DiagnosticReport report, string ruleId) =>
+        report.Findings.Where(f => f.RuleId == ruleId).ToList();
+
+    [Fact]
+    public void AllBuiltInRulesHaveUniqueIdsAndRunWithoutErrorsOnEmptySessions()
+    {
+        var rules = BuiltInRules.Create();
+        Assert.Equal(rules.Count, rules.Select(r => r.Descriptor.Id).Distinct().Count());
+        var report = Analyze([]);
+        Assert.Empty(report.RuleErrors);
+        Assert.Empty(report.Findings);
+        Assert.Equal(rules.Count, report.Rules.Count);
+    }
+
+    [Fact]
+    public void BP1001_ReportsHighFrequencyRenderingWithHighConfidenceWhenOutputUnchanged()
+    {
+        var events = Enumerable.Range(0, 60).Select(i => (ProfilerEvent)Ev.Render("App.Clock", i * 50, 0.5, unchanged: true)).ToList();
+        events.Add(Ev.Render("App.Rare", 0));
+        var finding = Assert.Single(Findings(Analyze(events, o => o.Instrumentation.TrackRenderOutput = true), "BP1001"));
+        Assert.Equal("App.Clock", finding.ComponentType);
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Contains("20", finding.Title, StringComparison.Ordinal);
+        Assert.NotEmpty(finding.Caveats);
+        Assert.StartsWith(DocumentationRecommendationProvider.BaseUrl, finding.DocumentationUrl, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP1001_UsesParameterUpdatesAsLowConfidenceProxyWithoutInstrumentation()
+    {
+        var events = Enumerable.Range(0, 60).Select(i => (ProfilerEvent)Ev.Parameters("App.Row", i * 50)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP1001"));
+        Assert.Equal(DiagnosticConfidence.Low, finding.Confidence);
+        Assert.True(finding.Severity <= DiagnosticSeverity.Medium);
+        Assert.Contains(finding.Evidence, e => e.Quality == ValueQuality.Inferred);
+    }
+
+    [Fact]
+    public void BP1001_WeightsSampledRendersWhenEstimatingRates()
+    {
+        // 30 renders per second for three seconds, sampled at 0.25: only about 7.5 events per second are retained (each
+        // with weight 4), and fewer than MinimumRenderSamples in total. The weighted rate is still 30 per second.
+        var events = Enumerable.Range(0, 90).Select(i => (ProfilerEvent)Ev.Render("App.Ticker", i * (1000.0 / 30), 0.2)).ToList();
+        var report = Analyze(events, o => o.Sampling.Rates[ProfilerEventKind.ComponentRender] = 0.25);
+        Assert.Empty(report.RuleErrors);
+        var finding = Assert.Single(Findings(report, "BP1001"));
+        Assert.Equal("App.Ticker", finding.ComponentType);
+        Assert.Contains(finding.Evidence, e => e.Label == "Peak rate" && e.Quality == ValueQuality.Estimated);
+    }
+
+    [Fact]
+    public void BP4001_WeightsSampledInteropCalls()
+    {
+        // 60 calls in one operation, sampled at 0.5: 30 retained calls stand for 60.
+        var events = new List<ProfilerEvent> { Ev.Handler("App.Chart", "Draw", 0, 50, 1) };
+        events.AddRange(Enumerable.Range(0, 60).Select(i => (ProfilerEvent)Ev.Interop("chart.point", i * 20, 0.1, operation: 1)));
+        var findings = Findings(Analyze(events, o => o.Sampling.Rates[ProfilerEventKind.JSInterop] = 0.5), "BP4001");
+        var finding = Assert.Single(findings, f => f.Subject!.Contains("Chart.Draw", StringComparison.Ordinal));
+        Assert.Contains("60", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(ValueQuality.Estimated, finding.Impact!.Quality);
+    }
+
+    [Fact]
+    public void HandlerRulesTolerateDuplicateOperationIds()
+    {
+        // Imported or merged traces can contain several handlers with the same operation identifier.
+        var events = new List<ProfilerEvent>
+        {
+            Ev.Handler("App.Form", "Save", 0, 5, 1),
+            Ev.Handler("App.Form", "Save", 1, 5, 1),
+            Ev.Http("https://x.test/api/a", 2, 1, operation: 1),
+            Ev.Http("https://x.test/api/a", 3, 1, operation: 1),
+        };
+        events.AddRange(Enumerable.Range(0, 60).Select(i => (ProfilerEvent)Ev.Interop("form.field", 4 + (i * 0.1), 0.05, operation: 1)));
+        var report = Analyze(events);
+        Assert.Empty(report.RuleErrors);
+        Assert.Single(Findings(report, "BP2003"));
+        Assert.Contains(Findings(report, "BP4001"), f => f.Subject!.Contains("Form.Save", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("javascript:alert(1)", null)]
+    [InlineData("data:text/html,x", null)]
+    [InlineData("//evil.test/x", null)]
+    [InlineData("/\\evil.test/x", null)]
+    [InlineData(" https://x.test", null)]
+    [InlineData("https://wiki.example.com/perf/bp2001", "https://wiki.example.com/perf/bp2001")]
+    [InlineData("/wiki/perf/bp2001", "/wiki/perf/bp2001")]
+    public void DocumentationLinksMustBeWebUrlsOrSameOriginPaths(string link, string? expected)
+    {
+        // A rejected link falls back to the built-in rule reference, like a missing one.
+        var (host, session, _) = TestHost.WithSession(rules: [new SlowEndpointRule()]);
+        var engine = new DiagnosticEngine(new DiagnosticOptions(), [new SlowEndpointRule()], [new LinkProvider(link)]);
+        host.Emit(Ev.Http("https://x.test/slow", 0, 5000));
+        var finding = Assert.Single(engine.Analyze(session).Findings);
+        Assert.Equal(expected ?? DocumentationRecommendationProvider.BaseUrl + "bp3004", finding.DocumentationUrl);
+    }
+
+    [Fact]
+    public void BP1001_DoesNotOverCountComponentsThatAlternateWithOthersUnderSampling()
+    {
+        // A list renders B, B, B, A three times per second for 20 seconds: A renders 3 times per second. Sampled at 0.25 with
+        // one counter per kind, every retained render would be A's (weight 4), reporting A at 12 per second.
+        var events = new List<ProfilerEvent>();
+        for (var cycle = 0; cycle < 60; cycle++)
+        {
+            for (var i = 0; i < 4; i++)
+            {
+                events.Add(Ev.Render(i == 3 ? "App.A" : "App.B", (cycle * 1000.0 / 3) + (i * 10), 0.2));
+            }
+        }
+
+        var report = Analyze(events, o => o.Sampling.Rates[ProfilerEventKind.ComponentRender] = 0.25);
+        Assert.Empty(report.RuleErrors);
+        Assert.DoesNotContain(Findings(report, "BP1001"), f => f.ComponentType == "App.A");
+    }
+
+    [Fact]
+    public void BP1001_WeightsRenderTimeLikeTheRenderCount()
+    {
+        // 400 renders of 2 ms at 30 per second, sampled at 0.25: 100 retained renders stand for 400 renders and 800 ms.
+        var events = Enumerable.Range(0, 400).Select(i => (ProfilerEvent)Ev.Render("App.Ticker", i * (1000.0 / 30), 2)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events, o => o.Sampling.Rates[ProfilerEventKind.ComponentRender] = 0.25), "BP1001"));
+        Assert.Equal(400, finding.Impact!.Occurrences);
+        Assert.Equal(800, finding.Impact.TotalMs!.Value, 3);
+        Assert.Equal(ValueQuality.Estimated, finding.Impact.Quality);
+    }
+
+    [Fact]
+    public void BP1001_IgnoresInfrequentRendering()
+    {
+        var events = Enumerable.Range(0, 60).Select(i => (ProfilerEvent)Ev.Render("App.Slow", i * 1000)).ToList();
+        Assert.Empty(Findings(Analyze(events), "BP1001"));
+    }
+
+    [Fact]
+    public void BP1002_AttributesLargeBatchToInteraction()
+    {
+        var finding = Assert.Single(Findings(Analyze([Ev.Handler("App.Grid", "Sort", 0, 5, 1), Ev.Batch(5, 30, 400, 1), Ev.Batch(100, 1, 3)]), "BP1002"));
+        Assert.Contains("Grid.Sort", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Equal(DiagnosticSeverity.High, finding.Severity);
+    }
+
+    [Fact]
+    public void BP1003_ReportsReferenceOnlyParameterChurn()
+    {
+        var events = Enumerable.Range(0, 30).Select(i => (ProfilerEvent)Ev.Parameters("App.Item", i, 0.1, ParameterChangeState.ChangedByReferenceOnly, InstrumentationSource.ComponentInstrumentation, ["OnSelect"])).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP1003"));
+        Assert.Contains("OnSelect", finding.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP1004_ReportsRendersWithoutVisibleChange()
+    {
+        var events = Enumerable.Range(0, 40).Select(i => (ProfilerEvent)Ev.Render("App.Badge", i * 1000, 1, unchanged: i % 2 == 0)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP1004"));
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Equal(20, finding.Impact!.TotalMs!.Value, 3);
+    }
+
+    [Fact]
+    public void BP1005_DistinguishesSynchronousLifecycleFromFrameworkMetrics()
+    {
+        var report = Analyze(
+        [
+            new LifecycleMethodEvent { ComponentType = "App.Report", Method = LifecycleMethod.OnInitialized, Duration = Ev.D(120), SynchronousDuration = Ev.D(120), Timestamp = Ev.T(0) },
+            Ev.Parameters("App.Remote", 0, 300),
+        ]);
+        var findings = Findings(report, "BP1005");
+        Assert.Equal(2, findings.Count);
+        Assert.Equal(DiagnosticConfidence.High, findings.Single(f => f.ComponentType == "App.Report").Confidence);
+        var metrics = findings.Single(f => f.ComponentType == "App.Remote");
+        Assert.Equal(DiagnosticConfidence.Medium, metrics.Confidence);
+        Assert.True(metrics.Severity <= DiagnosticSeverity.Medium);
+    }
+
+    [Fact]
+    public void BP1006_ReportsBurstOfComponentInstances()
+    {
+        var events = Enumerable.Range(0, 150).Select(i => (ProfilerEvent)new ComponentCreatedEvent { ComponentType = "App.Cell", ComponentInstanceId = i + 1, Timestamp = Ev.T(i) }).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP1006"));
+        Assert.Equal("App.Cell", finding.ComponentType);
+    }
+
+    [Fact]
+    public void BP1007_ReportsSlowBatchesButNotServerRoundTrips()
+    {
+        var report = Analyze([Ev.Batch(0, 80, 5), Ev.Batch(100, 400, 5, roundTrip: true, circuit: "c")]);
+        var finding = Assert.Single(Findings(report, "BP1007"));
+        Assert.Single(finding.RelatedEventIds);
+    }
+
+    [Fact]
+    public void BP2001_ExplainsHttpDominatedHandlers()
+    {
+        var report = Analyze([Ev.Handler("App.Orders", "Load", 0, 800, 1), Ev.Http("https://x.test/orders", 10, 700, operation: 1)]);
+        var finding = Assert.Single(Findings(report, "BP2001"));
+        Assert.Equal(DiagnosticConfidence.Medium, finding.Confidence);
+        Assert.Contains("HTTP", finding.Explanation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP2001_ReportsSynchronousBlockingWithHighConfidence()
+    {
+        var finding = Assert.Single(Findings(Analyze([Ev.Handler("App.Calc", "Run", 0, 300, 1, syncMs: 290)]), "BP2001"));
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Contains("synchronously", finding.Explanation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP2001_LongRunningHandlerIsHighSeverity()
+    {
+        var finding = Assert.Single(Findings(Analyze([Ev.Handler("App.Export", "Run", 0, 2500, 1)]), "BP2001"));
+        Assert.Equal(DiagnosticSeverity.High, finding.Severity);
+    }
+
+    [Fact]
+    public void BP2002_ReportsRapidInputEvents()
+    {
+        var events = new List<ProfilerEvent>();
+        for (var i = 0; i < 40; i++)
+        {
+            events.Add(Ev.Handler("App.Search", "OnInput", i * 50, 1, i + 1, "oninput"));
+            events.Add(Ev.Batch((i * 50) + 1, 1, 3, i + 1));
+        }
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP2002"));
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+    }
+
+    [Fact]
+    public void BP2003_ReportsDuplicateRequestsWithinOneInteraction()
+    {
+        var report = Analyze(
+        [
+            Ev.Handler("App.Page", "Refresh", 0, 100, 1),
+            Ev.Http("https://x.test/api/user", 1, 20, operation: 1),
+            Ev.Http("https://x.test/api/user", 2, 20, operation: 1),
+            Ev.Http("https://x.test/api/other", 3, 20, operation: 1),
+        ]);
+        var finding = Assert.Single(Findings(report, "BP2003"));
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+    }
+
+    [Fact]
+    public void BP2004_ReportsManyBatchesPerInteraction()
+    {
+        var events = new List<ProfilerEvent> { Ev.Handler("App.Import", "Run", 0, 500, 1) };
+        events.AddRange(Enumerable.Range(0, 20).Select(i => (ProfilerEvent)Ev.Batch(i * 20, 1, 1, 1)));
+        Assert.Single(Findings(Analyze(events), "BP2004"));
+    }
+
+    [Fact]
+    public void BP3001_ReportsDuplicateAndOverlappingGets()
+    {
+        var finding = Assert.Single(Findings(Analyze([Ev.Http("https://x.test/a", 0, 100), Ev.Http("https://x.test/a", 50, 100), Ev.Http("https://x.test/a", 5000, 100)]), "BP3001"));
+        Assert.Contains("1 of them while", finding.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP3001_IgnoresPostAndDistantRequests()
+    {
+        var report = Analyze([Ev.Http("https://x.test/a", 0, 10, method: "POST"), Ev.Http("https://x.test/a", 10, 10, method: "POST"), Ev.Http("https://x.test/b", 0, 10), Ev.Http("https://x.test/b", 10_000, 10)]);
+        Assert.Empty(Findings(report, "BP3001"));
+    }
+
+    [Fact]
+    public void BP3001_ReportsDistinctUrlsOfOneEndpointAsOneFinding()
+    {
+        // /items/1 and /items/2 share the endpoint template (the finding's subject and fingerprint), so separate findings
+        // would be indistinguishable and suppressing one would suppress the other.
+        var events = new List<ProfilerEvent>();
+        foreach (var id in new[] { 1, 2 })
+        {
+            events.Add(Ev.Http($"https://x.test/items/{id}", id * 1000, 10));
+            events.Add(Ev.Http($"https://x.test/items/{id}", (id * 1000) + 100, 10));
+        }
+
+        var report = Analyze(events);
+        var finding = Assert.Single(Findings(report, "BP3001"));
+        Assert.Equal("GET https://x.test/items/{id}", finding.Subject);
+        Assert.StartsWith("2 URLs of", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(2, finding.Impact!.Occurrences);
+        Assert.Equal(report.Findings.Count, report.Findings.Select(f => f.Fingerprint).Distinct().Count());
+    }
+
+    [Fact]
+    public void BP3002_ReportsNPlusOneWithinOperation()
+    {
+        var events = Enumerable.Range(1, 8).Select(i => (ProfilerEvent)Ev.Http($"https://x.test/api/products/{i}", i, 10, operation: 3)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP3002"));
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Equal("GET https://x.test/api/products/{id}", finding.Subject);
+    }
+
+    [Fact]
+    public void BP3002_FallsBackToTemporalGroupingWithMediumConfidence()
+    {
+        var events = Enumerable.Range(1, 6).Select(i => (ProfilerEvent)Ev.Http($"https://x.test/api/products/{i}", i * 10, 10)).ToList();
+        Assert.Equal(DiagnosticConfidence.Medium, Assert.Single(Findings(Analyze(events), "BP3002")).Confidence);
+    }
+
+    [Fact]
+    public void BP3003_ReportsSequentialChainsWithLowConfidence()
+    {
+        var finding = Assert.Single(Findings(Analyze([Ev.Http("https://x.test/a", 0, 100, 1), Ev.Http("https://x.test/b", 101, 100, 1), Ev.Http("https://x.test/c", 202, 100, 1)]), "BP3003"));
+        Assert.Equal(DiagnosticConfidence.Low, finding.Confidence);
+        Assert.Equal(200, finding.Impact!.TotalMs!.Value, 0);
+    }
+
+    [Fact]
+    public void BP3004_ReportsSlowEndpoint()
+    {
+        var events = Enumerable.Range(0, 5).Select(i => (ProfilerEvent)Ev.Http("https://x.test/slow", i * 5000, 1500)).ToList();
+        events.Add(Ev.Http("https://x.test/fast", 0, 10));
+        var finding = Assert.Single(Findings(Analyze(events), "BP3004"));
+        Assert.Equal("GET https://x.test/slow", finding.Subject);
+    }
+
+    [Fact]
+    public void BP3005_ReportsRepeatedFailuresAndRetries()
+    {
+        var events = Enumerable.Range(0, 4).Select(i => (ProfilerEvent)Ev.Http("https://x.test/flaky", i * 100, 10, status: 503)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP3005"));
+        Assert.Contains("503", finding.Summary, StringComparison.Ordinal);
+        Assert.Contains("3 were followed", finding.Summary, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP3006_ReportsPerInstanceInitializationRequests()
+    {
+        var events = Enumerable.Range(1, 6).Select(i => (ProfilerEvent)Ev.Http("https://x.test/api/settings", i, 10, origin: "App.Row", lifecycle: LifecycleMethod.OnInitializedAsync, instance: i)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP3006"));
+        Assert.Equal("App.Row", finding.ComponentType);
+    }
+
+    [Fact]
+    public void BP4001_ReportsExcessiveInteropPerOperation()
+    {
+        var events = new List<ProfilerEvent> { Ev.Handler("App.Chart", "Draw", 0, 50, 1) };
+        events.AddRange(Enumerable.Range(0, 60).Select(i => (ProfilerEvent)Ev.Interop("chart.point", i * 20, 0.1, operation: 1)));
+        var findings = Findings(Analyze(events), "BP4001");
+        Assert.Contains(findings, f => f.Subject!.Contains("Chart.Draw", StringComparison.Ordinal));
+        Assert.Single(Findings(Analyze(events), "BP4002"));
+    }
+
+    [Fact]
+    public void BP4003_ReportsLargePayloadsAsEstimates()
+    {
+        var finding = Assert.Single(Findings(Analyze([Ev.Interop("grid.load", 0, 5, payload: 500_000)]), "BP4003"));
+        Assert.Contains(finding.Evidence, e => e.Quality == ValueQuality.Estimated);
+    }
+
+    private static JSInteropEvent FromJs(string identifier, double atMs, double durationMs = 0.5, long? payload = null, string? circuit = null)
+    {
+        var call = Ev.Interop(identifier, atMs, durationMs, payload: payload);
+        call.Direction = InteropDirection.JSToDotNet;
+        call.Source = InstrumentationSource.Browser;
+        call.ViaObjectReference = true;
+        call.CircuitId = circuit;
+        return call;
+    }
+
+    [Fact]
+    public void BP4007_ReportsFrequentJavaScriptToDotNetCallsWithHostingSpecificThresholds()
+    {
+        // 30 calls in one second: frequent on Blazor Server (threshold 20), not in WebAssembly (threshold 60).
+        var server = Enumerable.Range(0, 30).Select(i => (ProfilerEvent)FromJs("OnPointerMove", i * 30, 2, circuit: "c1")).ToList();
+        var finding = Assert.Single(Findings(Analyze(server), "BP4007"));
+        Assert.Contains("OnPointerMove", finding.Summary, StringComparison.Ordinal);
+        Assert.Contains("circuit", finding.Explanation, StringComparison.Ordinal);
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+
+        var wasm = Enumerable.Range(0, 30).Select(i => (ProfilerEvent)FromJs("OnPointerMove", i * 30, 2)).ToList();
+        Assert.Empty(Findings(Analyze(wasm), "BP4007"));
+        var busy = Enumerable.Range(0, 90).Select(i => (ProfilerEvent)FromJs("OnScroll", i * 10, 0.2)).ToList();
+        Assert.Single(Findings(Analyze(busy), "BP4007"));
+
+        // The same calls spread out are not frequent; .NET-to-JavaScript calls never count.
+        var spread = Enumerable.Range(0, 30).Select(i => (ProfilerEvent)FromJs("OnPointerMove", i * 1000, 2, circuit: "c1")).ToList();
+        Assert.Empty(Findings(Analyze(spread), "BP4007"));
+        var outbound = Enumerable.Range(0, 90).Select(i => (ProfilerEvent)Ev.Interop("plot", i * 10, 0.2)).ToList();
+        Assert.Empty(Findings(Analyze(outbound), "BP4007"));
+    }
+
+    [Fact]
+    public void BP4001_AndBP4002_IgnoreJavaScriptToDotNetCalls()
+    {
+        var events = new List<ProfilerEvent> { Ev.Handler("App.Chart", "Draw", 0, 50, 1) };
+        events.AddRange(Enumerable.Range(0, 90).Select(i =>
+        {
+            var call = FromJs("OnTick", i * 10, 0.1);
+            call.OperationId = 1;
+            return (ProfilerEvent)call;
+        }));
+        var report = Analyze(events);
+        Assert.Empty(Findings(report, "BP4001"));
+        Assert.Empty(Findings(report, "BP4002"));
+        Assert.Single(Findings(report, "BP4007"));
+    }
+
+    [Fact]
+    public void BP4003_UsesTheHubMessageLimitForJavaScriptToDotNetCallsOnServer()
+    {
+        // 28 KB: below the general threshold (64 KB), above 75% of the default MaximumReceiveMessageSize on the server.
+        var server = Assert.Single(Findings(Analyze([FromJs("UploadChunk", 0, 5, payload: 28 * 1024, circuit: "c1")]), "BP4003"));
+        Assert.Equal(DiagnosticSeverity.Medium, server.Severity);
+        Assert.Contains("MaximumReceiveMessageSize", server.Explanation, StringComparison.Ordinal);
+        Assert.StartsWith("JavaScript sends", server.Title, StringComparison.Ordinal);
+        Assert.Equal(DiagnosticSeverity.High, Assert.Single(Findings(Analyze([FromJs("UploadChunk", 0, 5, payload: 40 * 1024, circuit: "c1")]), "BP4003")).Severity);
+
+        // In WebAssembly there is no message limit; the general threshold applies.
+        Assert.Empty(Findings(Analyze([FromJs("UploadChunk", 0, 5, payload: 28 * 1024)]), "BP4003"));
+        Assert.Empty(Findings(Analyze([Ev.Interop("grid.load", 0, 5, payload: 28 * 1024)]), "BP4003"));
+    }
+
+    [Fact]
+    public void BP4004_DescribesSlowJavaScriptToDotNetCalls()
+    {
+        var events = Enumerable.Range(0, 5).Select(i => (ProfilerEvent)FromJs("Compute", i * 1000, 300)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP4004"));
+        Assert.StartsWith("JavaScript calls to Compute", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("JSInvokable", finding.Recommendation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP4004_ReportsSlowInterop()
+    {
+        var events = Enumerable.Range(0, 5).Select(i => (ProfilerEvent)Ev.Interop("map.render", i * 1000, 300)).ToList();
+        Assert.Single(Findings(Analyze(events), "BP4004"));
+    }
+
+    [Fact]
+    public void BP4005_ReportsInteropAfterDisposal()
+    {
+        var report = Analyze(
+        [
+            new ComponentDisposedEvent { ComponentType = "App.Ticker", ComponentInstanceId = 9, Timestamp = Ev.T(100) },
+            Ev.Interop("ticker.update", 50, instance: 9, origin: "App.Ticker"),
+            Ev.Interop("ticker.update", 200, instance: 9, origin: "App.Ticker"),
+        ]);
+        var finding = Assert.Single(Findings(report, "BP4005"));
+        Assert.Single(finding.RelatedEventIds);
+    }
+
+    private const string Timeout = "System.Threading.Tasks.TaskCanceledException";
+    private const string Disconnected = "Microsoft.JSInterop.JSDisconnectedException";
+    private const string Unavailable = "System.InvalidOperationException";
+
+    private static JSInteropEvent Unanswered(string identifier, double atMs, double durationMs, string? circuit = null, string error = Timeout)
+    {
+        var call = Ev.Interop(identifier, atMs, durationMs);
+        call.CircuitId = circuit;
+        call.Outcome = error == Timeout ? ProfilerOutcome.Canceled : ProfilerOutcome.Error;
+        call.ErrorType = error;
+        return call;
+    }
+
+    [Fact]
+    public void BP4004_MeasuresOnlyCallsThatJavaScriptAnswered()
+    {
+        // Answered calls (including one that threw in JavaScript), calls that waited for the one-minute timeout, and calls
+        // that failed at once because interop was unavailable: only the answered ones say anything about JavaScript.
+        var events = Enumerable.Range(0, 9).Select(i => (ProfilerEvent)Ev.Interop("console.debug", i * 100, 2)).ToList();
+        events.Add(Unanswered("console.debug", 950, 2, error: "Microsoft.JSInterop.JSException"));
+        events.AddRange(Enumerable.Range(0, 10).Select(i => (ProfilerEvent)Unanswered("console.debug", 2_000 + (i * 100), 60_000)));
+        events.AddRange(Enumerable.Range(0, 40).Select(i => (ProfilerEvent)Unanswered("console.debug", 4_000 + (i * 10), 0.01, error: Unavailable)));
+        var (host, session, _) = TestHost.WithSession();
+        foreach (var e in events)
+        {
+            host.Emit(e);
+        }
+
+        Assert.Empty(Findings(host.Diagnostics.Analyze(session), "BP4004"));
+        var interop = Assert.Single(session.GetSummary().Interop);
+        Assert.Equal(60, interop.Durations.Count);
+        Assert.Equal(10, interop.ResponseDurations.Count);
+        Assert.Equal(2, interop.ResponseDurations.P95Ms, 1);
+        Assert.Equal(50, interop.NoResponse);
+        Assert.Equal(51, interop.Failures);
+    }
+
+    [Fact]
+    public void BP4006_ReportsCallsMadeWhileTheCircuitWasDisconnected()
+    {
+        var events = new List<ProfilerEvent>
+        {
+            new CircuitEvent { CircuitId = "c1", Change = CircuitChange.Opened, Timestamp = Ev.T(0) },
+            Ev.Interop("console.debug", 100, 0.5),
+            new CircuitEvent { CircuitId = "c1", Change = CircuitChange.ConnectionDown, Timestamp = Ev.T(1_000) },
+            new CircuitEvent { CircuitId = "c1", Change = CircuitChange.Closed, Timestamp = Ev.T(200_000) },
+        };
+        events.AddRange(Enumerable.Range(0, 20).Select(i => (ProfilerEvent)Unanswered("console.debug", 2_000 + (i * 200), 60_000, "c1")));
+        events.AddRange(Enumerable.Range(0, 5).Select(i => (ProfilerEvent)Unanswered("console.debug", 201_000 + (i * 200), 0.1, "c1", Disconnected)));
+        events.AddRange(Enumerable.Range(0, 3).Select(i => (ProfilerEvent)Unanswered("console.debug", 300 + (i * 200), 0.01, error: Unavailable)));
+        var report = Analyze(events);
+
+        var finding = Assert.Single(Findings(report, "BP4006"));
+        Assert.Equal("console.debug", finding.Subject);
+        Assert.Equal("console.debug called 28 times without a connected browser", finding.Title);
+        Assert.Equal(DiagnosticSeverity.High, finding.Severity);
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Contains(finding.Evidence, e => e.Label == "Timed out or canceled" && e.Value == "20");
+        Assert.Contains(finding.Evidence, e => e.Label == "Timed out while the circuit was disconnected" && e.Value == "20");
+        Assert.Contains(finding.Evidence, e => e.Label.StartsWith("Failed as disconnected", StringComparison.Ordinal) && e.Value == "5");
+        Assert.Contains(finding.Evidence, e => e.Label.StartsWith("Failed as unavailable", StringComparison.Ordinal) && e.Value == "3");
+        Assert.Contains("prerender", finding.Explanation, StringComparison.Ordinal);
+        Assert.Equal(28, finding.Impact!.Occurrences);
+    }
+
+    [Fact]
+    public void BP4006_ReportsTimeoutsWithoutCircuitInformationAndIgnoresIsolatedCancellations()
+    {
+        var events = new List<ProfilerEvent>();
+        events.AddRange(Enumerable.Range(0, 4).Select(i => (ProfilerEvent)Unanswered("dialog.open", i * 1_000, 60_000)));
+        events.AddRange(Enumerable.Range(0, 2).Select(i => (ProfilerEvent)Unanswered("map.pan", i * 1_000, 5)));
+        var report = Analyze(events);
+
+        var finding = Assert.Single(Findings(report, "BP4006"));
+        Assert.Equal("dialog.open", finding.Subject);
+        Assert.Equal("4 call(s) to dialog.open got no response", finding.Title);
+        Assert.Single(finding.Evidence, e => e.Label == "Timed out or canceled");
+        Assert.DoesNotContain(finding.Evidence, e => e.Label.StartsWith("Timed out while", StringComparison.Ordinal) || e.Label.StartsWith("Failed as", StringComparison.Ordinal));
+        Assert.Empty(Findings(report, "BP4004"));
+    }
+
+    [Fact]
+    public void BP5001_ReportsHighGcPauseRatio()
+    {
+        var events = Enumerable.Range(0, 10).Select(i => (ProfilerEvent)Ev.Runtime(i * 1000, 1000, 1_000_000, gen0: 5, gen2: 1, pauseMs: 100)).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP5001"));
+        Assert.Contains("10%", finding.Title, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP5001_DoesNotPresentMissingPauseDataAsMeasured()
+    {
+        // WebAssembly samples carry no pause time; only the generation 2 rate is evaluated.
+        var events = Enumerable.Range(0, 10).Select(i =>
+        {
+            var sample = Ev.Runtime(i * 1000, 1000, 1_000_000, gen0: 5, gen2: 1);
+            sample.GcPauseTicks = null;
+            return (ProfilerEvent)sample;
+        }).ToList();
+        var report = Analyze(events);
+        var finding = Assert.Single(Findings(report, "BP5001"));
+        Assert.Contains("generation 2", finding.Title, StringComparison.Ordinal);
+        Assert.Null(finding.Impact!.TotalMs);
+        Assert.Equal(ValueQuality.Unavailable, finding.Evidence.Single(e => e.Label == "GC pause share").Quality);
+    }
+
+    [Fact]
+    public void BP5002_ReportsAllocationSpikesWithTemporalOverlapOnly()
+    {
+        var events = Enumerable.Range(0, 20).Select(i => (ProfilerEvent)Ev.Runtime(i * 1000, 1000, i == 10 ? 200_000_000 : 1_000_000)).ToList();
+        events.Add(Ev.Handler("App.Report", "Generate", 10_200, 300, 1));
+        var finding = Assert.Single(Findings(Analyze(events), "BP5002"));
+        Assert.Contains("Report.Generate", finding.Explanation, StringComparison.Ordinal);
+        Assert.Contains("temporal", finding.Explanation, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(DiagnosticConfidence.Medium, finding.Confidence);
+    }
+
+    [Fact]
+    public void BP5003_ReportsHeapGrowthAcrossNavigations()
+    {
+        var events = new List<ProfilerEvent>();
+        for (var i = 0; i < 8; i++)
+        {
+            events.Add(new NavigationEvent { Route = i % 2 == 0 ? "/a" : "/b", ComponentType = "App.Page", Timestamp = Ev.T(i * 1000), Duration = Ev.D(5) });
+            events.Add(Ev.Runtime((i * 1000) + 10, 100, 1000, heap: 10_000_000 + (i * 2_000_000), gen2: 1));
+        }
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP5003"));
+        Assert.Equal(DiagnosticConfidence.Medium, finding.Confidence);
+    }
+
+    [Fact]
+    public void BP5003_IgnoresFlatHeap()
+    {
+        var events = new List<ProfilerEvent>();
+        for (var i = 0; i < 8; i++)
+        {
+            events.Add(new NavigationEvent { Route = "/a", Timestamp = Ev.T(i * 1000) });
+            events.Add(Ev.Runtime((i * 1000) + 10, 100, 1000, heap: 10_000_000 + ((i % 2) * 100_000)));
+        }
+
+        Assert.Empty(Findings(Analyze(events), "BP5003"));
+    }
+
+    [Fact]
+    public void BP5004_GroupsRetainedInstancesByComponentType()
+    {
+        var events = new List<ProfilerEvent>();
+        for (var i = 0; i < 6; i++)
+        {
+            events.Add(new ComponentRetainedEvent
+            {
+                ComponentType = "App.Pages.Chart",
+                ComponentInstanceId = i + 1,
+                CircuitId = i < 3 ? "c1" : "c2",
+                Reason = i < 3 ? RetentionReason.Disposed : RetentionReason.ScopeEnded,
+                ReleasedTimestamp = Ev.T(i * 100),
+                Timestamp = Ev.T(10_000),
+                SurvivedCollections = 2,
+            });
+        }
+
+        events.Add(new ComponentRetainedEvent { ComponentType = "App.Shared.Badge", ComponentInstanceId = 99, ReleasedTimestamp = Ev.T(0), Timestamp = Ev.T(5_000), SurvivedCollections = 4, ForcedCollection = true });
+
+        var findings = Findings(Analyze(events), "BP5004");
+        Assert.Equal(2, findings.Count);
+        var chart = findings.Single(f => f.ComponentType == "App.Pages.Chart");
+        Assert.Equal(DiagnosticSeverity.High, chart.Severity);
+        Assert.Equal(DiagnosticConfidence.Medium, chart.Confidence);
+        Assert.Contains(chart.Evidence, e => e.Label == "Circuits" && e.Value == "2");
+        Assert.Contains(chart.Evidence, e => e.Label == "Released by" && e.Value.Contains("scope end (3)", StringComparison.Ordinal));
+        Assert.Contains(chart.Evidence, e => e.Label == "Likely leaked" && e.Value == "6");
+
+        // A single retained instance per parent position matches the renderer's previous render tree: bounded, not a leak.
+        var badge = findings.Single(f => f.ComponentType == "App.Shared.Badge");
+        Assert.Equal(DiagnosticConfidence.Low, badge.Confidence);
+        Assert.Equal(DiagnosticSeverity.Info, badge.Severity);
+    }
+
+    [Fact]
+    public void BP5004_TreatsAccumulationUnderOneParentAsALeakAndSingleStaleChildrenAsBounded()
+    {
+        var events = new List<ProfilerEvent>
+        {
+            new ComponentChildrenEvent { ComponentType = "App.Host", ComponentInstanceId = 1, ChildInstanceIds = [10, 20], ChildTypes = ["App.Dialog", "App.Row"], Timestamp = Ev.T(0) },
+            new ComponentChildrenEvent { ComponentType = "App.Host", ComponentInstanceId = 1, ChildInstanceIds = [11, 21], ChildTypes = ["App.Dialog", "App.Row"], Timestamp = Ev.T(100) },
+        };
+        foreach (var id in new long[] { 10, 11, 21 })
+        {
+            events.Add(new ComponentRetainedEvent { ComponentType = id < 20 ? "App.Dialog" : "App.Row", ComponentInstanceId = id, ReleasedTimestamp = Ev.T(200), Timestamp = Ev.T(5_000), SurvivedCollections = 3, ForcedCollection = true });
+        }
+
+        var findings = Findings(Analyze(events), "BP5004");
+        var dialog = findings.Single(f => f.ComponentType == "App.Dialog");
+        Assert.Equal(DiagnosticConfidence.High, dialog.Confidence);
+        Assert.Equal(DiagnosticSeverity.Medium, dialog.Severity);
+        var row = findings.Single(f => f.ComponentType == "App.Row");
+        Assert.Equal(DiagnosticSeverity.Info, row.Severity);
+    }
+
+    [Fact]
+    public void BP8001_ReportsPerItemQueriesWithinAnOperation()
+    {
+        var events = new List<ProfilerEvent> { Ev.Handler("App.Orders", "Load", 0, 200, operation: 7) };
+        for (var i = 0; i < 8; i++)
+        {
+            events.Add(Ev.Db("SELECT * FROM Lines WHERE OrderId = @p0", 10 + (i * 5), 4, operation: 7, arguments: i, origin: "App.Orders", lifecycle: LifecycleMethod.OnInitializedAsync, instance: 1));
+        }
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP8001"));
+        Assert.Equal(DiagnosticConfidence.High, finding.Confidence);
+        Assert.Contains("Load", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(28, finding.Impact!.TotalMs!.Value, 3);
+        Assert.Empty(Findings(Analyze(events), "BP8002"));
+    }
+
+    [Fact]
+    public void BP8001_ReportsQueriesIssuedByManyInstancesOfOneComponent()
+    {
+        var events = Enumerable.Range(0, 6)
+            .Select(i => (ProfilerEvent)Ev.Db("SELECT * FROM Stock WHERE ProductId = @p0", i * 10, 3, arguments: i, origin: "App.ProductRow", instance: 100 + i, lifecycle: LifecycleMethod.OnInitializedAsync))
+            .ToList();
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP8001"));
+        Assert.Equal(DiagnosticConfidence.Medium, finding.Confidence);
+        Assert.Contains("parent", finding.Recommendation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP8001_IgnoresFewExecutions()
+    {
+        var events = Enumerable.Range(0, 3).Select(i => (ProfilerEvent)Ev.Db("SELECT 1", i, operation: 1, arguments: i)).ToList();
+        Assert.Empty(Findings(Analyze(events), "BP8001"));
+    }
+
+    [Fact]
+    public void BP8002_ReportsIdenticalQueriesInOneOperationButNotWrites()
+    {
+        var events = new List<ProfilerEvent>
+        {
+            Ev.Db("SELECT * FROM Settings", 0, 5, operation: 3),
+            Ev.Db("SELECT * FROM Settings", 10, 5, operation: 3),
+            Ev.Db("SELECT * FROM Settings", 20, 5, operation: 3),
+            Ev.Db("UPDATE Counters SET Value = Value + ?", 30, 1, operation: 3, method: "NonQuery"),
+            Ev.Db("UPDATE Counters SET Value = Value + ?", 40, 1, operation: 3, method: "NonQuery"),
+        };
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP8002"));
+        Assert.Contains("3 times", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(10, finding.Impact!.TotalMs!.Value, 3);
+    }
+
+    [Fact]
+    public void BP8002_ReportsPrerenderDoubleFetch()
+    {
+        var events = new List<ProfilerEvent>
+        {
+            Ev.Db("SELECT * FROM Products", 0, 20, origin: "App.Catalog", lifecycle: LifecycleMethod.OnInitializedAsync, instance: 1),
+            Ev.Db("SELECT * FROM Products", 1500, 25, origin: "App.Catalog", lifecycle: LifecycleMethod.OnInitializedAsync, instance: 2, circuit: "c1"),
+        };
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP8002"));
+        Assert.Contains("prerendering", finding.Title, StringComparison.Ordinal);
+        Assert.Contains("PersistentState", finding.Recommendation, StringComparison.Ordinal);
+        Assert.Equal(25, finding.Impact!.TotalMs!.Value, 3);
+    }
+
+    [Fact]
+    public void BP8003_ReportsSlowQueryShapes()
+    {
+        var events = Enumerable.Range(0, 4).Select(i => (ProfilerEvent)Ev.Db("SELECT * FROM Big", i * 1000, 250, arguments: i)).ToList();
+        events.Add(Ev.Db("SELECT 1", 0, 2));
+        var finding = Assert.Single(Findings(Analyze(events), "BP8003"));
+        Assert.Equal(DiagnosticSeverity.Medium, finding.Severity);
+    }
+
+    [Fact]
+    public void BP8004_ReportsSynchronousQueriesOnTheRenderer()
+    {
+        var events = new List<ProfilerEvent>
+        {
+            Ev.Db("SELECT * FROM Users", 0, 40, origin: "App.Profile", isAsync: false, onRenderer: true),
+            Ev.Db("SELECT * FROM Users", 100, 40, origin: "App.Profile", isAsync: false, onRenderer: false),
+            Ev.Db("SELECT * FROM Users", 200, 40, origin: "App.Profile", isAsync: true, onRenderer: true),
+        };
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP8004"));
+        Assert.Equal("App.Profile", finding.ComponentType);
+        Assert.Contains("ToListAsync", finding.Recommendation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP8005_ReportsDbContextLivingAcrossInteractions()
+    {
+        var events = Enumerable.Range(0, 4).Select(i => (ProfilerEvent)Ev.Db("SELECT 1", i * 15_000, operation: i + 1, circuit: "c1", context: 42)).ToList();
+        events.AddRange(Enumerable.Range(0, 4).Select(i => (ProfilerEvent)Ev.Db("SELECT 1", i * 15_000, operation: i + 10, circuit: "c2", context: 43 + i)));
+
+        var finding = Assert.Single(Findings(Analyze(events), "BP8005"));
+        Assert.Contains("IDbContextFactory", finding.Recommendation, StringComparison.Ordinal);
+        Assert.Contains(finding.Evidence, e => e.Label == "Long-lived instances" && e.Value == "1");
+    }
+
+    [Fact]
+    public void BP6001_IdentifiesNetworkBoundRoundTrips()
+    {
+        var events = Enumerable.Range(0, 10).Select(i => (ProfilerEvent)Ev.Batch(i * 1000, 400, 1, roundTrip: true, circuit: "c1")).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP6001"));
+        Assert.Contains("network", finding.Explanation, StringComparison.OrdinalIgnoreCase);
+        Assert.Empty(Findings(Analyze(events), "BP1007"));
+    }
+
+    [Fact]
+    public void BP6002_ReportsUnstableCircuits()
+    {
+        var events = new List<ProfilerEvent>();
+        for (var i = 0; i < 3; i++)
+        {
+            events.Add(new CircuitEvent { CircuitId = "c1", Change = CircuitChange.ConnectionDown, Timestamp = Ev.T(i * 10) });
+            events.Add(new CircuitEvent { CircuitId = "c1", Change = CircuitChange.ConnectionUp, Timestamp = Ev.T((i * 10) + 5) });
+        }
+
+        Assert.Single(Findings(Analyze(events), "BP6002"));
+    }
+
+    [Fact]
+    public void BP6003_ReportsSlowCircuitActivities()
+    {
+        Assert.Single(Findings(Analyze([new CircuitActivityEvent { CircuitId = "c", ActivityName = "DispatchBrowserEvent", Timestamp = Ev.T(0), Duration = Ev.D(800) }]), "BP6003"));
+    }
+
+    [Fact]
+    public void BP6004_ReportsHighBatchVolume()
+    {
+        var events = Enumerable.Range(0, 200).Select(i => (ProfilerEvent)Ev.Batch(i * 20, 1, 1, roundTrip: true, circuit: "c1")).ToList();
+        Assert.Single(Findings(Analyze(events), "BP6004"));
+    }
+
+    [Fact]
+    public void BP6004_ReportsTheMeasuredBandwidthOfTheBatches()
+    {
+        var events = Enumerable.Range(0, 200).Select(i =>
+        {
+            var batch = Ev.Batch(i * 20, 1, 1, roundTrip: true, circuit: "c1");
+            batch.TransportBytes = 2_048;
+            return (ProfilerEvent)batch;
+        }).ToList();
+        var finding = Assert.Single(Findings(Analyze(events), "BP6004"));
+        Assert.Contains(finding.Evidence, e => e.Label == "Peak bytes per second" && e.Value == "100 KB");
+
+        // Without measured sizes the evidence is left out rather than reported as zero.
+        var unmeasured = Enumerable.Range(0, 200).Select(i => (ProfilerEvent)Ev.Batch(i * 20, 1, 1, roundTrip: true, circuit: "c1")).ToList();
+        Assert.DoesNotContain(Assert.Single(Findings(Analyze(unmeasured), "BP6004")).Evidence, e => e.Label == "Peak bytes per second");
+    }
+
+    [Fact]
+    public void BP6006_ReportsLargeRenderBatchesPerCircuit()
+    {
+        RenderBatchEvent Sized(double atMs, long bytes, string circuit = "c1")
+        {
+            var batch = Ev.Batch(atMs, 30, 5, roundTrip: true, circuit: circuit);
+            batch.TransportBytes = bytes;
+            return batch;
+        }
+
+        var finding = Assert.Single(Findings(Analyze([Sized(0, 200 * 1024), Sized(100, 80 * 1024), Sized(200, 10 * 1024), Sized(300, 30 * 1024, "c2")]), "BP6006"));
+        Assert.Equal("batches|c1", finding.Subject);
+        Assert.Contains("200 KB", finding.Title, StringComparison.Ordinal);
+        Assert.Equal(DiagnosticSeverity.Medium, finding.Severity);
+        Assert.Contains(finding.Evidence, e => e.Label == "Large batches" && e.Value == "2");
+        Assert.Contains(finding.Evidence, e => e.Label == "Total size" && e.Value == "280 KB");
+        Assert.Equal(ValueQuality.Measured, finding.Impact!.Quality);
+
+        // Severity is capped: a batch is never critical on its own.
+        Assert.Equal(DiagnosticSeverity.High, Assert.Single(Findings(Analyze([Sized(0, 50 * 1024 * 1024)]), "BP6006")).Severity);
+        Assert.Empty(Findings(Analyze([Ev.Batch(0, 30, 5, roundTrip: true, circuit: "c1")]), "BP6006"));
+    }
+
+    [Fact]
+    public void BP6006_ReportsReceivedMessagesCloseToTheHubLimit()
+    {
+        CircuitActivityEvent Received(string activity, long bytes) =>
+            new() { CircuitId = "c1", ActivityName = activity, ReceivedBytes = bytes, Timestamp = Ev.T(0), Duration = Ev.D(5) };
+
+        var findings = Findings(Analyze([Received("DispatchBrowserEvent", 28 * 1024), Received("DispatchBrowserEvent", 25 * 1024), Received("EndInvokeJSFromDotNet", 40 * 1024), Received("OnRenderCompleted", 30), Received("ReceiveJSDataChunk", 31 * 1024)]), "BP6006");
+        Assert.Equal(2, findings.Count);
+        var events = findings.Single(f => f.Subject == "received|c1|DispatchBrowserEvent");
+        Assert.Equal(DiagnosticSeverity.Medium, events.Severity);
+        Assert.Contains("@bind", events.Recommendation, StringComparison.Ordinal);
+        Assert.Contains(events.Evidence, e => e.Label == "Messages" && e.Value == "2");
+        var result = findings.Single(f => f.Subject == "received|c1|EndInvokeJSFromDotNet");
+        Assert.Equal(DiagnosticSeverity.High, result.Severity);
+        Assert.Contains("IJSStreamReference", result.Recommendation, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BP4003_ReportsMeasuredPayloadsWithoutEstimationCaveats()
+    {
+        var call = Ev.Interop("grid.load", 0, 5, payload: 400 * 1024);
+        call.PayloadBytesQuality = ValueQuality.Measured;
+        call.CircuitId = "c1";
+        var finding = Assert.Single(Findings(Analyze([call]), "BP4003"));
+        Assert.DoesNotContain("estimated", finding.Title, StringComparison.Ordinal);
+        Assert.Empty(finding.Caveats);
+        Assert.Equal(ValueQuality.Measured, finding.Impact!.Quality);
+        Assert.Contains(finding.Evidence, e => e.Label == "Largest payload" && e.Quality == ValueQuality.Measured);
+
+        // Estimated sizes keep their caveat.
+        var estimated = Assert.Single(Findings(Analyze([Ev.Interop("grid.load", 0, 5, payload: 400 * 1024)]), "BP4003"));
+        Assert.Contains("(estimated)", estimated.Title, StringComparison.Ordinal);
+        Assert.NotEmpty(estimated.Caveats);
+    }
+
+    [Fact]
+    public void BP6005_ReportsThreadPoolSaturation()
+    {
+        var events = Enumerable.Range(0, 3).Select(i => (ProfilerEvent)Ev.Runtime(i * 1000, 1000, 10, queue: 500)).ToList();
+        events.Add(Ev.Handler("App.X", "Y", 500, 400, 1));
+        var finding = Assert.Single(Findings(Analyze(events), "BP6005"));
+        Assert.Equal(DiagnosticConfidence.Medium, finding.Confidence);
+    }
+
+    [Fact]
+    public void BP7001_BreaksDownSlowInteractions()
+    {
+        var finding = Assert.Single(Findings(Analyze([new BrowserInteractionEvent { EventType = "click", Timestamp = Ev.T(0), Duration = Ev.D(400), InputDelayMs = 10, ProcessingMs = 350, PresentationDelayMs = 40 }]), "BP7001"));
+        Assert.Contains("processing", finding.Explanation, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void BP7002_ReportsRepeatedLongTasks()
+    {
+        var events = Enumerable.Range(0, 4).Select(i => (ProfilerEvent)new BrowserLongTaskEvent { EntryType = "long-animation-frame", Timestamp = Ev.T(i * 1000), Duration = Ev.D(300), BlockingMs = 250 }).ToList();
+        Assert.Single(Findings(Analyze(events), "BP7002"));
+    }
+
+    [Fact]
+    public void SuppressionsAndSeverityOverridesAreApplied()
+    {
+        var (host, session, _) = TestHost.WithSession(o => o.Diagnostics.Rules["BP3004"] = new RuleSettings { Severity = DiagnosticSeverity.Info });
+        host.Emit(Ev.Http("https://x.test/slow", 0, 5000));
+        host.Diagnostics.Suppressions.Add(new FindingSuppression { Fingerprint = "BP3004:GET https://x.test/slow", Kind = SuppressionKind.Expected });
+        var finding = Assert.Single(host.Diagnostics.Analyze(session).Findings);
+        Assert.Equal(DiagnosticSeverity.Info, finding.Severity);
+        Assert.Equal(SuppressionKind.Expected, finding.Suppression!.Kind);
+    }
+
+    [Fact]
+    public void DisabledRulesDoNotRun()
+    {
+        var (host, session, _) = TestHost.WithSession(o => o.Diagnostics.Rules["BP3004"] = new RuleSettings { Enabled = false });
+        host.Emit(Ev.Http("https://x.test/slow", 0, 5000));
+        var report = host.Diagnostics.Analyze(session);
+        Assert.Empty(report.Findings);
+        Assert.DoesNotContain(report.Rules, r => r.Id == "BP3004");
+    }
+
+    [Fact]
+    public void FailingRuleIsIsolated()
+    {
+        var (host, session, _) = TestHost.WithSession(rules: [new ThrowingRule(), new SlowEndpointRule()]);
+        host.Emit(Ev.Http("https://x.test/slow", 0, 5000));
+        var report = host.Diagnostics.Analyze(session);
+        Assert.Single(report.Findings);
+        Assert.Contains("TEST1", report.RuleErrors.Keys);
+    }
+
+    [Fact]
+    public void AnalysisIsDeterministic()
+    {
+        var events = Enumerable.Range(1, 8).Select(i => (ProfilerEvent)Ev.Http($"https://x.test/api/p/{i}", i, 10, operation: 1)).ToList();
+        var a = Analyze(events).Findings.Select(f => f.Fingerprint + f.Summary);
+        var b = Analyze(events).Findings.Select(f => f.Fingerprint + f.Summary);
+        Assert.Equal(a, b);
+    }
+
+    private sealed class LinkProvider(string link) : IDiagnosticRecommendationProvider
+    {
+        public void Augment(DiagnosticFinding finding) => finding.DocumentationUrl = link;
+    }
+
+    private sealed class ThrowingRule : IDiagnosticRule
+    {
+        public DiagnosticRuleDescriptor Descriptor { get; } = new() { Id = "TEST1", Title = "t", Description = "t" };
+
+        public IEnumerable<DiagnosticFinding> Evaluate(DiagnosticContext context) => throw new InvalidOperationException("rule failure");
+    }
+}
