@@ -174,7 +174,7 @@ fn detect_indent(lines: &[String]) -> String {
     }
 }
 
-fn class(ch: char) -> u8 {
+pub fn class(ch: char) -> u8 {
     if ch.is_alphanumeric() || ch == '_' {
         2
     } else if ch.is_whitespace() {
@@ -362,7 +362,7 @@ impl FileView {
         }
         ed.redo.clear();
         // a word and the space after it are one undo step, like VS Code
-        ed.seal = kind == EditKind::Other || text.contains('\n');
+        ed.seal = kind == EditKind::Other || text.contains('\n') || (kind == EditKind::Type && text.ends_with([' ', '\t']));
         ed.cur = end;
         ed.anchor = end;
         ed.want_vcol = None;
@@ -559,7 +559,9 @@ impl FileView {
     /// selection inserts one indentation unit.
     pub fn indent(&mut self, outdent: bool) {
         let sel = self.sel();
-        let multi = matches!(sel, Some((a, b)) if a.0 != b.0);
+        // like VS Code, a selection of one whole line indents it too (only a part of a line is
+        // replaced by the indentation)
+        let multi = matches!(sel, Some((a, b)) if a.0 != b.0 || (a.1 == 0 && b.1 == char_len(&self.lines[b.0])));
         if !outdent && !multi {
             let unit = if self.ed.indent == "\t" {
                 "\t".to_string()
@@ -934,7 +936,12 @@ impl App {
                 edited = true;
             }
             // ---- Ctrl shortcuts
-            (0x41, true) if !shift => f.select_all(),
+            // the view stays where it is, like VS Code (revealing the caret would jump to the end)
+            (0x41, true) if !shift => {
+                f.select_all();
+                self.invalidate();
+                return true;
+            }
             (0x5A, true) if !shift => edited = f.undo(),
             (0x59, true) | (0x5A, true) => edited = f.redo(),
             (0x43, true) | (0x2D, true) if !shift => {

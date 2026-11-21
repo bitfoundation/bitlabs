@@ -59,9 +59,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Cli {
             }
             continue;
         }
-        let p = clean_arg(&a);
-        if !p.is_empty() {
-            c.paths.push(p);
+        // `"C:\a b\" "C:\c"` arrives as one argument, `C:\a b" C:\c` (the `\"` escapes the
+        // quote); a path can't contain `"`, so each part is a path of its own
+        for part in a.split('"') {
+            let p = clean_arg(part);
+            if !p.is_empty() {
+                c.paths.push(p);
+            }
         }
     }
     c
@@ -70,8 +74,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Cli {
 /// Fixes common Windows quoting artifacts, e.g. `"C:\repo\"` arrives as `C:\repo"`.
 pub fn clean_arg(a: &str) -> String {
     let s = a.trim().trim_matches('"').trim();
-    let s = s.strip_prefix("file:///").map(|x| x.replace('/', "\\")).unwrap_or_else(|| s.to_string());
-    let s = s.replace("%20", " ");
+    // only a URL is percent-encoded: a folder may really be named `My%20Project`
+    let s = s.strip_prefix("file:///").map(|x| x.replace('/', "\\").replace("%20", " ")).unwrap_or_else(|| s.to_string());
     // a drive root such as Explorer's `"D:\"` arrives as `D:"`; a bare `D:` would mean the
     // current directory on that drive
     let b = s.as_bytes();
@@ -92,6 +96,9 @@ mod quoting_tests {
         assert_eq!(clean_arg("d:"), r"d:\");
         assert_eq!(clean_arg("file:///C:/a%20b"), r"C:\a b");
         assert_eq!(clean_arg("."), ".");
+        assert_eq!(clean_arg(r"C:\My%20Project"), r"C:\My%20Project");
+        let c = parse([r#"C:\a b" C:\c"#.to_string()]);
+        assert_eq!(c.paths, vec![r"C:\a b".to_string(), r"C:\c".to_string()]);
     }
 }
 
@@ -119,7 +126,9 @@ pub struct Target {
 pub fn resolve(arg: &str, cwd: &Path) -> Result<Target, String> {
     let raw = PathBuf::from(arg);
     let abs = if raw.is_absolute() { raw } else { cwd.join(raw) };
-    let abs = std::fs::canonicalize(&abs).map(simplify).map_err(|_| format!("Path '{}' does not exist.", abs.display()))?;
+    // absolute (resolves `.` and `..`), not canonicalize: that turns a mapped or subst drive
+    // into its UNC / real path, which cmd can't start in and the recent list doesn't match
+    let abs = std::path::absolute(&abs).ok().filter(|p| p.exists()).map(simplify).ok_or_else(|| format!("Path '{}' does not exist.", abs.display()))?;
     if abs.is_file() {
         let folder = abs.parent().map(Path::to_path_buf).unwrap_or_else(|| abs.clone());
         return Ok(Target { folder, file: Some(abs) });
@@ -268,7 +277,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git").join("refs")).unwrap();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src").join("a.txt"), "x").unwrap();
-        let canon = simplify(std::fs::canonicalize(&root).unwrap());
+        let canon = root.clone();
 
         assert_eq!(resolve(".", &root).unwrap(), Target { folder: canon.clone(), file: None });
         assert_eq!(resolve("src", &root).unwrap().folder, canon.join("src"));

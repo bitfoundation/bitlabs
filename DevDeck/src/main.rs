@@ -48,11 +48,28 @@ const WM_NCMOUSELEAVE: u32 = 0x02A2;
 thread_local! {
     static BUSY: Cell<bool> = const { Cell::new(false) };
     static PENDING: Cell<u32> = const { Cell::new(0) };
+    /// The file change timer is running: further changes don't restart it, so a file written
+    /// more often than the delay (a log, a build cache) can't hold the refresh back forever.
+    static FS_ARMED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// A file changed: refresh shortly, at most one delay after the first change.
+fn arm_fs_timer(hwnd: HWND) {
+    if !FS_ARMED.with(|f| f.replace(true)) {
+        unsafe {
+            SetTimer(hwnd, app::TIMER_FS, 300, None);
+        }
+    }
 }
 const P_PAINT: u32 = 1;
 const P_JOB: u32 = 2;
 const P_FS: u32 = 4;
 const P_TERM: u32 = 8;
+/// WM_CLOSE while busy: closing then would destroy the window under the app (and skip the
+/// unsaved files prompt), so it is posted again afterwards.
+const P_CLOSE: u32 = 16;
+/// WM_SIZE / WM_DPICHANGED while busy: layout (and fonts, after a DPI change) are redone afterwards.
+const P_LAYOUT: u32 = 32;
 
 fn app_ptr(hwnd: HWND) -> *mut App {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App }
@@ -95,12 +112,26 @@ fn with_app<R>(hwnd: HWND, f: impl FnOnce(&mut App) -> R) -> Option<R> {
             app.on_term_data();
         }
         if pend & P_FS != 0 {
-            unsafe {
-                SetTimer(hwnd, app::TIMER_FS, 300, None);
+            arm_fs_timer(hwnd);
+        }
+        if pend & P_LAYOUT != 0 {
+            let dpi = unsafe { GetDpiForWindow(hwnd) };
+            if dpi != 0 && dpi != app.dpi {
+                apply_dpi(app, dpi);
+            }
+            if unsafe { IsIconic(hwnd) } != 0 {
+                app.release_buffer();
+            } else {
+                app.layout();
             }
         }
         if pend & P_PAINT != 0 {
             app.invalidate();
+        }
+        if pend & P_CLOSE != 0 {
+            unsafe {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            }
         }
         BUSY.with(|b| b.set(false));
     }
@@ -216,7 +247,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 PostMessageW(hwnd, DEFERRED_EDIT, wp, lp);
                 return 0;
             }
-            WM_CTLCOLOREDIT => {}
+            WM_CLOSE => {
+                PENDING.with(|p| p.set(p.get() | P_CLOSE));
+                return 0;
+            }
+            WM_SIZE => {
+                PENDING.with(|p| p.set(p.get() | P_LAYOUT));
+                return 0;
+            }
+            WM_DPICHANGED => {
+                let r = &*(lp as *const RECT);
+                PENDING.with(|p| p.set(p.get() | P_LAYOUT));
+                SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                return 0;
+            }
+            // handled below: with the app busy it blocks the shutdown rather than lose edits
+            WM_CTLCOLOREDIT | WM_QUERYENDSESSION => {}
             WM_NCHITTEST => return nc_hit_test(hwnd, lp, true),
             _ => return DefWindowProcW(hwnd, msg, wp, lp),
         }
@@ -287,19 +333,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DPICHANGED => {
             let dpi = (wp & 0xFFFF) as u32;
             let r = &*(lp as *const RECT);
-            with_app(hwnd, |a| {
-                a.dpi = dpi;
-                a.scale = dpi as f32 / 96.0;
-                a.fonts = win::Fonts::new(a.scale);
-                set_edit_fonts(a);
-                a.release_buffer();
-            });
+            with_app(hwnd, |a| apply_dpi(a, dpi));
             SetWindowPos(hwnd, null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
             0
         }
         WM_GETMINMAXINFO => {
             let mmi = &mut *(lp as *mut MINMAXINFO);
-            mmi.ptMinTrackSize = POINT { x: 640, y: 400 };
+            // logical pixels, like the layout
+            let k = GetDpiForWindow(hwnd).max(96) as i32;
+            mmi.ptMinTrackSize = POINT { x: 640 * k / 96, y: 400 * k / 96 };
             0
         }
         app::WM_JOB => {
@@ -307,7 +349,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         app::WM_FS => {
-            SetTimer(hwnd, app::TIMER_FS, 300, None);
+            arm_fs_timer(hwnd);
             0
         }
         app::WM_TERM => {
@@ -340,6 +382,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(hwnd, |a| match id {
                 app::TIMER_FS => unsafe {
                     KillTimer(hwnd, app::TIMER_FS);
+                    FS_ARMED.with(|f| f.set(false));
                     a.refresh();
                 },
                 app::TIMER_TOAST => a.tick_toasts(),
@@ -462,7 +505,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_LBUTTONDBLCLK => {
-            with_app(hwnd, |a| a.on_dblclick(lo(lp), hi(lp)));
+            let (ctrl, shift) = ((wp & 0x0008usize) != 0, (wp & 0x0004usize) != 0);
+            with_app(hwnd, |a| a.on_dblclick(lo(lp), hi(lp), ctrl, shift));
             0
         }
         WM_MBUTTONUP => {
@@ -492,10 +536,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return DefWindowProcW(hwnd, msg, wp, lp);
                 }
             }
-            // AltGr reports Ctrl+Alt: a character typed with it (Polish ą, German @ ...) must reach
-            // WM_CHAR instead of running Ctrl+letter shortcuts (Ctrl+A, Ctrl+Z ...). Ctrl+Alt+` stays a key.
-            let char_key = matches!(vk, 0x30..=0x5A | 0xBA..=0xE2) && vk != 0xC0;
-            if ctrl && char_key && key_down(VK_MENU) && with_app(hwnd, |a| a.editor_focused()).unwrap_or(false) {
+            // AltGr characters reach WM_CHAR (the editor, the terminal) instead of running shortcuts
+            if altgr_char(vk) {
                 return 0;
             }
             with_app(hwnd, |a| a.on_key(vk, ctrl, shift));
@@ -553,6 +595,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
+fn apply_dpi(a: &mut App, dpi: u32) {
+    a.dpi = dpi;
+    a.scale = dpi as f32 / 96.0;
+    a.fonts = win::Fonts::new(a.scale);
+    set_edit_fonts(a);
+    a.release_buffer();
+}
+
+/// AltGr reports Ctrl+Alt: a character typed with it (Polish ą, Hungarian @ and |, German {
+/// ...) must not run Ctrl+letter shortcuts (Ctrl+A, Ctrl+W, Ctrl+V ...) anywhere. No shortcut
+/// uses Ctrl+Alt with a character key; Ctrl+Alt+` stays a key.
+fn altgr_char(vk: u16) -> bool {
+    matches!(vk, 0x30..=0x5A | 0xBA..=0xE2) && vk != 0xC0 && key_down(VK_CONTROL) && key_down(VK_MENU)
+}
+
 /// Remembers the window's normal position and maximized state for the next start.
 fn save_placement(hwnd: HWND, a: &mut App) {
     let mut wp: WINDOWPLACEMENT = unsafe { std::mem::zeroed() };
@@ -584,6 +641,9 @@ unsafe extern "system" fn commit_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
             if vk == VK_ESCAPE {
                 SetFocus(main);
                 return 0;
+            }
+            if altgr_char(vk) {
+                return DefSubclassProc(hwnd, msg, wp, lp);
             }
             if ctrl && !shift && vk == 0x41 {
                 SendMessageW(hwnd, 0x00B1, 0, -1);
@@ -637,7 +697,7 @@ unsafe extern "system" fn overlay_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
             if matches!(vk, 0x26 | 0x28 | 0x21 | 0x22 | 0x0D | 0x1B) && with_app(main, |a| a.overlay_key(vk)).unwrap_or(false) {
                 return 0;
             }
-            if key_down(VK_CONTROL) && !key_down(VK_SHIFT) && vk == 0x41 {
+            if key_down(VK_CONTROL) && !key_down(VK_SHIFT) && vk == 0x41 && !altgr_char(vk) {
                 SendMessageW(hwnd, 0x00B1, 0, -1);
                 return 0;
             }
@@ -687,7 +747,7 @@ fn set_edit_fonts(a: &App) {
 
 fn main() {
     // ---- command line (code.exe style)
-    let cli = cli::parse(std::env::args().skip(1));
+    let cli = cli::parse(std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()));
     if cli.help {
         cli::output("DevDeck", cli::USAGE);
         return;

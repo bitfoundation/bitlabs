@@ -105,8 +105,13 @@ impl App {
     }
 
     pub fn branch_sel_index(&self) -> Option<usize> {
+        // compared in place: runs on every paint, over every tag and remote branch
         let k = self.branch_sel.as_ref()?;
-        (0..self.brows.len()).find(|&i| self.brow_key(i).as_ref() == Some(k))
+        let refs = &self.repo.as_ref()?.refs;
+        self.brows.iter().position(|b| match b {
+            BRow::Group { key, .. } => k.strip_prefix("G:") == Some(key.as_str()),
+            BRow::Ref(ri) => refs.get(*ri).is_some_and(|r| k.strip_prefix(kind_prefix(r.kind)) == Some(r.name.as_str())),
+        })
     }
 
     pub fn select_branch_row(&mut self, i: usize) {

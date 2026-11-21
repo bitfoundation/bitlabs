@@ -366,9 +366,16 @@ pub fn set_clipboard(hwnd: HWND, text: &str) {
         let h = GlobalAlloc(GMEM_MOVEABLE, bytes);
         if !h.is_null() {
             let p = GlobalLock(h) as *mut u16;
-            std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
-            GlobalUnlock(h);
-            SetClipboardData(13 /* CF_UNICODETEXT */, h as HANDLE);
+            if p.is_null() {
+                GlobalFree(h);
+            } else {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), p, data.len());
+                GlobalUnlock(h);
+                // the clipboard owns the memory only when this succeeds
+                if SetClipboardData(13 /* CF_UNICODETEXT */, h as HANDLE).is_null() {
+                    GlobalFree(h);
+                }
+            }
         }
         CloseClipboard();
     }
@@ -384,8 +391,10 @@ pub fn get_clipboard(hwnd: HWND) -> Option<String> {
         if !h.is_null() {
             let p = GlobalLock(h as HGLOBAL) as *const u16;
             if !p.is_null() {
+                // bounded by the block: text another app put there without a NUL ends at its size
+                let max = GlobalSize(h as HGLOBAL) / 2;
                 let mut n = 0;
-                while *p.add(n) != 0 {
+                while n < max && *p.add(n) != 0 {
                     n += 1;
                 }
                 out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));

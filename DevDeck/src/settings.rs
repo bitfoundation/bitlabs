@@ -41,6 +41,10 @@ pub struct Settings {
     pub panel_terminal: bool,
     pub terminal_shell: String,
     pub window: Option<(i32, i32, i32, i32, bool)>,
+    /// The values as loaded or last saved: saving writes only what this window changed since
+    /// and keeps the rest from the file, so closing one window doesn't undo a setting (theme,
+    /// layout ...) another window changed meanwhile.
+    base: std::cell::RefCell<Vec<(&'static str, String)>>,
 }
 
 impl Default for Settings {
@@ -73,6 +77,7 @@ impl Default for Settings {
             panel_terminal: false,
             terminal_shell: String::new(),
             window: None,
+            base: Default::default(),
         }
     }
 }
@@ -131,7 +136,40 @@ impl Settings {
                 _ => {}
             }
         }
+        *s.base.borrow_mut() = s.values();
         s
+    }
+
+    /// Every setting but the recent lists, as written to the file.
+    fn values(&self) -> Vec<(&'static str, String)> {
+        let b = |x: bool| if x { "1" } else { "0" }.to_string();
+        let mut v = vec![
+            ("dark", b(self.dark)),
+            ("inline_diff", b(self.inline_diff)),
+            ("compact_diff", b(self.compact_diff)),
+            ("sidebar_w", self.sidebar_w.to_string()),
+            ("sidebar_right", b(self.sidebar_right)),
+            ("sidebar_visible", b(self.sidebar_visible)),
+            ("side_view", self.side_view.to_string()),
+            ("tree_view", b(self.tree_view)),
+            ("graph_split", self.graph_split.to_string()),
+            ("branches_open", b(self.branches_open)),
+            ("graph_open", b(self.graph_open)),
+            ("panel_mode", self.panel_mode.to_string()),
+            ("panel_max", self.panel_max.to_string()),
+            ("branches_h", self.branches_h.to_string()),
+            ("output_h", self.output_h.to_string()),
+            ("output_visible", b(self.output_visible)),
+            ("graph_all", b(self.graph_all)),
+            ("smart_commit", self.smart_commit.map(b).unwrap_or_default()),
+            ("confirm_sync", b(self.confirm_sync)),
+            ("panel_terminal", b(self.panel_terminal)),
+            ("terminal_shell", self.terminal_shell.clone()),
+        ];
+        if let Some((x, y, w, h, m)) = self.window {
+            v.push(("window", format!("{x},{y},{w},{h},{}", if m { 1 } else { 0 })));
+        }
+        v
     }
 
     pub fn save(&self) {
@@ -139,39 +177,35 @@ impl Settings {
         if let Some(d) = p.parent() {
             let _ = std::fs::create_dir_all(d);
         }
+        let disk_text = std::fs::read_to_string(&p).unwrap_or_default();
+        let disk: Vec<(&str, &str)> = disk_text.lines().filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v)).collect();
         let (recent, recent_cmds) = self.merged_recent();
-        let b = |x: bool| if x { "1" } else { "0" };
+        let mine = self.values();
+        let mut base = self.base.borrow_mut();
         let mut out = String::new();
-        out += &format!("dark={}\n", b(self.dark));
-        out += &format!("inline_diff={}\n", b(self.inline_diff));
-        out += &format!("compact_diff={}\n", b(self.compact_diff));
-        out += &format!("sidebar_w={}\n", self.sidebar_w);
-        out += &format!("sidebar_right={}\n", b(self.sidebar_right));
-        out += &format!("sidebar_visible={}\n", b(self.sidebar_visible));
-        out += &format!("side_view={}\n", self.side_view);
-        out += &format!("tree_view={}\n", b(self.tree_view));
-        out += &format!("graph_split={}\n", self.graph_split);
-        out += &format!("branches_open={}\n", b(self.branches_open));
-        out += &format!("graph_open={}\n", b(self.graph_open));
-        out += &format!("panel_mode={}\n", self.panel_mode);
-        out += &format!("panel_max={}\n", self.panel_max);
-        out += &format!("branches_h={}\n", self.branches_h);
-        out += &format!("output_h={}\n", self.output_h);
-        out += &format!("output_visible={}\n", b(self.output_visible));
-        out += &format!("graph_all={}\n", b(self.graph_all));
-        out += &format!("smart_commit={}\n", self.smart_commit.map(b).unwrap_or(""));
-        out += &format!("confirm_sync={}\n", b(self.confirm_sync));
-        out += &format!("panel_terminal={}\n", b(self.panel_terminal));
-        out += &format!("terminal_shell={}\n", self.terminal_shell);
+        for (k, v) in &mine {
+            let changed = base.iter().find(|(bk, _)| bk == k).map(|(_, bv)| bv != v).unwrap_or(true);
+            let val = if changed { v.as_str() } else { disk.iter().find(|(dk, _)| dk == k).map(|(_, dv)| *dv).unwrap_or(v) };
+            out += &format!("{k}={val}\n");
+        }
         out += &format!("recent={}\n", recent.join("|"));
         out += &format!("recent_cmds={}\n", recent_cmds.join("|"));
-        if let Some((x, y, w, h, m)) = self.window {
-            out += &format!("window={x},{y},{w},{h},{}\n", if m { 1 } else { 0 });
-        }
+        *base = mine;
         // write a temporary file and rename it over the settings, so a window starting at the
         // same moment never reads a half-written file and falls back to the defaults
         let tmp = p.with_extension(format!("{}.tmp", std::process::id()));
-        if std::fs::write(&tmp, out).is_err() || std::fs::rename(&tmp, &p).is_err() {
+        // flushed before the rename: after a power loss the rename could otherwise survive
+        // without the data, leaving an empty settings file
+        let written = std::fs::File::create(&tmp).and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(out.as_bytes())?;
+            f.sync_all()
+        });
+        // the rename fails while another program (antivirus, indexer) has the file open: retry once
+        if written.is_err() || (std::fs::rename(&tmp, &p).is_err() && {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::rename(&tmp, &p).is_err()
+        }) {
             let _ = std::fs::remove_file(&tmp);
         }
     }

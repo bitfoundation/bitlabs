@@ -48,6 +48,11 @@ pub fn parse(text: &str) -> FileDiff {
     let mut cur: Option<Hunk> = None;
     let (mut o, mut n) = (0u32, 0u32);
     for raw in text.split('\n') {
+        // a second file section (a type change prints a deletion and a creation): its header
+        // lines would read as changed lines, and its hunks would mix with the first one's
+        if cur.is_some() && raw.starts_with("diff ") {
+            break;
+        }
         if let Some(rest) = raw.strip_prefix("@@ ") {
             if let Some(h) = cur.take() {
                 fd.hunks.push(h);
@@ -93,9 +98,7 @@ pub fn parse(text: &str) -> FileDiff {
                         o += 1;
                     }
                     "\\" => h.lines.push(DLine { kind: LK::NoNl, text: raw.to_string(), old: 0, new: 0 }),
-                    _ => {
-                        // a new file section (diff --git) would start here; not expected for single-file diffs
-                    }
+                    _ => {}
                 }
             }
         }
@@ -187,12 +190,14 @@ pub fn build_patch(fd: &FileDiff, selected: &HashSet<LineId>, reverse: bool) -> 
     // unstaging some lines of an added one, is a modification, not a deletion. Unstaging lines
     // of a staged rename must not undo the rename, so both sides name the new path.
     let keep_file = partial && (has("new file mode") && reverse || has("deleted file mode") && !reverse);
-    let renamed = has("rename from");
+    let renamed = has("rename from") || has("copy from");
     let side = |p: &str| fd.header.iter().find_map(|h| h.strip_prefix(p)).filter(|s| !s.starts_with('"'));
     let path = side("+++ b/").or_else(|| side("--- a/"));
     for h in &fd.header {
         let line = match path {
             Some(_) if keep_file && (h.starts_with("new file mode") || h.starts_with("deleted file mode")) => continue,
+            // some lines only: a mode change (chmod +x) isn't one of them
+            _ if partial && (h.starts_with("old mode") || h.starts_with("new mode")) => continue,
             Some(p) if h.starts_with("--- ") && (renamed || keep_file && h == "--- /dev/null") => format!("--- a/{p}"),
             Some(p) if h.starts_with("+++ ") && keep_file && h == "+++ /dev/null" => format!("+++ b/{p}"),
             Some(p) if h.starts_with("diff --git") && renamed => {
@@ -246,7 +251,14 @@ pub fn build_patch(fd: &FileDiff, selected: &HashSet<LineId>, reverse: bool) -> 
                     }
                 }
                 LK::NoNl => {
-                    if last_kept {
+                    // reverse: a restored old last line followed by unselected added lines (now
+                    // context) needs its newline, or git apply glues the next line onto it
+                    let restored_before_ctx = reverse
+                        && li > 0
+                        && h.lines[li - 1].kind == LK::Del
+                        && selected.contains(&(hi, li - 1))
+                        && h.lines.iter().enumerate().skip(li + 1).any(|(k, n)| n.kind == LK::Add && !selected.contains(&(hi, k)));
+                    if last_kept && !restored_before_ctx {
                         body.push_str(&l.text);
                         body.push('\n');
                     }
@@ -279,7 +291,6 @@ pub fn build_patch(fd: &FileDiff, selected: &HashSet<LineId>, reverse: bool) -> 
             (os, (os + delta).max(if nc > 0 { 1 } else { 0 }))
         };
         delta += nc as i64 - oc as i64;
-        let os = if oc == 0 && os > 0 && !reverse { os } else { os };
         out.push_str(&format!("@@ -{},{} +{},{} @@\n", os, oc, ns, nc));
         out.push_str(&body);
         any = true;
@@ -314,6 +325,13 @@ pub struct Conflict {
     pub end: usize,
 }
 
+/// A conflict marker line: exactly seven marker characters, then a space or the line's end
+/// (longer runs are content, or the inner markers of a recursive merge's base).
+fn marker(l: &str, c: u8) -> bool {
+    let b = l.as_bytes();
+    b.len() >= 7 && b[..7].iter().all(|&x| x == c) && (b.len() == 7 || b[7] == b' ')
+}
+
 pub fn parse_conflicts(lines: &[&str]) -> Vec<Conflict> {
     let mut v = Vec::new();
     let mut start = None;
@@ -321,15 +339,15 @@ pub fn parse_conflicts(lines: &[&str]) -> Vec<Conflict> {
     let mut mid = None;
     for (i, l) in lines.iter().enumerate() {
         let l = l.trim_end_matches('\r');
-        if l.starts_with("<<<<<<<") {
+        if marker(l, b'<') {
             start = Some(i);
             base = None;
             mid = None;
-        } else if l.starts_with("|||||||") && start.is_some() && mid.is_none() {
+        } else if marker(l, b'|') && start.is_some() && mid.is_none() {
             base = Some(i);
         } else if l == "=======" && start.is_some() && mid.is_none() {
             mid = Some(i);
-        } else if l.starts_with(">>>>>>>") && mid.is_some() {
+        } else if marker(l, b'>') && mid.is_some() {
             v.push(Conflict { start: start.unwrap(), base, mid: mid.unwrap(), end: i });
             start = None;
             mid = None;

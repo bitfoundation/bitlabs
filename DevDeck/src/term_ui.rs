@@ -247,7 +247,7 @@ impl App {
             match back {
                 Some(ti) if ti != self.tab_active => self.activate_tab(ti),
                 _ if self.st.sidebar_visible => {
-                    self.focus = Focus::Changes;
+                    self.focus = self.side_focus();
                     self.invalidate();
                 }
                 _ => {}
@@ -386,7 +386,7 @@ impl App {
         if self.terminal_visible() && self.focus == Focus::Terminal && !self.term_editor_focus {
             self.st.output_visible = false;
             self.st.save();
-            self.focus = Focus::Changes;
+            self.focus = self.side_focus();
             self.layout();
         } else {
             self.show_terminal(true);
@@ -429,7 +429,7 @@ impl App {
             self.st.output_visible = false;
             self.st.save();
             if self.focus == Focus::Terminal && !self.term_editor_focus {
-                self.focus = Focus::Changes;
+                self.focus = self.side_focus();
             }
             self.layout();
         }
@@ -535,11 +535,20 @@ impl App {
         self.term_pending.store(false, Ordering::SeqCst);
         let log = std::env::var_os("DEVDECK_TERM_LOG");
         let mut any = false;
-        for t in self.terms.iter_mut() {
+        // only output of a terminal on screen repaints: one in the background (a dev server, a
+        // Claude Code session in another tab) must not repaint the window at its output rate
+        let shown = [self.panel_term().filter(|_| self.terminal_visible()), self.editor_term()];
+        let mut more = false;
+        for (i, t) in self.terms.iter_mut().enumerate() {
             let (before, trimmed) = (t.screen.scrolled_total, t.screen.trimmed);
             let mut exited = false;
+            // a budget per message: a flood of output (cat of a big log) lets the window paint
+            // and take input in between
+            let mut budget = 1usize << 20;
             while let Ok(ev) = t.rx.try_recv() {
-                any = true;
+                if shown.contains(&Some(i)) {
+                    any = true;
+                }
                 match ev {
                     TermEvent::Data(d) => {
                         if let Some(path) = &log {
@@ -548,10 +557,19 @@ impl App {
                                 let _ = f.write_all(&d);
                             }
                         }
-                        t.screen.feed(&d)
+                        t.screen.feed(&d);
+                        budget = budget.saturating_sub(d.len());
                     }
                     TermEvent::Exited => exited = true,
                 }
+                if budget == 0 {
+                    more = true;
+                    break;
+                }
+            }
+            // a full-screen app has no history to be scrolled into
+            if t.screen.in_alt_screen() {
+                t.scroll = 0;
             }
             if !t.screen.replies.is_empty() {
                 let r = std::mem::take(&mut t.screen.replies);
@@ -567,6 +585,7 @@ impl App {
                 };
                 t.screen.feed(format!("\r\n\x1b[7m * {msg} Press any key to restart the terminal. \x1b[0m\r\n").as_bytes());
                 t.exited = Some(msg);
+                any = true;
             }
             // keep the viewport stable when scrolled up into history
             if t.scroll > 0 {
@@ -579,7 +598,12 @@ impl App {
                 t.sel = t.sel.and_then(|(a, b)| (a.0 >= d && b.0 >= d).then(|| ((a.0 - d, a.1), (b.0 - d, b.1))));
             }
         }
-        if any && (self.terminal_visible() || self.editor_term().is_some()) {
+        if more && !self.term_pending.swap(true, Ordering::SeqCst) {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(self.hwnd, WM_TERM, 0, 0);
+            }
+        }
+        if any {
             self.invalidate();
         }
     }
@@ -603,7 +627,9 @@ impl App {
         let Some(text) = win::get_clipboard(self.hwnd) else { return };
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
         let bracketed = self.term().map(|t| t.screen.bracketed_paste).unwrap_or(false);
-        let data = if bracketed { format!("\x1b[200~{text}\x1b[201~") } else { text };
+        // ESC can't be in pasted text: an `ESC[201~` in it would end the paste early and run
+        // the rest as typed commands
+        let data = if bracketed { format!("\x1b[200~{}\x1b[201~", text.replace('\x1b', "")) } else { text };
         self.term_write(data.as_bytes());
     }
 
@@ -715,8 +741,9 @@ impl App {
             let hi = std::mem::take(&mut self.term_surrogate);
             String::from_utf16_lossy(&[hi, ch])
         } else if ch == 0x08 {
-            // Backspace (WM_CHAR 0x08) sends DEL like xterm
-            "\x7f".into()
+            // Backspace (WM_CHAR 0x08) sends DEL like xterm; Ctrl+H (also 0x08) stays ^H
+            let backspace = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(0x08) } < 0;
+            if backspace { "\x7f" } else { "\x08" }.into()
         } else if ch == 0x7F {
             // Ctrl+Backspace (WM_CHAR 0x7F) sends ^H like xterm.js: deletes a word in shells
             "\x08".into()

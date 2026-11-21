@@ -88,7 +88,9 @@ pub fn shape(row: &GraphRow, commit: &Commit) -> RowShape {
     let out = &row.output;
     let input_index = inp.iter().position(|n| n.id == commit.hash);
     let circle_index = input_index.unwrap_or(inp.len());
-    let circle_color = if circle_index < out.len() {
+    // a root commit has no lane of its own in the output: the lane there belongs to another branch
+    let root = commit.parents.is_empty();
+    let circle_color = if circle_index < out.len() && !root {
         out[circle_index].color
     } else if circle_index < inp.len() {
         inp[circle_index].color
@@ -101,7 +103,7 @@ pub fn shape(row: &GraphRow, commit: &Commit) -> RowShape {
             if index != circle_index {
                 segs.push(Seg::C { x0: index as f32 + 1.0, y0: 0.0, x1: index as f32, y1: 0.5, color: node.color });
                 segs.push(Seg::H { x0: index as f32, x1: circle_index as f32 + 1.0, y: 0.5, color: node.color });
-            } else {
+            } else if !root {
                 oi += 1;
             }
         } else if oi < out.len() && node.id == out[oi].id {
@@ -135,6 +137,16 @@ mod tests {
 
     fn c(h: &str, p: &[&str], refs: Vec<Decoration>) -> Commit {
         Commit { hash: h.into(), parents: p.iter().map(|s| s.to_string()).collect(), author: String::new(), email: String::new(), date: 0, message: String::new(), refs }
+    }
+
+    #[test]
+    fn lanes_continue_past_a_root_commit() {
+        // q's lane (right of the root commit r) moves left under it and keeps its line
+        let commits = vec![c("x", &["r"], vec![]), c("y", &["q"], vec![]), c("r", &[], vec![]), c("q", &[], vec![])];
+        let rows = compute(&commits, None, None, None);
+        let s = shape(&rows[2], &commits[2]);
+        assert!(s.segs.iter().any(|g| matches!(g, Seg::C { x0, x1, .. } if *x0 == 2.0 && *x1 == 1.0)));
+        assert_eq!(s.circle_color, rows[2].input[0].color);
     }
 
     #[test]

@@ -34,7 +34,9 @@ pub enum JobResult {
     Refresh { gen: u64, status: GitResult<Status>, refs: Vec<RefInfo>, stashes: Vec<Stash>, ignored: Option<HashSet<String>> },
     Log { gen: u64, commits: Vec<Commit>, more: bool, append: bool },
     View { gen: u64, view: MainView, keep_scroll: bool },
-    Op { title: String, result: GitResult<String>, then: Option<Then>, on_err: Option<OnErr> },
+    /// `root`: the repository the op ran in; its callbacks are dropped when another one is open
+    /// by the time it finishes (None = always run them).
+    Op { title: String, root: Option<PathBuf>, result: GitResult<String>, then: Option<Then>, on_err: Option<OnErr> },
 }
 
 pub struct Repo {
@@ -144,6 +146,41 @@ pub struct DiffView {
     pub inline: bool,
     /// First row of the change F7 / Shift+F7 went to last.
     pub nav: Option<usize>,
+    /// Text selected on one side (copied with Ctrl+C), as in an editor.
+    pub tsel: Option<TextSel>,
+}
+
+/// A text selection in a diff: `side` 0 is the original (or the inline column), 1 the
+/// modified side; positions are (row, char column).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct TextSel {
+    pub side: u8,
+    pub anchor: (usize, usize),
+    pub cur: (usize, usize),
+}
+
+impl DiffView {
+    /// The line shown on `side` of `row` (none for filler rows and hunk separators).
+    pub fn side_line(&self, row: usize, side: u8) -> Option<&diff::DLine> {
+        let r = self.rows.get(row)?;
+        let (hi, li) = if side == 0 || self.inline { r.left? } else { r.right? };
+        self.fd.hunks.get(hi)?.lines.get(li)
+    }
+
+    /// The selected text of one side, lines joined with CRLF (None when nothing is selected).
+    pub fn selected_text(&self) -> Option<String> {
+        let t = self.tsel.filter(|t| t.anchor != t.cur)?;
+        let (a, b) = (t.anchor.min(t.cur), t.anchor.max(t.cur));
+        let mut parts = Vec::new();
+        for row in a.0..=b.0.min(self.rows.len().saturating_sub(1)) {
+            let Some(l) = self.side_line(row, t.side) else { continue };
+            let chars: Vec<char> = l.text.trim_end_matches('\r').chars().collect();
+            let from = if row == a.0 { a.1.min(chars.len()) } else { 0 };
+            let to = if row == b.0 { b.1.min(chars.len()) } else { chars.len() };
+            parts.push(chars[from..to.max(from)].iter().collect::<String>());
+        }
+        Some(parts.join("\r\n"))
+    }
 }
 
 pub struct FileView {
@@ -499,7 +536,8 @@ pub struct App {
     pub rx: Receiver<JobResult>,
     pub op_tx: Sender<Box<dyn FnOnce() + Send>>,
     pub repo: Option<Repo>,
-    pub watcher: Option<Watcher>,
+    /// The work tree, plus the git dir when it is kept elsewhere (linked worktree, submodule).
+    pub watcher: Vec<Watcher>,
     pub refresh_gen: u64,
     pub refreshing: bool,
     pub refresh_pending: bool,
@@ -567,6 +605,8 @@ pub struct App {
     pub buf: (HDC, HBITMAP, i32, i32),
     pub output_seen: usize,
     pub mouse: (i32, i32),
+    /// A wheel scroll moved the rows under the pointer: hover is recomputed after the next paint.
+    pub hover_stale: bool,
     /// Tooltip shown: the hovered item and the mouse position it was shown at.
     pub tip: Option<(Hit, i32, i32)>,
     /// Where the tooltip was painted (the commit box is cut out under it).
@@ -592,6 +632,22 @@ pub struct App {
     pub title_icon: (windows_sys::Win32::UI::WindowsAndMessaging::HICON, i32),
     pub term_surrogate: u16,
     pub shells: Vec<crate::term::Shell>,
+}
+
+/// `<remote> <branch>:<upstream branch>` for pushing the current branch, like VS Code: a bare
+/// `git push` fails (push.default=simple) when the upstream branch has another name.
+fn push_target(s: &Status) -> Vec<String> {
+    match (&s.branch, &s.upstream) {
+        (Some(b), Some(up)) => {
+            let (remote, ub) = crate::branches::split_remote(&s.remotes, up);
+            if remote.is_empty() {
+                vec![]
+            } else {
+                vec![remote, format!("{b}:{ub}")]
+            }
+        }
+        _ => vec![],
+    }
 }
 
 pub fn group_id(g: Group) -> u8 {
@@ -642,7 +698,7 @@ impl App {
             rx,
             op_tx,
             repo: None,
-            watcher: None,
+            watcher: Vec::new(),
             refresh_gen: 0,
             refreshing: false,
             refresh_pending: false,
@@ -697,6 +753,7 @@ impl App {
             buf: (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
             output_seen: 0,
             mouse: (0, 0),
+            hover_stale: false,
             pending_init: None,
             pending_file: None,
             terms: Vec::new(),
@@ -786,7 +843,7 @@ impl App {
         let Some(root) = git::toplevel(folder) else {
             let f = folder.display().to_string();
             self.repo = None;
-            self.watcher = None;
+            self.watcher.clear();
             self.tabs.clear();
             self.tab_active = 0;
             self.prune_editor_terms();
@@ -798,7 +855,7 @@ impl App {
             // the folder still opens, like VS Code: the Explorer, editor and terminal work on
             // it and Source Control offers to initialize a repository
             self.ex = crate::explorer::Explorer::default();
-            self.watcher = Watcher::start(folder, self.hwnd, WM_FS);
+            self.watcher = Watcher::start(folder, self.hwnd, WM_FS, false).into_iter().collect();
             self.st.side_view = 1;
             self.st.sidebar_visible = true;
             self.rebuild_explorer();
@@ -810,8 +867,14 @@ impl App {
         let name = root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
         self.st.add_recent(&root.display().to_string());
         self.st.save();
-        self.watcher = None;
-        self.watcher = Watcher::start(&root, self.hwnd, WM_FS);
+        self.watcher.clear();
+        self.watcher = Watcher::start(&root, self.hwnd, WM_FS, false).into_iter().collect();
+        // `.git` is a file pointing elsewhere: index, HEAD and refs change there
+        if let Some(d) = std::fs::read_to_string(root.join(".git")).ok().and_then(|t| t.trim().strip_prefix("gitdir:").map(|d| root.join(d.trim()))) {
+            if !d.starts_with(&root) {
+                self.watcher.extend(Watcher::start(&d, self.hwnd, WM_FS, true));
+            }
+        }
         self.repo = Some(Repo { root, name, status: Status::default(), refs: vec![], stashes: vec![], loaded: false });
         self.commits.clear();
         self.graph_rows.clear();
@@ -822,12 +885,20 @@ impl App {
         self.ex = crate::explorer::Explorer::default();
         self.brows.clear();
         self.branch_sel = None;
+        self.graph_sel = None;
         self.view = MainView::Empty;
         self.tabs.clear();
         self.tab_active = 0;
         self.prune_editor_terms();
         self.sync_term_focus();
         win::set_text(self.commit_edit, "");
+        self.merge_prefill = None;
+        // results of a status or log load still running for the previous repository are stale
+        self.refresh_gen += 1;
+        self.refreshing = false;
+        self.refresh_pending = false;
+        self.log_gen += 1;
+        self.log_loading = false;
         self.refresh();
         self.update_title();
     }
@@ -948,6 +1019,10 @@ impl App {
                     if append {
                         self.commits.extend(commits);
                     } else {
+                        // the selected commit stays selected where it moved to (a new commit
+                        // above it, Auto / All), or the selection goes
+                        let sel = self.graph_sel.and_then(|i| self.commits.get(i)).map(|c| c.hash.clone());
+                        self.graph_sel = sel.and_then(|h| commits.iter().position(|c| c.hash == h));
                         self.commits = commits;
                     }
                     self.has_more = more;
@@ -970,28 +1045,28 @@ impl App {
                         continue;
                     }
                     let mut view = view;
+                    // a reload never replaces unsaved edits, whatever it found (the file may be
+                    // gone or too large now); Save asks before overwriting
+                    if keep_scroll && matches!(&self.view, MainView::File(o) if o.ed.dirty()) {
+                        continue;
+                    }
                     if keep_scroll {
                         if let (MainView::File(old), MainView::File(new)) = (&self.view, &mut view) {
-                            if old.path == new.path && old.ed.editable {
-                                // a reload never replaces unsaved edits (Save asks before overwriting)
-                                if old.ed.dirty() {
-                                    continue;
-                                }
-                                if new.ed.editable {
-                                    let clamp = |p: crate::editor::Pos| {
-                                        let l = p.0.min(new.lines.len() - 1);
-                                        (l, p.1.min(crate::editor::char_len(&new.lines[l])))
-                                    };
-                                    new.ed.cur = clamp(old.ed.cur);
-                                    new.ed.anchor = clamp(old.ed.anchor);
-                                }
+                            // the caret stays where it was
+                            if old.path == new.path && old.ed.editable && new.ed.editable {
+                                let clamp = |p: crate::editor::Pos| {
+                                    let l = p.0.min(new.lines.len() - 1);
+                                    (l, p.1.min(crate::editor::char_len(&new.lines[l])))
+                                };
+                                new.ed.cur = clamp(old.ed.cur);
+                                new.ed.anchor = clamp(old.ed.anchor);
                             }
                         }
                     } else {
                         self.scroll[Area::Main as usize] = 0;
                         self.hscroll = 0;
                     }
-                    let prev_sel = if let MainView::Diff(d) = &self.view { d.sel } else { None };
+                    let (prev_sel, prev_tsel) = if let MainView::Diff(d) = &self.view { (d.sel, d.tsel) } else { (None, None) };
                     self.view = view;
                     if keep_scroll {
                         if let MainView::Diff(d) = &mut self.view {
@@ -1000,13 +1075,22 @@ impl App {
                                     d.sel = Some((a, b));
                                 }
                             }
+                            // the same diff again (a refresh): a text selection stays
+                            if let Some(t) = prev_tsel {
+                                if t.anchor.0.max(t.cur.0) < d.rows.len() {
+                                    d.tsel = Some(t);
+                                }
+                            }
                         }
                     }
                 }
-                JobResult::Op { title, result, then, on_err } => {
+                JobResult::Op { title, root, result, then, on_err } => {
                     if let Some(i) = self.ops.iter().position(|t| *t == title) {
                         self.ops.remove(i);
                     }
+                    // the follow-up of an op (push after commit, force checkout, ...) belongs to
+                    // the repository it ran in, not to one opened since
+                    let (then, on_err) = if root.is_some() && root != self.root() { (None, None) } else { (then, on_err) };
                     match result {
                         Ok(_) => {
                             if let Some(t) = then {
@@ -1040,7 +1124,8 @@ impl App {
         let Some(repo) = self.repo.as_mut() else { return };
         // keep merge message in the commit box
         if let Some(m) = &s.merge_msg {
-            if win::get_text(self.commit_edit).trim().is_empty() && !m.is_empty() {
+            // once per merge: a message the user cleared isn't put back on the next refresh
+            if self.merge_prefill.is_none() && win::get_text(self.commit_edit).trim().is_empty() && !m.is_empty() {
                 win::set_text(self.commit_edit, m);
                 self.merge_prefill = Some(m.clone());
             }
@@ -1090,10 +1175,27 @@ impl App {
             MainView::File(f) => f.change.clone(),
             _ => None,
         };
-        if let Some(c) = current {
-            let still = self.repo.as_ref().unwrap().status.files.iter().find(|f| f.path == c.path && f.group == c.group).cloned();
-            if let Some(f) = still {
-                self.load_change_view(f, true);
+        // unsaved edits in a conflict view are never replaced
+        if let (Some(c), false) = (current, matches!(&self.view, MainView::File(f) if f.ed.dirty())) {
+            let files = &self.repo.as_ref().unwrap().status.files;
+            // a staged, unstaged or resolved file is followed to its new group, so the view
+            // never shows changes that are no longer there
+            let still = files.iter().find(|f| f.path == c.path && f.group == c.group).or_else(|| files.iter().find(|f| f.path == c.path)).cloned();
+            match still {
+                Some(f) => {
+                    let key = format!("change:{}:{}", group_id(f.group), f.path);
+                    if f.group != c.group && !self.tabs.iter().any(|t| t.key == key) {
+                        if let Some(t) = self.tabs.get_mut(self.tab_active) {
+                            t.key = key;
+                        }
+                    }
+                    self.load_change_view(f, true);
+                }
+                // committed or discarded
+                None => {
+                    let (title, _) = crate::tabs::view_title(&self.view);
+                    self.view = MainView::Message(title, "There are no changes in this file.".into());
+                }
             }
         }
     }
@@ -1171,11 +1273,18 @@ impl App {
     // --------------------------------------------------------------- graph
 
     pub fn load_log(&mut self, append: bool) {
+        // "load more" while a full reload runs would drop the reload and append to the old list
+        if append && self.log_loading {
+            return;
+        }
         let Some(repo) = &self.repo else { return };
         if repo.status.head.is_none() {
             self.commits.clear();
             self.graph_rows.clear();
             self.has_more = false;
+            // a load still running (history from before an undone first commit) is stale
+            self.log_gen += 1;
+            self.log_loading = false;
             return;
         }
         let root = repo.root.clone();
@@ -1229,7 +1338,7 @@ impl App {
         }
         let _ = self.op_tx.send(Box::new(move || {
             let result = f(&root);
-            let _ = tx.send(JobResult::Op { title: t, result, then, on_err });
+            let _ = tx.send(JobResult::Op { title: t, root: Some(root), result, then, on_err });
             post(hwnd);
         }));
         self.invalidate();
@@ -1452,8 +1561,8 @@ impl App {
         // keep `back` alive across the thread by sending it along
         std::thread::spawn(move || {
             let mut args: Vec<String> = match &parent {
-                Some(p) => vec!["diff".into(), "--no-color".into(), "--no-ext-diff".into(), "-M".into(), ctx.clone(), p.clone(), sha.clone()],
-                None => vec!["show".into(), "--format=".into(), "--no-color".into(), "--no-ext-diff".into(), ctx.clone(), sha.clone()],
+                Some(p) => vec!["--literal-pathspecs".into(), "diff".into(), "--no-color".into(), "--no-ext-diff".into(), "-M".into(), ctx.clone(), p.clone(), sha.clone()],
+                None => vec!["--literal-pathspecs".into(), "show".into(), "--format=".into(), "--no-color".into(), "--no-ext-diff".into(), ctx.clone(), sha.clone()],
             };
             args.push("--".into());
             if let Some(o) = &file.orig {
@@ -1534,7 +1643,7 @@ impl App {
         let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         let run = move |app: &mut App| {
             app.op("Stage", move |root| {
-                for chunk in paths.chunks(200) {
+                for chunk in path_chunks(&paths) {
                     // literal: a file named app/[id]/x must not also match app/i/x
                     let mut a = vec!["--literal-pathspecs", "add", "-A", "--"];
                     a.extend(chunk.iter().map(|s| s.as_str()));
@@ -1564,7 +1673,7 @@ impl App {
         }
         let has_head = self.status().map(|s| s.head.is_some()).unwrap_or(false);
         self.op("Unstage", move |root| {
-            for chunk in paths.chunks(200) {
+            for chunk in path_chunks(&paths) {
                 // literal: bracketed names aren't globs; -f: rm refuses "staged content different" otherwise, and --cached never touches the work tree
                 let mut a = if has_head { vec!["--literal-pathspecs", "reset", "-q", "HEAD", "--"] } else { vec!["--literal-pathspecs", "rm", "--cached", "-r", "-f", "-q", "--"] };
                 a.extend(chunk.iter().map(|s| s.as_str()));
@@ -1620,16 +1729,32 @@ impl App {
     pub fn add_to_gitignore(&mut self, files: Vec<FileChange>) {
         let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         self.op("Ignore", move |root| {
+            use std::io::Write;
             let p = root.join(".gitignore");
-            let mut cur = std::fs::read_to_string(&p).unwrap_or_default();
-            if !cur.is_empty() && !cur.ends_with('\n') {
-                cur.push('\n');
+            // appended as bytes: a file that can't be read (not UTF-8, locked) is never rewritten
+            let cur = match std::fs::read(&p) {
+                Ok(b) => b,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(e) => return Err(GitError::new(e.to_string())),
+            };
+            let mut add = String::new();
+            if !cur.is_empty() && !cur.ends_with(b"\n") {
+                add.push('\n');
             }
             for x in paths {
-                cur.push_str(&x);
-                cur.push('\n');
+                // the path itself, not a pattern: app/[id]/x must not also ignore app/i/x
+                if x.starts_with(['#', '!']) {
+                    add.push('\\');
+                }
+                for ch in x.chars() {
+                    if matches!(ch, '[' | '*' | '?' | '\\') {
+                        add.push('\\');
+                    }
+                    add.push(ch);
+                }
+                add.push('\n');
             }
-            std::fs::write(&p, cur).map_err(|e| GitError::new(e.to_string()))?;
+            std::fs::OpenOptions::new().append(true).create(true).open(&p).and_then(|mut f| f.write_all(add.as_bytes())).map_err(|e| GitError::new(e.to_string()))?;
             Ok(String::new())
         }, None, None);
     }
@@ -1736,13 +1861,19 @@ impl App {
         let staged = s.count(Group::Staged);
         let changes = s.count(Group::Changes);
         let mut all = all;
+        // staging everything because nothing looked staged: checked again when the commit runs,
+        // since a Stage still queued before it makes the status above stale
+        let mut implied = false;
         if staged == 0 && !amend && !s.merging && !all {
             if changes == 0 {
                 self.info("There are no changes to commit.");
                 return;
             }
             match self.st.smart_commit {
-                Some(true) => all = true,
+                Some(true) => {
+                    all = true;
+                    implied = true;
+                }
                 Some(false) => {
                     self.info("There are no staged changes to commit.");
                     return;
@@ -1777,9 +1908,13 @@ impl App {
             });
             return;
         }
+        let sent = msg.clone();
         let then: Then = Box::new(move |app: &mut App| {
-            win::set_text(app.commit_edit, "");
-            app.edit_changed();
+            // a message typed while the commit ran (hooks can take a while) is kept
+            if win::get_text(app.commit_edit).replace("\r\n", "\n").trim_end() == sent {
+                win::set_text(app.commit_edit, "");
+                app.edit_changed();
+            }
             match post_cmd {
                 1 => app.push(false),
                 2 => app.sync(),
@@ -1787,7 +1922,8 @@ impl App {
             }
         });
         self.op("Committing", move |root| {
-            if all {
+            // `diff --cached --quiet` exits with 1 when something is staged
+            if all && !(implied && git::run(root, &["diff", "--cached", "--quiet"], None, true).code == 1) {
                 git::exec(root, &["add", "-A"])?;
             }
             if amend && msg.is_empty() {
@@ -1808,10 +1944,18 @@ impl App {
             self.warn("Can't undo because HEAD doesn't point to any commit.");
             return;
         }
-        let root = self.root().unwrap();
-        let msg = git::run(&root, &["log", "-1", "--format=%B"], None, true).text().trim().to_string();
-        let has_parent = git::run(&root, &["rev-parse", "--verify", "-q", "HEAD~"], None, true).ok();
-        self.op("Undo Commit", move |root| if has_parent { git::exec(root, &["reset", "--soft", "HEAD~"]) } else { git::exec(root, &["update-ref", "-d", "HEAD"]) }, Some(Box::new(move |app: &mut App| {
+        // HEAD is read when the op runs: a commit still queued before it is the one undone
+        let msg = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let m = msg.clone();
+        self.op("Undo Commit", move |root| {
+            *m.lock().unwrap() = git::run(root, &["log", "-1", "--format=%B"], None, true).text().trim().to_string();
+            if git::run(root, &["rev-parse", "--verify", "-q", "HEAD~"], None, true).ok() {
+                git::exec(root, &["reset", "--soft", "HEAD~"])
+            } else {
+                git::exec(root, &["update-ref", "-d", "HEAD"])
+            }
+        }, Some(Box::new(move |app: &mut App| {
+            let msg = std::mem::take(&mut *msg.lock().unwrap());
             win::set_text(app.commit_edit, &msg);
             app.edit_changed();
         })), None);
@@ -2066,13 +2210,14 @@ impl App {
             self.confirm(&format!("The branch \"{branch}\" has no remote branch. Would you like to publish this branch?"), "", &["OK"], |app, _| app.publish());
             return;
         }
+        let target = push_target(&s);
         if force {
-            self.confirm("You are about to force push your changes, this can be destructive and could inadvertently overwrite changes made by others.\n\nAre you sure to continue?", "", &["OK"], |app, _| {
-                app.git_op("Pushing", vec!["push".into(), "--force-with-lease".into()]);
+            self.confirm("You are about to force push your changes, this can be destructive and could inadvertently overwrite changes made by others.\n\nAre you sure to continue?", "", &["OK"], move |app, _| {
+                app.git_op("Pushing", [vec!["push".into(), "--force-with-lease".into()], target].concat());
             });
             return;
         }
-        self.git_op("Pushing", vec!["push".into()]);
+        self.git_op("Pushing", [vec!["push".to_string()], target].concat());
     }
 
     pub fn publish(&mut self) {
@@ -2102,10 +2247,14 @@ impl App {
             self.publish();
             return;
         }
-        let run = |app: &mut App| {
-            app.op("Syncing", |root| {
+        let target = push_target(&s);
+        let run = move |app: &mut App| {
+            let target = target.clone();
+            app.op("Syncing", move |root| {
                 git::exec(root, &["pull", "--tags"])?;
-                git::exec(root, &["push"])
+                let mut a = vec!["push"];
+                a.extend(target.iter().map(|x| x.as_str()));
+                git::exec(root, &a)
             }, None, None);
         };
         if self.st.confirm_sync {
@@ -2149,7 +2298,9 @@ impl App {
 
     pub fn stash(&mut self, untracked: bool, staged: bool) {
         let Some(s) = self.status() else { return };
-        if s.files.is_empty() {
+        // without --include-untracked, git stashes nothing (and says so with exit code 0) when
+        // only untracked files changed
+        if s.files.iter().all(|f| !untracked && f.kind == Kind::Untracked) {
             self.info("There are no changes to stash.");
             return;
         }
@@ -2305,7 +2456,7 @@ impl App {
             let then: Then = Box::new(move |app: &mut App| app.open_repo(&tgt));
             std::thread::spawn(move || {
                 let r = git::exec(Path::new(&parent), &["clone", "--progress", &url, &target.display().to_string()]);
-                let _ = tx.send(JobResult::Op { title: "Cloning".into(), result: r, then: Some(then), on_err: None });
+                let _ = tx.send(JobResult::Op { title: "Cloning".into(), root: None, result: r, then: Some(then), on_err: None });
                 post(hwnd);
             });
         });
@@ -2463,7 +2614,7 @@ impl App {
                     self.st.panel_terminal = false;
                 }
                 if self.focus == Focus::Terminal && !self.term_editor_focus {
-                    self.focus = Focus::Changes;
+                    self.focus = self.side_focus();
                 }
                 self.st.save();
                 self.layout();
@@ -2702,10 +2853,30 @@ pub fn resolve_side(root: &Path, files: &[(String, String)], side: &str) -> GitR
     Ok(String::new())
 }
 
+/// Splits paths into groups that fit on one command line (CreateProcess takes at most 32,767
+/// characters, and long, deep paths reach that well before a few hundred of them).
+fn path_chunks(paths: &[String]) -> Vec<&[String]> {
+    let mut v = Vec::new();
+    let (mut start, mut len) = (0, 0);
+    for (i, p) in paths.iter().enumerate() {
+        let n = p.encode_utf16().count() + 3;
+        if i > start && len + n > 24_000 {
+            v.push(&paths[start..i]);
+            start = i;
+            len = 0;
+        }
+        len += n;
+    }
+    if start < paths.len() {
+        v.push(&paths[start..]);
+    }
+    v
+}
+
 /// Restores tracked files and recycles untracked ones; errors when some couldn't be removed
 /// (e.g. locked by another process) instead of failing silently.
 pub fn discard_paths(root: &Path, tracked: &[String], untracked: &[String]) -> GitResult<String> {
-    for chunk in tracked.chunks(200) {
+    for chunk in path_chunks(tracked) {
         // literal: a file named app/[id]/x must not also match app/i/x
         let mut a = vec!["--literal-pathspecs", "checkout", "-q", "--"];
         a.extend(chunk.iter().map(|s| s.as_str()));
@@ -2716,7 +2887,10 @@ pub fn discard_paths(root: &Path, tracked: &[String], untracked: &[String]) -> G
     }
     let abs: Vec<PathBuf> = untracked.iter().map(|p| root.join(p)).collect();
     let exists = |p: &&PathBuf| std::fs::symlink_metadata(p).is_ok();
-    recycle_many(&abs);
+    // declined deleting for good (no Recycle Bin there): not asked again for each file
+    if recycle_many(&abs) == Some(false) {
+        return Err(GitError::new("The files were not deleted."));
+    }
     // the shell stops at the first failure: give the rest their own try
     let left: Vec<&PathBuf> = abs.iter().filter(exists).filter(|p| !recycle(p)).collect();
     if left.is_empty() {
@@ -2728,11 +2902,11 @@ pub fn discard_paths(root: &Path, tracked: &[String], untracked: &[String]) -> G
 }
 
 /// Moves many files to the Recycle Bin with one shell call (one call per file is slow).
-/// Returns false when the shell reported a failure.
-pub fn recycle_many(paths: &[PathBuf]) -> bool {
-    use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW};
+/// Some(true) when all went, Some(false) when the user cancelled, None on another failure.
+pub fn recycle_many(paths: &[PathBuf]) -> Option<bool> {
+    use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE, SHFILEOPSTRUCTW};
     if paths.is_empty() {
-        return true;
+        return Some(true);
     }
     // double-NUL terminated list of NUL separated paths, with backslashes
     let mut from: Vec<u16> = Vec::new();
@@ -2746,18 +2920,24 @@ pub fn recycle_many(paths: &[PathBuf]) -> bool {
         wFunc: FO_DELETE,
         pFrom: from.as_ptr(),
         pTo: std::ptr::null(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        // where the bin isn't available (network drives, too big) the shell asks before deleting for good
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING) as u16,
         fAnyOperationsAborted: 0,
         hNameMappings: std::ptr::null_mut(),
         lpszProgressTitle: std::ptr::null(),
     };
-    unsafe { SHFileOperationW(&mut op) == 0 && op.fAnyOperationsAborted == 0 }
+    let r = unsafe { SHFileOperationW(&mut op) };
+    if op.fAnyOperationsAborted != 0 {
+        Some(false)
+    } else {
+        (r == 0).then_some(true)
+    }
 }
 
 /// Moves a file or folder to the Recycle Bin; false when that failed. Never falls back to
 /// deleting for good: callers ask first, then use `delete_permanently`.
 pub fn recycle(path: &Path) -> bool {
-    use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FO_DELETE, SHFILEOPSTRUCTW};
+    use windows_sys::Win32::UI::Shell::{SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, FO_DELETE, SHFILEOPSTRUCTW};
     // the shell wants backslashes
     let mut from: Vec<u16> = path.display().to_string().replace('/', "\\").encode_utf16().collect();
     from.push(0);
@@ -2767,7 +2947,8 @@ pub fn recycle(path: &Path) -> bool {
         wFunc: FO_DELETE,
         pFrom: from.as_ptr(),
         pTo: std::ptr::null(),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) as u16,
+        // where the bin isn't available (network drives, too big) the shell asks before deleting for good
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOF_WANTNUKEWARNING) as u16,
         fAnyOperationsAborted: 0,
         hNameMappings: std::ptr::null_mut(),
         lpszProgressTitle: std::ptr::null(),
@@ -2800,11 +2981,17 @@ pub fn diff_view_from(text: &str, f: &FileChange, kind: DiffKind, inline: bool, 
     }
     let (rows, blocks) = diff::build_rows(&fd, inline);
     let max_cols = fd.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3).max().unwrap_or(0);
-    MainView::Diff(DiffView { title: title.into(), desc: f.path.clone(), path: f.path.clone(), kind, change: Some(f.clone()), fd, rows, blocks, sel: None, back: None, max_cols, inline, nav: None })
+    MainView::Diff(DiffView { title: title.into(), desc: f.path.clone(), path: f.path.clone(), kind, change: Some(f.clone()), fd, rows, blocks, sel: None, back: None, max_cols, inline, nav: None, tsel: None })
 }
 
 pub fn build_change_view(root: &Path, f: &FileChange, ctx: &str, inline: bool) -> MainView {
     let name = short_name(&f.path).to_string();
+    // like the file viewer, a huge file (a log, a dump) isn't diffed with full context on
+    // every refresh
+    let size = std::fs::metadata(root.join(&f.path)).map(|m| m.len()).unwrap_or(0);
+    if size > crate::explorer::MAX_VIEW_BYTES {
+        return MainView::Message(name, format!("The file is not displayed because it is too large ({:.1} MB).", size as f64 / 1048576.0));
+    }
     match (f.group, f.kind) {
         (Group::Merge, _) => {
             let bytes = std::fs::read(root.join(&f.path)).unwrap_or_default();
@@ -2818,16 +3005,16 @@ pub fn build_change_view(root: &Path, f: &FileChange, ctx: &str, inline: bool) -
             MainView::File(FileView { title: format!("{name} (Merge Conflicts)"), path: f.path.clone(), lines, conflicts, change: Some(f.clone()), mtime: None, ed: Default::default() })
         }
         (Group::Changes, Kind::Untracked) => {
-            let o = git::run(root, &["diff", "--no-index", "--no-color", "--no-ext-diff", ctx, "--", "/dev/null", &f.path], None, false);
+            let o = git::run(root, &["--literal-pathspecs", "diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", ctx, "--", "/dev/null", &f.path], None, false);
             diff_view_from(&o.text(), f, DiffKind::Untracked, inline, &format!("{name} (Untracked)"))
         }
         (Group::Changes, _) => {
-            let o = git::run(root, &["diff", "--no-color", "--no-ext-diff", ctx, "--", &f.path], None, false);
+            let o = git::run(root, &["--literal-pathspecs", "diff", "--no-color", "--no-ext-diff", "--no-textconv", ctx, "--", &f.path], None, false);
             let suffix = if f.kind == Kind::Deleted { "Deleted" } else { "Working Tree" };
             diff_view_from(&o.text(), f, DiffKind::WorkingTree, inline, &format!("{name} ({suffix})"))
         }
         (Group::Staged, _) => {
-            let mut a = vec!["diff", "--cached", "--no-color", "--no-ext-diff", "-M", ctx, "--"];
+            let mut a = vec!["--literal-pathspecs", "diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "-M", ctx, "--"];
             if let Some(o) = &f.orig {
                 a.push(o);
             }

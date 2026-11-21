@@ -579,6 +579,13 @@ impl Screen {
                 i += 1;
                 continue;
             };
+            // a lead byte without its continuation bytes is one bad character: what follows
+            // (ASCII, an ESC sequence) is still read
+            if (1..len.min(bytes.len() - i)).any(|k| bytes[i + k] & 0xC0 != 0x80) {
+                i += 1;
+                self.handle('\u{FFFD}');
+                continue;
+            }
             if i + len > bytes.len() {
                 self.utf8 = bytes[i..].to_vec();
                 break;
@@ -668,7 +675,17 @@ impl Screen {
                 }
             }
             State::Csi => {
-                if ('\x40'..='\x7e').contains(&ch) {
+                // controls inside a sequence: ESC starts a new one, CAN / SUB cancel it, the
+                // others (CR, LF, BS ...) run as usual and the sequence goes on
+                if ch == '\x1b' {
+                    self.state = State::Esc;
+                } else if ch == '\x18' || ch == '\x1a' {
+                    self.state = State::Ground;
+                } else if (ch as u32) < 0x20 {
+                    self.state = State::Ground;
+                    self.handle(ch);
+                    self.state = State::Csi;
+                } else if ('\x40'..='\x7e').contains(&ch) {
                     let params = std::mem::take(&mut self.params);
                     self.state = State::Ground;
                     self.csi(&params, ch);
@@ -734,7 +751,26 @@ impl Screen {
             return;
         }
         let body: String = raw.chars().filter(|c| c.is_ascii_digit() || *c == ';' || *c == ':').collect();
-        let ps: Vec<usize> = if body.is_empty() { vec![] } else { body.split(';').map(|p| p.split(':').next().unwrap_or("").parse().unwrap_or(0)).collect() };
+        let num = |s: &str| s.parse().unwrap_or(0).min(0xFFFF);
+        let ps: Vec<usize> = if body.is_empty() {
+            vec![]
+        } else if f == 'm' && body.contains(':') {
+            // SGR sub-parameters: 4:N is an underline style (4:0 = none), 38:2::R:G:B /
+            // 38:5:N a colour; spelled out the way the ';' forms are
+            let mut v = Vec::new();
+            for g in body.split(';') {
+                let s: Vec<usize> = g.split(':').map(num).collect();
+                match s.as_slice() {
+                    [4, n, ..] => v.push(if *n == 0 { 24 } else { 4 }),
+                    [c @ (38 | 48 | 58), 2, rest @ ..] if rest.len() >= 3 => v.extend([*c, 2].iter().chain(&rest[rest.len() - 3..])),
+                    [c @ (38 | 48 | 58), 5, n, ..] => v.extend([*c, 5, *n]),
+                    _ => v.push(s[0]),
+                }
+            }
+            v
+        } else {
+            body.split(';').map(|p| num(p.split(':').next().unwrap_or(""))).collect()
+        };
         let p = |i: usize, d: usize| -> usize { ps.get(i).copied().filter(|&v| v != 0).unwrap_or(d) };
         // only commands that move the cursor or edit the grid cancel a pending wrap
         if !"hlncqptms".contains(f) {
@@ -789,6 +825,8 @@ impl Screen {
                     }
                     _ => {}
                 }
+                // an erase that splits a wide character leaves no half of it behind
+                self.fix_wide_pairs();
             }
             'K' => {
                 let b = self.blank();
@@ -937,7 +975,8 @@ impl Screen {
                 49 => self.pen.bg = Color::Default,
                 90..=97 => self.pen.fg = Color::Idx((v - 90 + 8) as u8),
                 100..=107 => self.pen.bg = Color::Idx((v - 100 + 8) as u8),
-                38 | 48 => {
+                // 58: underline colour, not drawn; its operands are skipped all the same
+                38 | 48 | 58 => {
                     let c = match ps.get(i + 1) {
                         Some(5) => {
                             i += 2;
@@ -955,7 +994,7 @@ impl Screen {
                     if let Some(c) = c {
                         if v == 38 {
                             self.pen.fg = c;
-                        } else {
+                        } else if v == 48 {
                             self.pen.bg = c;
                         }
                     }
@@ -1100,6 +1139,13 @@ mod tests {
         s.feed(b"\x1b[38;2;10;20;30mT\x1b[48;5;200mU");
         assert_eq!(s.lines[0][2].fg, Color::Rgb(10, 20, 30));
         assert_eq!(s.lines[0][3].bg, Color::Idx(200));
+        // colon sub-parameters; an underline colour (58) leaves the pen alone
+        s.feed(b"\x1b[0m\x1b[2;1H\x1b[4mA\x1b[4:0mB\x1b[38:2::1:2:3mC\x1b[58;2;0;2;0mD\x1b[4:3mE");
+        assert_eq!(s.lines[1][0].flags & UNDERLINE, UNDERLINE);
+        assert_eq!(s.lines[1][1].flags & UNDERLINE, 0);
+        assert_eq!(s.lines[1][2].fg, Color::Rgb(1, 2, 3));
+        assert_eq!((s.lines[1][3].fg, s.lines[1][3].flags & DIM), (Color::Rgb(1, 2, 3), 0));
+        assert_eq!(s.lines[1][4].flags & UNDERLINE, UNDERLINE);
     }
 
     #[test]

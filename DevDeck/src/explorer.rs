@@ -12,7 +12,7 @@ use crate::ui::Menu;
 use crate::win::{self, MenuItem};
 
 /// Files larger than this are not loaded into the viewer.
-const MAX_VIEW_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_VIEW_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ERow {
@@ -82,7 +82,8 @@ pub fn list_dir(root: &Path, rel: &str) -> Vec<(String, bool)> {
             Some((name, is_dir))
         })
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase())).then_with(|| a.0.cmp(&b.0)));
+    // folders first, then by name ignoring case (keys computed once, not per comparison)
+    v.sort_by_cached_key(|(n, d)| (!*d, n.to_lowercase(), n.clone()));
     v
 }
 
@@ -346,7 +347,7 @@ impl App {
         let Some(root) = self.folder() else { return };
         let text = if self.repo.is_some() { git::run(&root, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"], None, true).text() } else { list_files(&root).join("\0") };
         let mut paths: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-        paths.sort_by_key(|p| p.to_lowercase());
+        paths.sort_by_cached_key(|p| p.to_lowercase());
         paths.dedup();
         let items: Vec<PickItem> = paths
             .into_iter()
@@ -539,7 +540,7 @@ impl App {
                 return;
             }
             // a case-only rename is allowed (the same file on Windows)
-            if !new.eq_ignore_ascii_case(&old) && std::fs::symlink_metadata(root.join(&new)).is_ok() {
+            if new.to_lowercase() != old.to_lowercase() && std::fs::symlink_metadata(root.join(&new)).is_ok() {
                 return a.error(format!("A file or folder '{name}' already exists at this location. Choose a different name."));
             }
             if let Err(e) = std::fs::rename(root.join(&old), root.join(&new)) {

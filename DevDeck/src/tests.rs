@@ -18,6 +18,9 @@ impl TempRepo {
         git::exec(&p, &["config", "user.name", "Test"]).unwrap();
         git::exec(&p, &["config", "user.email", "t@example.com"]).unwrap();
         git::exec(&p, &["config", "core.autocrlf", "false"]).unwrap();
+        // a global signing setup would make the commits fail or ask for a passphrase
+        git::exec(&p, &["config", "commit.gpgsign", "false"]).unwrap();
+        git::exec(&p, &["config", "tag.gpgsign", "false"]).unwrap();
         TempRepo(p)
     }
     fn write(&self, f: &str, c: &str) {
@@ -216,6 +219,19 @@ fn partial_patches_of_added_deleted_renamed_and_no_newline_files() {
     let patch = diff::build_patch(&fd, &select(&fd, |t| t == "c"), false).unwrap();
     git::exec_input(r.root(), &["apply", "--cached", "--recount", "-"], Some(patch.as_bytes())).unwrap();
     assert_eq!(index_content(r.root(), "nonl.txt"), "a\nb\nc\n");
+
+    // unstage only the removed last line (it had no newline) while the added line stays:
+    // the restored line keeps a newline instead of being glued to the next one
+    r.write("nonl2.txt", "a\nb");
+    git::exec(r.root(), &["add", "nonl2.txt"]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "nonl2"]).unwrap();
+    r.write("nonl2.txt", "a\nB\n");
+    git::exec(r.root(), &["add", "nonl2.txt"]).unwrap();
+    let s = git::status(r.root()).unwrap();
+    let fd = diff_of(r.root(), &file(&s, "nonl2.txt", Group::Staged));
+    let patch = diff::build_patch(&fd, &select(&fd, |t| t == "b"), true).unwrap();
+    git::exec_input(r.root(), &["apply", "--cached", "-R", "--recount", "-"], Some(patch.as_bytes())).unwrap();
+    assert_eq!(index_content(r.root(), "nonl2.txt"), "a\nb\nB\n");
 }
 
 #[test]
@@ -299,4 +315,21 @@ fn stash_restore_keeps_the_real_error() {
     let e = crate::app::stash_restore(r.root(), "pop", None).unwrap_err();
     assert!(e.message.contains("merge conflicts"), "{}", e.message);
     assert!(!e.stderr.contains("needs merge"), "{}", e.stderr);
+}
+
+#[test]
+fn diff_text_selection_copies_one_side() {
+    let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n same\n-old line\n+new line\n tail\n";
+    let f = git::FileChange { path: "f".into(), orig: None, kind: Kind::Modified, group: Group::Changes, xy: ".M".into() };
+    let MainView::Diff(mut d) = crate::app::diff_view_from(text, &f, DiffKind::WorkingTree, false, "f") else { panic!() };
+    let row = |t: &str| d.rows.iter().position(|r| r.left.or(r.right).is_some_and(|(h, l)| d.fd.hunks[h].lines[l].text == t)).unwrap();
+    let (same, changed) = (row("same"), row("old line"));
+    // from "me" on the first line to "old" on the original side
+    d.tsel = Some(crate::app::TextSel { side: 0, anchor: (changed, 3), cur: (same, 2) });
+    assert_eq!(d.selected_text().as_deref(), Some("me\r\nold"));
+    // the same rows on the modified side
+    d.tsel = Some(crate::app::TextSel { side: 1, anchor: (same, 2), cur: (changed, 3) });
+    assert_eq!(d.selected_text().as_deref(), Some("me\r\nnew"));
+    d.tsel = Some(crate::app::TextSel { side: 1, anchor: (same, 2), cur: (same, 2) });
+    assert_eq!(d.selected_text(), None);
 }

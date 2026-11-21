@@ -10,9 +10,12 @@ use std::time::Instant;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Lines ever logged: unlike the length, it keeps changing once the log is full.
+static LOG_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub fn log_line(s: String) {
     let mut l = LOG.lock().unwrap();
+    LOG_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     l.push(s);
     let n = l.len();
     if n > 3000 {
@@ -20,8 +23,13 @@ pub fn log_line(s: String) {
     }
 }
 
-pub fn log_snapshot() -> Vec<String> {
-    LOG.lock().unwrap().clone()
+pub fn log_total() -> usize {
+    LOG_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Up to `n` lines from `first` (the visible part of the Output panel).
+pub fn log_lines(first: usize, n: usize) -> Vec<String> {
+    LOG.lock().unwrap().iter().skip(first).take(n).cloned().collect()
 }
 
 pub fn log_len() -> usize {
@@ -85,27 +93,35 @@ pub fn run(cwd: &Path, args: &[&str], input: Option<&[u8]>, quiet: bool) -> Outp
     let mut cmd = Command::new("git");
     cmd.current_dir(cwd)
         // user settings that would change the output DevDeck parses or the patches it applies
-        .args(["-c", "core.quotepath=false", "-c", "color.ui=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false", "-c", "diff.suppressBlankEmpty=false", "-c", "log.showSignature=false"])
+        .args(["-c", "core.quotepath=false", "-c", "color.ui=false", "-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/", "-c", "diff.relative=false", "-c", "diff.suppressBlankEmpty=false", "-c", "log.showSignature=false"])
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("LC_ALL", "C")
         .env("GIT_PAGER", "cat")
         .env("GIT_EDITOR", "true")
+        // git has no visible console to ask for a user name or password on: fail instead of
+        // waiting forever (credential helpers such as Git Credential Manager still run)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .creation_flags(CREATE_NO_WINDOW)
         .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let result = match cmd.spawn() {
         Ok(mut child) => {
-            if let Some(data) = input {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(data);
+            // stdin is written while stdout / stderr are read: git may print a lot (a commit's
+            // hooks) before it reads its input, and both sides would wait on full pipes
+            let stdin = child.stdin.take();
+            std::thread::scope(|sc| {
+                if let (Some(data), Some(mut stdin)) = (input, stdin) {
+                    sc.spawn(move || {
+                        let _ = stdin.write_all(data);
+                    });
                 }
-            }
-            match child.wait_with_output() {
-                Ok(o) => Output { code: o.status.code().unwrap_or(-1), stdout: o.stdout, stderr: String::from_utf8_lossy(&o.stderr).into_owned() },
-                Err(e) => Output { code: -1, stdout: vec![], stderr: e.to_string() },
-            }
+                match child.wait_with_output() {
+                    Ok(o) => Output { code: o.status.code().unwrap_or(-1), stdout: o.stdout, stderr: String::from_utf8_lossy(&o.stderr).into_owned() },
+                    Err(e) => Output { code: -1, stdout: vec![], stderr: e.to_string() },
+                }
+            })
         }
         Err(e) => Output { code: -1, stdout: vec![], stderr: format!("Unable to run git: {e}") },
     };
@@ -427,7 +443,7 @@ pub struct RefInfo {
 }
 
 pub fn refs(root: &Path) -> Vec<RefInfo> {
-    let o = run(root, &["for-each-ref", "--sort=-committerdate", "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(committerdate:unix)%00%(subject)", "refs/heads", "refs/remotes", "refs/tags"], None, true);
+    let o = run(root, &["for-each-ref", "--sort=-creatordate", "--format=%(refname)%00%(objectname)%00%(*objectname)%00%(upstream:short)%00%(upstream:track,nobracket)%00%(creatordate:unix)%00%(subject)", "refs/heads", "refs/remotes", "refs/tags"], None, true);
     let mut v = Vec::new();
     for line in o.text().lines() {
         let f: Vec<&str> = line.split('\0').collect();

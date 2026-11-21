@@ -160,8 +160,9 @@ impl App {
         let has_button = self.repo.is_some();
         l.button = if has_button { rect(l.edit.left, l.edit.bottom + self.s(6), l.edit.right, l.edit.bottom + self.s(6) + self.s(28)) } else { rect(l.edit.left, l.edit.bottom, l.edit.right, l.edit.bottom) };
         // Changes keeps room for about three rows below the commit button
-        let changes_min = l.button.bottom + self.s(6) + self.s(66);
         let graph_min = if self.st.graph_open { self.s(80) } else { 0 };
+        // ... unless the window is too short for that next to the other section headers
+        let changes_min = (l.button.bottom + self.s(6) + self.s(66)).min(bottom - hdr * 2 - graph_min);
         let br_h = if self.st.branches_open { self.s(self.st.branches_h).max(self.s(44)) } else { 0 };
         let br_h = br_h.min((bottom - hdr * 2 - graph_min - changes_min).max(0));
         l.branches_header = rect(sx, bottom - br_h - hdr, sx + sw, bottom - br_h);
@@ -466,6 +467,10 @@ impl App {
         }
         let g = Gfx { dc: self.buf.0 };
         self.hits.clear();
+        // content that shrank (a commit, a reload) leaves no list scrolled into empty space
+        for a in [Area::Changes, Area::Graph, Area::Branches, Area::Explorer, Area::Main, Area::Output] {
+            self.clamp_scroll(a);
+        }
         g.fill(&c, self.t.editor);
         self.paint_titlebar(&g);
         let mode = self.panel_mode();
@@ -482,6 +487,12 @@ impl App {
         if !matches!(mode, PanelMode::FullHeight | PanelMode::FullScreen) {
             self.paint_main(&g);
         }
+        // the side bar's resize sash, over the rows on both sides of its edge
+        if mode != PanelMode::FullScreen && self.st.sidebar_visible {
+            let l = self.l;
+            let edge = if self.st.sidebar_right { l.sidebar.left - 1 } else { l.sidebar.right };
+            self.hits.push((rect(edge - self.s(2), l.sidebar.top, edge + self.s(3), l.sidebar.bottom), Hit::Sash(Sash::Sidebar)));
+        }
         if self.st.output_visible {
             self.paint_output(&g);
         }
@@ -493,6 +504,15 @@ impl App {
             BitBlt(hdc, 0, 0, w, h, self.buf.0, 0, 0, SRCCOPY);
         }
         self.clip_commit_edit();
+        // after a wheel scroll: hover (highlight, row actions, tooltip) follows what is now under
+        // the pointer; one more paint shows it
+        if std::mem::take(&mut self.hover_stale) && self.drag.is_none() {
+            let h = self.hit_test(self.mouse.0, self.mouse.1);
+            if h != self.hover {
+                self.set_hover(h);
+                self.invalidate();
+            }
+        }
     }
 
     /// The commit box is a child window, so it draws on top of anything painted on the main
@@ -676,7 +696,6 @@ impl App {
         g.fill(&l.sidebar, self.t.sidebar);
         let edge = if self.st.sidebar_right { l.sidebar.left - 1 } else { l.sidebar.right };
         g.vline(edge, l.sidebar.top, l.sidebar.bottom, self.t.border);
-        self.hits.push((rect(edge - self.s(2), l.sidebar.top, edge + self.s(3), l.sidebar.bottom), Hit::Sash(Sash::Sidebar)));
         let bs = self.s(22);
         let y = l.title.top + (rh(&l.title) - bs) / 2;
         let mut x = l.title.right - self.s(8) - bs;
@@ -721,7 +740,8 @@ impl App {
             MainView::Diff(d) => Some(d.path.clone()),
             _ => None,
         };
-        let rows: Vec<(usize, crate::explorer::ERow)> = self.ex.rows.iter().cloned().enumerate().skip(first).take(n).collect();
+        let rows: Vec<(usize, crate::explorer::ERow)> = self.ex.rows.iter().enumerate().skip(first).take(n).map(|(i, r)| (i, r.clone())).collect();
+        let m = self.hits.len();
         for (i, row) in rows {
             let y = r.top + i as i32 * rh22 - scroll;
             let rr = rect(r.left, y, r.right, y + rh22);
@@ -758,6 +778,7 @@ impl App {
                 }
             }
         }
+        self.clip_hits(m, r);
         g.unclip(saved);
         self.draw_scrollbar(g, Area::Explorer);
     }
@@ -768,7 +789,6 @@ impl App {
         // border and resize sash on the edge facing the main area
         let edge = if self.st.sidebar_right { l.sidebar.left - 1 } else { l.sidebar.right };
         g.vline(edge, l.sidebar.top, l.sidebar.bottom, self.t.border);
-        self.hits.push((rect(edge - self.s(2), l.sidebar.top, edge + self.s(3), l.sidebar.bottom), Hit::Sash(Sash::Sidebar)));
         // title
         g.text_in(&rect(l.title.left + self.s(20), l.title.top, l.title.right - self.s(80), l.title.bottom), "SOURCE CONTROL", self.fonts.cap, self.t.fg, DT_LINE);
         let bs = self.s(22);
@@ -803,7 +823,9 @@ impl App {
             g.fill(&l.edit, self.t.input_bg);
             g.frame(&l.edit, if focused { self.t.focus } else { self.t.input_border });
             self.paint_commit_button(g);
+            let m = self.hits.len();
             self.paint_changes(g);
+            self.clip_hits(m, self.l.changes);
         }
         // graph
         let gh = l.graph_header;
@@ -831,7 +853,9 @@ impl App {
             let label = if self.st.graph_all { "All" } else { "Auto" };
             self.text_button(g, x - self.s(2), y + self.s(1), bs - self.s(2), label, Hit::Cmd(Cmd::ToggleGraphAll));
             if self.st.graph_open {
+                let m = self.hits.len();
                 self.paint_graph(g);
+                self.clip_hits(m, self.l.graph);
             }
         }
         self.paint_branches_section(g);
@@ -1114,7 +1138,9 @@ impl App {
         x -= bs;
         self.icon_button(g, xywh(x, bh.top, bs, bs), I_TAG, Hit::Cmd(Cmd::TagCreate), true);
         if open {
+            let m = self.hits.len();
             self.paint_branches(g);
+            self.clip_hits(m, self.l.branches);
         }
     }
 
@@ -1323,10 +1349,14 @@ impl App {
                 g.text_in(&rect(hd.left + self.s(12), hd.top, actions_left - self.s(8), hd.bottom), &title, self.fonts.ui, self.t.fg, DT_LINE);
             }
         } else {
-            self.paint_tabs(g, rect(hd.left, hd.top, actions_left - self.s(8), hd.bottom));
+            let strip = rect(hd.left, hd.top, actions_left - self.s(8), hd.bottom);
+            let m = self.hits.len();
+            self.paint_tabs(g, strip);
+            self.clip_hits(m, strip);
         }
         let body = l.main_body;
         let saved = g.clip(&body);
+        let m = self.hits.len();
         match &self.view {
             MainView::Empty => self.paint_watermark(g),
             MainView::Loading(_) => g.text_in(&body, "Loading...", self.fonts.ui, self.t.fg_dim, DT_LINE | DT_CENTER),
@@ -1346,8 +1376,28 @@ impl App {
                 }
             }
         }
+        self.clip_hits(m, body);
         g.unclip(saved);
         self.draw_scrollbar(g, Area::Main);
+    }
+
+    /// Rows partly scrolled out of a list must not catch clicks meant for what is next to it
+    /// (header buttons, the commit button, editor tabs): the hit rectangles pushed since `from`
+    /// are cut to the list's area.
+    fn clip_hits(&mut self, from: usize, area: RECT) {
+        let mut i = from;
+        while i < self.hits.len() {
+            let r = &mut self.hits[i].0;
+            r.left = r.left.max(area.left);
+            r.top = r.top.max(area.top);
+            r.right = r.right.min(area.right);
+            r.bottom = r.bottom.min(area.bottom);
+            if r.left >= r.right || r.top >= r.bottom {
+                self.hits.remove(i);
+            } else {
+                i += 1;
+            }
+        }
     }
 
     /// Editor tab strip in `strip`. Tabs shrink when crowded; if they still don't fit, the
@@ -1505,6 +1555,9 @@ impl App {
         let width = rw(&body) - self.s(12);
         let (left_x, right_x, half) = if inline { (body.left, body.left, width) } else { (body.left, body.left + width / 2, width / 2) };
         let sel = d.sel.map(|(a, b)| (a.min(b), a.max(b)));
+        // text selected on one side, painted like the editor's selection
+        let tsel = d.tsel.filter(|t| t.anchor != t.cur).map(|t| (t.side, t.anchor.min(t.cur), t.anchor.max(t.cur)));
+        let sel_bg = if self.focus == Focus::Main { crate::theme::blend_colorref(self.t.editor, self.t.accent, 0.35) } else { crate::theme::blend_colorref(self.t.editor, self.t.fg, 0.12) };
         let hover_block = match self.hover {
             Hit::DiffRow(r) => d.rows.get(r).and_then(|x| x.block),
             Hit::DiffBlock(b, _) if b != usize::MAX => Some(b),
@@ -1569,7 +1622,19 @@ impl App {
                         g.text(nx + self.s(2), y + self.s(1), marker, self.fonts.mono, self.t.fg_dim);
                         let text = expand_tabs(&line.text);
                         let clip = rect(nx + mw + self.s(4), y, x + wdt, y + lh);
-                        g.text_clip(nx + mw + self.s(6) - hs, y + self.s(1), &text, self.fonts.mono, self.t.fg, &clip);
+                        let tx = nx + mw + self.s(6) - hs;
+                        let sd = if right_side { 1 } else { 0 };
+                        if let Some((_, a, b)) = tsel.filter(|(ts, a, b)| *ts == sd && i >= a.0 && i <= b.0) {
+                            let t = line.text.trim_end_matches('\r');
+                            let c0 = if i == a.0 { crate::editor::vcol(t, a.1) } else { 0 } as i32;
+                            // the line break of a selected line shows as one extra cell
+                            let c1 = if i == b.0 { crate::editor::vcol(t, b.1) as i32 } else { crate::editor::vcol(t, usize::MAX) as i32 + 1 };
+                            let r = rect((tx + c0 * mw).max(clip.left), y, (tx + c1 * mw).min(clip.right), y + lh);
+                            if r.right > r.left {
+                                g.fill(&r, sel_bg);
+                            }
+                        }
+                        g.text_clip(tx, y + self.s(1), &text, self.fonts.mono, self.t.fg, &clip);
                     }
                 }
             };
@@ -1581,9 +1646,13 @@ impl App {
                 g.vline(right_x - 1, y, y + lh, self.t.border);
             }
             if selected {
+                // the lines Stage / Unstage / Revert Selected Lines act on; framed unless text
+                // is selected (that shows them already)
                 g.fill(&rect(body.left, y, body.left + self.s(3), y + lh), self.t.accent);
-                let ov = rect(body.left + self.s(3), y, body.right - self.s(12), y + lh);
-                g.frame(&ov, crate::theme::blend_colorref(self.t.editor, self.t.accent, 0.6));
+                if tsel.is_none() {
+                    let ov = rect(body.left + self.s(3), y, body.right - self.s(12), y + lh);
+                    g.frame(&ov, crate::theme::blend_colorref(self.t.editor, self.t.accent, 0.6));
+                }
             }
             self.hits.push((rect(body.left, y, body.right - self.s(12), y + lh), Hit::DiffRow(i)));
             if let Some(b) = row.block {
@@ -1620,21 +1689,33 @@ impl App {
         let scroll = self.scroll[Area::Main as usize];
         let mw = self.fonts.mono_w;
         let MainView::File(f) = &self.view else { return };
-        // virtual rows: conflict action row before each conflict start
-        let mut rows: Vec<(bool, usize)> = Vec::with_capacity(f.lines.len() + f.conflicts.len());
-        let starts: std::collections::HashSet<usize> = f.conflicts.iter().map(|c| c.start).collect();
-        for i in 0..f.lines.len() {
-            if starts.contains(&i) {
-                rows.push((true, i));
-            }
-            rows.push((false, i));
-        }
-        let num_w = (f.lines.len().to_string().len() as i32).max(3) * mw + self.s(16);
+        // virtual rows: a conflict action row before each conflict start; conflict j's action
+        // row is row start + j, so only the visible rows are worked out (big files stay cheap)
         let first = (scroll / lh).max(0) as usize;
         let n = (rh(&body) / lh + 2) as usize;
+        let rows: Vec<(usize, (bool, usize))> = (first..first + n)
+            .filter_map(|k| {
+                // conflicts whose action row is at or before row k
+                let (mut a, mut hi) = (0, f.conflicts.len());
+                while a < hi {
+                    let m = (a + hi) / 2;
+                    if f.conflicts[m].start + m <= k {
+                        a = m + 1;
+                    } else {
+                        hi = m;
+                    }
+                }
+                if a > 0 && f.conflicts[a - 1].start + a - 1 == k {
+                    return Some((k, (true, f.conflicts[a - 1].start)));
+                }
+                let li = k - a;
+                (li < f.lines.len()).then_some((k, (false, li)))
+            })
+            .collect();
+        let num_w = (f.lines.len().to_string().len() as i32).max(3) * mw + self.s(16);
         let top = body.top + self.s(4);
         let mut hits = Vec::new();
-        for (k, &(is_action, li)) in rows.iter().enumerate().skip(first).take(n) {
+        for &(k, (is_action, li)) in &rows {
             let y = top + k as i32 * lh - scroll;
             if is_action {
                 let mut x = body.left + num_w + self.s(8);
@@ -1777,30 +1858,39 @@ impl App {
                 None => "Terminal".into(),
             };
             let name = format!("{} \u{25BE}", name.chars().take(60).collect::<String>());
-            let tw = (g.text_w(&name, self.fonts.small) + self.s(14)).min(rw(&o) / 2);
-            let r = rect(rx - tw, y, rx, y + bs);
-            if self.hover == Hit::TermShellMenu {
-                g.round_rect(&r, self.s(5), self.t.toolbar_hover, None);
+            // never over the OUTPUT / TERMINAL tabs of a narrow panel
+            let tw = (g.text_w(&name, self.fonts.small) + self.s(14)).min(rw(&o) / 2).min(rx - x);
+            if tw >= self.s(40) {
+                let r = rect(rx - tw, y, rx, y + bs);
+                if self.hover == Hit::TermShellMenu {
+                    g.round_rect(&r, self.s(5), self.t.toolbar_hover, None);
+                }
+                g.text_in(&rect(r.left + self.s(6), r.top, r.right - self.s(6), r.bottom), &name, self.fonts.small, self.t.fg, DT_LINE);
+                self.hits.push((r, Hit::TermShellMenu));
             }
-            g.text_in(&rect(r.left + self.s(6), r.top, r.right - self.s(6), r.bottom), &name, self.fonts.small, self.t.fg, DT_LINE);
-            self.hits.push((r, Hit::TermShellMenu));
             self.paint_terminal(g);
             return;
         }
         self.icon_button(g, xywh(rx, y, bs, bs), '\u{E894}', Hit::Cmd(Cmd::ClearOutput), true);
         let body = self.l.output_body;
-        let lines = git::log_snapshot();
         let lh = self.fonts.mono_small_h;
-        if lines.len() != self.output_seen {
-            self.output_seen = lines.len();
-            self.scroll[Area::Output as usize] = i32::MAX;
-            self.clamp_scroll(Area::Output);
+        // new lines scroll to the end (counted, since the length stops growing once the log is full)
+        // ... but only when the view was at the end, like VS Code (reading further up stays put)
+        let total = git::log_total();
+        if total != self.output_seen {
+            let new = (total - self.output_seen) as i32;
+            let at_end = self.output_seen == 0 || self.scroll[Area::Output as usize] + rh(&body) >= self.content_h(Area::Output) - new.saturating_mul(lh) - lh;
+            self.output_seen = total;
+            if at_end {
+                self.scroll[Area::Output as usize] = i32::MAX;
+                self.clamp_scroll(Area::Output);
+            }
         }
         let scroll = self.scroll[Area::Output as usize];
         let saved = g.clip(&body);
         let first = (scroll / lh).max(0) as usize;
-        for (i, line) in lines.iter().enumerate().skip(first).take((rh(&body) / lh + 2) as usize) {
-            let y = body.top + i as i32 * lh - scroll;
+        for (k, line) in git::log_lines(first, (rh(&body) / lh + 2) as usize).iter().enumerate() {
+            let y = body.top + (first + k) as i32 * lh - scroll;
             let is_err = !line.contains(" > git ");
             let ws = win::w(line);
             g.text_clip(body.left + self.s(20), y, &ws, self.fonts.mono_small, if is_err { self.t.fg_dim } else { self.t.fg }, &body);
@@ -1831,31 +1921,36 @@ impl App {
             g.text_in(&rr, text, app.fonts.small, app.t.fg, DT_LINE | DT_CENTER);
             *x += tw;
         };
-        if let Some(s) = self.status().cloned() {
-            let dirty = if s.count(Group::Changes) > 0 { "*" } else { "" };
-            let staged = if s.count(Group::Staged) > 0 { "+" } else { "" };
-            let conflict = if s.count(Group::Merge) > 0 { "!" } else { "" };
+        // labels first (no copy of the status, which holds every changed file, on each paint)
+        let mut left: Vec<(String, Option<Hit>)> = Vec::new();
+        if let Some(s) = self.status() {
+            let has = |gr: Group| s.files.iter().any(|f| f.group == gr);
+            let dirty = if has(Group::Changes) { "*" } else { "" };
+            let staged = if has(Group::Staged) { "+" } else { "" };
+            let conflict = if has(Group::Merge) { "!" } else { "" };
             let head = match &s.branch {
                 Some(b) => b.clone(),
                 None => s.head.as_deref().map(|h| h[..h.len().min(8)].to_string()).unwrap_or_else(|| "(no commits)".into()),
             };
-            let label = format!("\u{2387} {head}{dirty}{staged}{conflict}");
-            item(self, g, &mut x, &label, Some(Hit::StatusBranch));
+            left.push((format!("\u{2387} {head}{dirty}{staged}{conflict}"), Some(Hit::StatusBranch)));
             if s.upstream.is_some() {
                 let spin = if self.ops.iter().any(|o| o == "Syncing" || o == "Pushing" || o == "Pulling" || o == "Fetching") { ["\u{25D0}", "\u{25D3}", "\u{25D1}", "\u{25D2}"][(self.spin % 4) as usize] } else { "\u{21BB}" };
-                item(self, g, &mut x, &format!("{spin} {}\u{2193} {}\u{2191}", s.behind, s.ahead), Some(Hit::StatusSync));
+                left.push((format!("{spin} {}\u{2193} {}\u{2191}", s.behind, s.ahead), Some(Hit::StatusSync)));
             } else if s.branch.is_some() {
-                item(self, g, &mut x, "\u{2601} Publish", Some(Hit::Cmd(Cmd::Publish)));
+                left.push(("\u{2601} Publish".into(), Some(Hit::Cmd(Cmd::Publish))));
             }
-            if let Some((what, _)) = crate::app::op_in_progress(&s) {
+            if let Some((what, _)) = crate::app::op_in_progress(s) {
                 // abort_op confirms first and picks the right `git <op> --abort`
-                item(self, g, &mut x, &format!("\u{26A0} {what} in progress"), Some(Hit::Cmd(Cmd::MergeAbort)));
+                left.push((format!("\u{26A0} {what} in progress"), Some(Hit::Cmd(Cmd::MergeAbort))));
             }
             if let Some(r) = &self.repo {
                 if !r.stashes.is_empty() {
-                    item(self, g, &mut x, &format!("\u{2630} {} stash{}", r.stashes.len(), if r.stashes.len() == 1 { "" } else { "es" }), Some(Hit::Cmd(Cmd::StashView)));
+                    left.push((format!("\u{2630} {} stash{}", r.stashes.len(), if r.stashes.len() == 1 { "" } else { "es" }), Some(Hit::Cmd(Cmd::StashView))));
                 }
             }
+        }
+        for (label, hit) in left {
+            item(self, g, &mut x, &label, hit);
         }
         if !self.ops.is_empty() {
             let dots = ".".repeat((self.spin % 4) as usize);
@@ -1961,11 +2056,10 @@ impl App {
                 let saved = g.clip(&lr);
                 let scroll = self.scroll[Area::Pick as usize];
                 let mut hits = Vec::new();
-                for (k, &ix) in filtered.iter().enumerate() {
+                // only the visible rows (Go to File lists every file of the repository)
+                let first = (scroll / rh22).max(0) as usize;
+                for (k, &ix) in filtered.iter().enumerate().skip(first).take(vis as usize + 2) {
                     let y = lr.top + k as i32 * rh22 - scroll;
-                    if y + rh22 < lr.top || y > lr.bottom {
-                        continue;
-                    }
                     let it = &items[ix];
                     let row = rect(b.left + self.s(6), y, b.right - self.s(6), y + rh22);
                     if k == *sel {
@@ -1991,7 +2085,8 @@ impl App {
                     if !it.sep.is_empty() {
                         g.text_in(&rect(row.right - right_w, y, row.right - self.s(8), y + rh22), &it.sep, self.fonts.small, self.t.link, DT_LINE | DT_RIGHT);
                     }
-                    hits.push((row, Hit::PickRow(k)));
+                    // a row partly scrolled out doesn't cover the filter box
+                    hits.push((rect(row.left, row.top.max(lr.top), row.right, row.bottom.min(lr.bottom)), Hit::PickRow(k)));
                 }
                 if filtered.is_empty() {
                     g.text_in(&rect(b.left + self.s(16), b.bottom, b.right, b.bottom + rh22), "No matching results", self.fonts.ui, self.t.fg_dim, DT_LINE);
@@ -2104,7 +2199,10 @@ impl App {
                     let r = self.area_rect(a);
                     let content = self.content_h(a);
                     let view = rh(&r).max(1);
-                    let ratio = content as f32 / view as f32;
+                    // the thumb travels view - th pixels for content - view of scrolling (th as
+                    // in draw_scrollbar), so it stays under the pointer at its minimum size too
+                    let th = ((view as f32 * view as f32 / content.max(1) as f32) as i32).max(self.s(20));
+                    let ratio = (content - view).max(0) as f32 / (view - th).max(1) as f32;
                     self.scroll[a as usize] = orig + ((y - start) as f32 * ratio) as i32;
                     self.clamp_scroll(a);
                     self.invalidate();
@@ -2116,9 +2214,12 @@ impl App {
                                 t.sel = Some((a, p));
                             }
                         }
-                        if y < self.term_rect().top {
+                        // auto-scroll through the history; a full-screen app (less, vim) has
+                        // none and would get arrow keys instead
+                        let alt = self.term().is_some_and(|t| t.screen.in_alt_screen());
+                        if !alt && y < self.term_rect().top {
                             self.term_scroll_by(1);
-                        } else if y > self.term_rect().bottom {
+                        } else if !alt && y > self.term_rect().bottom {
                             self.term_scroll_by(-1);
                         }
                         self.invalidate();
@@ -2127,18 +2228,24 @@ impl App {
                 Drag::EditSelect => self.editor_drag(x, y),
                 Drag::Tab(i, start, moved) => self.drag_tab(i, start, moved, x),
                 Drag::DiffSelect => {
-                    if let Hit::DiffRow(r) = self.hit_test(x, y) {
-                        if let MainView::Diff(d) = &mut self.view {
-                            if let Some((a, _)) = d.sel {
-                                d.sel = Some((a, r));
-                            }
-                        }
-                        self.invalidate();
-                    } else if y > self.l.main_body.bottom - self.s(10) {
+                    if y > self.l.main_body.bottom - self.s(10) {
                         self.scroll_by(Area::Main, self.line_h());
                     } else if y < self.l.main_body.top + self.s(10) {
                         self.scroll_by(Area::Main, -self.line_h());
                     }
+                    // the text selection stays on the side it started on
+                    let side = if let MainView::Diff(d) = &self.view { d.tsel.map(|t| t.side) } else { None };
+                    if let Some((_, p)) = self.diff_pos_at(x, y, side) {
+                        if let MainView::Diff(d) = &mut self.view {
+                            if let Some((a, _)) = d.sel {
+                                d.sel = Some((a, p.0));
+                            }
+                            if let Some(t) = &mut d.tsel {
+                                t.cur = p;
+                            }
+                        }
+                    }
+                    self.invalidate();
                 }
             }
             return;
@@ -2512,7 +2619,7 @@ impl App {
         match self.hit_test(x, y) {
             Hit::Sash(Sash::Sidebar) => Some(IDC_SIZEWE),
             Hit::Sash(_) => Some(IDC_SIZENS),
-            Hit::TermBody | Hit::EditorTerm | Hit::EditorText => Some(IDC_IBEAM),
+            Hit::TermBody | Hit::EditorTerm | Hit::EditorText | Hit::DiffRow(_) => Some(IDC_IBEAM),
             // everything that does something when clicked: buttons, links, tabs, list rows
             Hit::Cmd(_)
             | Hit::GroupRow(_)
@@ -2551,9 +2658,9 @@ impl App {
             | Hit::TermKillPanel
             | Hit::TermTab(_)
             | Hit::TermTabKill(_) => Some(IDC_HAND),
-            // text selection in a diff, scroll bar thumbs, the caption buttons (arrow, like
-            // every Windows title bar) and empty space keep the arrow
-            Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::DiffRow(_) | Hit::Thumb(_) | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose => None,
+            // scroll bar thumbs, the caption buttons (arrow, like every Windows title bar) and
+            // empty space keep the arrow
+            Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::Thumb(_) | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose => None,
         }
     }
 
@@ -2600,8 +2707,13 @@ impl App {
                 self.load_log(true);
             }
         }
-        let (mx, my) = self.mouse;
-        self.on_mouse_move(mx, my);
+        // the rows under the pointer change only once the scrolled list is painted
+        self.hover_stale = true;
+        if self.drag.is_some() {
+            // a drag selection follows the scroll
+            let (mx, my) = self.mouse;
+            self.on_mouse_move(mx, my);
+        }
     }
 
     fn select_file_row(&mut self, i: usize, ctrl: bool, shift: bool) {
@@ -2694,11 +2806,23 @@ impl App {
         }
     }
 
+    /// Where the keyboard goes when it leaves the terminal: the side bar's list, or the editor
+    /// while the side bar is hidden (arrows and Del must not act on a list nobody sees).
+    pub fn side_focus(&self) -> Focus {
+        if !self.st.sidebar_visible {
+            Focus::Main
+        } else if self.st.side_view == 1 {
+            Focus::Explorer
+        } else {
+            Focus::Changes
+        }
+    }
+
     pub fn on_lbutton_down(&mut self, x: i32, y: i32, ctrl: bool, shift: bool) {
         self.hide_tip();
         let hit = self.hit_test(x, y);
         if self.focus == Focus::Terminal && !matches!(hit, Hit::TermBody | Hit::EditorTerm | Hit::TermShellMenu | Hit::TermTab(_) | Hit::TermTabKill(_) | Hit::PanelTab(_) | Hit::Cmd(_) | Hit::Sash(_)) {
-            self.focus = Focus::Changes;
+            self.focus = self.side_focus();
         }
         unsafe {
             if GetFocus() != self.hwnd && hit != Hit::Backdrop && !matches!(hit, Hit::None) && self.overlay.is_none() {
@@ -2828,6 +2952,11 @@ impl App {
             }
             Hit::DiffRow(r) => {
                 self.focus = Focus::Main;
+                let side = match &self.view {
+                    MainView::Diff(d) if shift => d.tsel.map(|t| t.side),
+                    _ => None,
+                };
+                let pos = self.diff_pos_at(x, y, side);
                 if let MainView::Diff(d) = &mut self.view {
                     if shift {
                         let a = d.sel.map(|s| s.0).unwrap_or(r);
@@ -2835,6 +2964,12 @@ impl App {
                     } else {
                         d.sel = Some((r, r));
                     }
+                    // Shift extends the text selection; a click starts one on the side clicked
+                    d.tsel = match (d.tsel, pos) {
+                        (Some(t), Some((_, p))) if shift => Some(crate::app::TextSel { cur: p, ..t }),
+                        (_, Some((side, p))) => Some(crate::app::TextSel { side, anchor: p, cur: p }),
+                        (t, None) => t,
+                    };
                 }
                 self.drag = Some(Drag::DiffSelect);
             }
@@ -2890,7 +3025,7 @@ impl App {
                 } else {
                     self.st.panel_terminal = false;
                     self.st.save();
-                    self.focus = Focus::Changes;
+                    self.focus = self.side_focus();
                     self.layout();
                 }
             }
@@ -2978,7 +3113,7 @@ impl App {
         self.invalidate();
     }
 
-    pub fn on_dblclick(&mut self, x: i32, y: i32) {
+    pub fn on_dblclick(&mut self, x: i32, y: i32, ctrl: bool, shift: bool) {
         match self.hit_test(x, y) {
             // like VS Code: the first click opened a preview tab, the double click keeps it open
             Hit::FileRow(_) | Hit::GraphRow(_) | Hit::Tab(_) => self.keep_tab(self.tab_active),
@@ -2987,12 +3122,17 @@ impl App {
                 self.focus = Focus::Main;
             }
             Hit::EditorText => self.editor_dblclick(x, y),
+            Hit::DiffRow(_) => self.diff_select_word(x, y),
             Hit::CommitFile(i) => {
                 self.open_commit_file(i);
                 self.keep_tab(self.tab_active);
             }
             Hit::BranchRow(i) if matches!(self.brows.get(i), Some(BRow::Ref(_))) => self.branch_activate(i),
             Hit::TermBody | Hit::EditorTerm => self.term_select_word(x, y),
+            // a second click on buttons used in quick succession (closing tabs, staging files,
+            // stepping through changes); toggles (sections, folders, views), commits and
+            // terminal create / kill buttons take one action per double click
+            Hit::TabClose(_) | Hit::ToastClose(_) | Hit::FileAct(..) | Hit::DirAct(..) | Hit::GroupAct(..) | Hit::DiffBlock(..) | Hit::Cmd(Cmd::NextChange | Cmd::PrevChange) | Hit::Thumb(_) | Hit::Sash(_) => self.on_lbutton_down(x, y, ctrl, shift),
             _ => {}
         }
     }
@@ -3091,7 +3231,8 @@ impl App {
     /// Middle click closes a tab.
     pub fn on_mbutton_up(&mut self, x: i32, y: i32) {
         if let Hit::Tab(i) | Hit::TabClose(i) = self.hit_test(x, y) {
-            if !self.tabs[i].pinned {
+            // hits are from the last paint: a tab closed since may be gone
+            if self.tabs.get(i).is_some_and(|t| !t.pinned) {
                 self.close_tab(i);
             }
         }
@@ -3369,14 +3510,73 @@ impl App {
     /// How far the diff scrolls sideways: until its longest line is in view, roughly (the
     /// line-number gutter is estimated). Other views (the editor) are not limited here.
     fn diff_hscroll_max(&self) -> i32 {
-        let MainView::Diff(d) = &self.view else { return i32::MAX / 2 };
         let width = rw(&self.l.main_body) - self.s(12);
-        let pane = if d.inline { width } else { width / 2 } - self.s(80);
-        (d.max_cols as i32 * self.fonts.mono_w - pane + self.fonts.mono_w * 4).max(0)
+        let (cols, pane) = match &self.view {
+            MainView::Diff(d) => (d.max_cols, if d.inline { width } else { width / 2 } - self.s(80)),
+            // the longest line (tabs count as up to 4 columns), next to the line numbers
+            MainView::File(f) => (f.lines.iter().map(|l| l.chars().count() + l.matches('\t').count() * 3).max().unwrap_or(0), width - self.s(80)),
+            _ => return 0,
+        };
+        (cols as i32 * self.fonts.mono_w - pane + self.fonts.mono_w * 4).max(0)
+    }
+
+    /// Side and (row, char column) of the diff text at `x`, `y`; `side` picks the side
+    /// instead of the one under the pointer (a drag stays on the side it started on).
+    pub fn diff_pos_at(&self, x: i32, y: i32, side: Option<u8>) -> Option<(u8, (usize, usize))> {
+        let MainView::Diff(d) = &self.view else { return None };
+        if d.rows.is_empty() {
+            return None;
+        }
+        let body = self.l.main_body;
+        let (lh, mw) = (self.line_h().max(1), self.fonts.mono_w.max(1));
+        let inline = self.st.inline_diff;
+        let digits = d.fd.hunks.iter().map(|h| (h.old_start + h.old_len).max(h.new_start + h.new_len)).max().unwrap_or(1).to_string().len() as i32;
+        let num_w = digits.max(3) * mw + self.s(14);
+        let width = rw(&body) - self.s(12);
+        let side = if inline { 0 } else { side.unwrap_or(if x >= body.left + width / 2 { 1 } else { 0 }) };
+        let row = ((y - body.top - self.s(4) + self.scroll[Area::Main as usize]).max(0) / lh) as usize;
+        let row = row.min(d.rows.len() - 1);
+        // as painted: the side's left edge, its line numbers, the +/- marker
+        let side_x = if side == 1 { body.left + width / 2 } else { body.left };
+        let tx = side_x + if inline { num_w * 2 } else { num_w } + mw + self.s(6) - self.hscroll;
+        let col = match d.side_line(row, side) {
+            Some(l) => crate::editor::col_at_vcol(l.text.trim_end_matches('\r'), ((x - tx).max(0) * 2 / mw) as usize),
+            None => 0,
+        };
+        Some((side, (row, col)))
+    }
+
+    /// Double click in a diff: selects the word under the pointer on that side.
+    fn diff_select_word(&mut self, x: i32, y: i32) {
+        let Some((side, (row, col))) = self.diff_pos_at(x, y, None) else { return };
+        let MainView::Diff(d) = &mut self.view else { return };
+        let Some(l) = d.side_line(row, side) else { return };
+        let chars: Vec<char> = l.text.trim_end_matches('\r').chars().collect();
+        if chars.is_empty() {
+            return;
+        }
+        let at = col.min(chars.len() - 1);
+        let c = crate::editor::class(chars[at]);
+        let (mut s, mut e) = (at, at + 1);
+        while s > 0 && crate::editor::class(chars[s - 1]) == c {
+            s -= 1;
+        }
+        while e < chars.len() && crate::editor::class(chars[e]) == c {
+            e += 1;
+        }
+        d.tsel = Some(crate::app::TextSel { side, anchor: (row, s), cur: (row, e) });
+        d.sel = Some((row, row));
+        self.drag = None;
+        self.invalidate();
     }
 
     pub fn copy_diff_selection(&mut self) {
         let MainView::Diff(d) = &self.view else { return };
+        // text selected on one side is copied as it is
+        if let Some(t) = d.selected_text() {
+            win::set_clipboard(self.hwnd, &t);
+            return;
+        }
         let Some((a, b)) = d.sel else { return };
         let mut out = String::new();
         let rows = || d.rows.iter().take(a.max(b) + 1).skip(a.min(b)).filter_map(|r| r.right.or(r.left));
@@ -3527,7 +3727,9 @@ impl App {
         match vk {
             0x09 => {
                 // visual order, skipping collapsed sections; Shift+Tab goes backwards
-                let order: Vec<Focus> = if self.st.sidebar_visible && self.st.side_view == 1 {
+                let order: Vec<Focus> = if !self.st.sidebar_visible {
+                    vec![Focus::Main]
+                } else if self.st.side_view == 1 {
                     vec![Focus::Explorer, Focus::Main]
                 } else {
                     [Some(Focus::Changes), self.st.graph_open.then_some(Focus::Graph), self.st.branches_open.then_some(Focus::Branches), Some(Focus::Main)].into_iter().flatten().collect()
@@ -3746,14 +3948,27 @@ impl App {
             let n = cv.files.len();
             if n > 0 && matches!(vk, 0x26 | 0x28 | 0x0D) {
                 let cur = cv.sel.unwrap_or(0);
-                match vk {
-                    0x26 => cv.sel = Some(cur.saturating_sub(1)),
-                    0x28 => cv.sel = Some(if cv.sel.is_none() { 0 } else { (cur + 1).min(n - 1) }),
+                let sel = match vk {
+                    0x26 => cur.saturating_sub(1),
+                    0x28 => if cv.sel.is_none() { 0 } else { (cur + 1).min(n - 1) },
                     _ => {
                         self.open_commit_file(cur);
                         return;
                     }
+                };
+                cv.sel = Some(sel);
+                // keep the selected file in view (rows sit below the commit header)
+                let (rh22, view) = (self.s(22), rh(&self.l.main_body));
+                let MainView::Commit(cv) = &self.view else { return };
+                let top = self.s(12) + self.commit_header_h(cv) + sel as i32 * rh22;
+                let s = &mut self.scroll[Area::Main as usize];
+                if top < *s {
+                    *s = top;
+                } else if top + rh22 > *s + view {
+                    *s = top + rh22 - view;
                 }
+                self.clamp_scroll(Area::Main);
+                self.invalidate();
                 return;
             }
         }
@@ -3771,10 +3986,23 @@ impl App {
             }
             (0x27, _) => self.hscroll = (self.hscroll + self.fonts.mono_w * 8).min(self.diff_hscroll_max()),
             (0x43, true) => self.copy_diff_selection(),
+            // all the text of one side: the one selected in, else the modified one
+            (0x41, true) => {
+                let inline = self.st.inline_diff;
+                if let MainView::Diff(d) = &mut self.view {
+                    if !d.rows.is_empty() {
+                        let side = if inline { 0 } else { d.tsel.map(|t| t.side).unwrap_or(1) };
+                        let last = d.rows.len() - 1;
+                        d.tsel = Some(crate::app::TextSel { side, anchor: (0, 0), cur: (last, usize::MAX) });
+                        d.sel = Some((0, last));
+                    }
+                }
+            }
             (0x08, _) => self.go_back(),
             (0x1B, _) => {
                 if let MainView::Diff(d) = &mut self.view {
                     d.sel = None;
+                    d.tsel = None;
                 }
             }
             (0x53, false) => self.apply_lines(None, 0),
