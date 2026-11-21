@@ -333,3 +333,80 @@ fn diff_text_selection_copies_one_side() {
     d.tsel = Some(crate::app::TextSel { side: 1, anchor: (same, 2), cur: (same, 2) });
     assert_eq!(d.selected_text(), None);
 }
+
+#[test]
+fn fuzzy_scores_word_starts_and_runs() {
+    use crate::fuzzy::{pattern, score};
+    let s = |q: &str, t: &str| score(&pattern(q), t, None);
+    let pos = |q: &str, t: &str| {
+        let mut p = Vec::new();
+        score(&pattern(q), t, Some(&mut p)).unwrap();
+        p
+    };
+    assert_eq!(s("xyz", "app.rs"), None);
+    assert_eq!(s("", "app.rs"), Some(0));
+    // case-insensitive, in order
+    assert!(s("APP", "app.rs").is_some());
+    assert_eq!(s("pa", "app.rs"), None);
+    // a prefix beats a match in the middle of a word
+    assert!(s("app", "app.rs") > s("app", "wrapper.rs"));
+    // consecutive beats scattered
+    assert!(s("main", "main.rs") > s("main", "my_awesome_init.rs"));
+    // word starts: "ui" in "src/ui.rs" is picked over the "u...i" of "build"
+    assert_eq!(pos("ui", "build/ui.rs"), vec![6, 7]);
+    // camelCase starts
+    assert_eq!(pos("fb", "fooBar.ts"), vec![0, 3]);
+    // '\' typed for '/'
+    assert_eq!(pos("src\\a", "src/a.rs"), vec![0, 1, 2, 3, 4]);
+    // non-ASCII text keeps char positions
+    assert_eq!(pos("üb", "Über.txt"), vec![0, 1]);
+    assert_eq!(crate::fuzzy::substring_positions(&[pattern("ile")], "Go to File..."), vec![7, 8, 9]);
+}
+
+#[test]
+fn quick_open_ranks_names_over_paths() {
+    use crate::quickopen::{highlights, rank, split_line};
+    let words = |q: &str| q.split_whitespace().map(crate::fuzzy::pattern).collect::<Vec<_>>();
+    let r = |q: &str, p: &str| rank(&words(q), p.rsplit('/').next().unwrap(), p);
+    // the name matches: above any path-only match
+    assert!(r("app", "src/app.rs") > r("app", "app/src/main.rs"));
+    // the whole name or stem: above a longer name
+    assert!(r("app", "src/app.rs") > r("app", "src/apples.rs"));
+    assert!(r("app.rs", "x/app.rs") > r("app.rs", "x/app_rs.rs"));
+    // every word must match, in the name or the path
+    assert!(r("src ui", "src/ui.rs").is_some());
+    assert!(r("src ui", "lib/ui.rs").is_none());
+    assert!(r("src/ui", "src/ui.rs").is_some());
+    // highlights: name chars in the label, folder chars in the description
+    assert_eq!(highlights(&words("ui"), "ui.rs", "src", "src/ui.rs"), (vec![0, 1], vec![]));
+    assert_eq!(highlights(&words("src/ui"), "ui.rs", "src", "src/ui.rs"), (vec![0, 1], vec![0, 1, 2]));
+    // name:line[:column]
+    assert_eq!(split_line("app.rs:12"), ("app.rs", Some((12, None))));
+    assert_eq!(split_line("app.rs:12:5"), ("app.rs", Some((12, Some(5)))));
+    assert_eq!(split_line("app.rs:12,5"), ("app.rs", Some((12, Some(5)))));
+    assert_eq!(split_line(":40"), ("", Some((40, None))));
+    assert_eq!(split_line("app.rs:"), ("app.rs", None));
+    assert_eq!(split_line("C:\\dev\\x"), ("C:\\dev\\x", None));
+    assert_eq!(split_line("app"), ("app", None));
+}
+
+#[test]
+fn quick_open_lists_files() {
+    let r = TempRepo::new("quickopen");
+    std::fs::create_dir_all(r.root().join("src")).unwrap();
+    r.write("src/main.rs", "fn main() {}\n");
+    r.write("gone.txt", "x\n");
+    r.write(".gitignore", "target/\n");
+    git::exec(r.root(), &["add", "."]).unwrap();
+    git::exec(r.root(), &["commit", "-q", "-m", "init"]).unwrap();
+    std::fs::remove_file(r.root().join("gone.txt")).unwrap();
+    r.write("new.txt", "untracked\n");
+    std::fs::create_dir_all(r.root().join("target")).unwrap();
+    r.write("target/out.bin", "ignored\n");
+    // tracked and untracked; not deleted, not ignored; sorted
+    assert_eq!(crate::quickopen::list_files(r.root(), true), vec![".gitignore", "new.txt", "src/main.rs"]);
+    // a folder without a repository: every file outside hidden folders
+    let mut all = crate::quickopen::list_files(r.root(), false);
+    all.retain(|p| !p.starts_with("target/"));
+    assert_eq!(all, vec![".gitignore", "new.txt", "src/main.rs"]);
+}

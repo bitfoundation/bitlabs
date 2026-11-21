@@ -65,6 +65,7 @@ impl App {
             if pin {
                 self.tabs[i].preview = false;
             }
+            self.note_history();
             return true;
         }
         // like VS Code there is one preview tab: a preview open replaces it wherever it is (a
@@ -90,6 +91,7 @@ impl App {
         }
         self.scroll[Area::Main as usize] = 0;
         self.hscroll = 0;
+        self.note_history();
         false
     }
 
@@ -133,6 +135,7 @@ impl App {
         self.view = std::mem::replace(&mut t.view, MainView::Empty);
         self.scroll[Area::Main as usize] = t.scroll;
         self.hscroll = t.hscroll;
+        self.note_history();
     }
 
     pub fn activate_tab(&mut self, i: usize) {

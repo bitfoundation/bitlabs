@@ -104,36 +104,6 @@ pub fn build_rows(root: &Path, open: &HashSet<String>) -> Vec<ERow> {
     out
 }
 
-/// Files under `root` for "Go to File..." in a folder without a repository (no .gitignore to
-/// go by): skips hidden folders and node_modules, and stops after 20,000 files.
-fn list_files(root: &Path) -> Vec<String> {
-    const MAX: usize = 20_000;
-    let mut out = Vec::new();
-    let mut stack = vec![String::new()];
-    while let Some(rel) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(root.join(&rel)) else { continue };
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            match e.file_type() {
-                Ok(t) if t.is_dir() => {
-                    if !name.starts_with('.') && name != "node_modules" {
-                        stack.push(path);
-                    }
-                }
-                Ok(t) if t.is_file() => {
-                    out.push(path);
-                    if out.len() >= MAX {
-                        return out;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    out
-}
-
 /// Ignored files and folders (folders are reported once, not their contents).
 pub fn ignored(root: &Path) -> HashSet<String> {
     let o = git::run(root, &["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"], None, true);
@@ -342,31 +312,6 @@ impl App {
         });
     }
 
-    /// "Go to File..." (Ctrl+P): picks any tracked or untracked (not ignored) file to view.
-    pub fn goto_file(&mut self) {
-        let Some(root) = self.folder() else { return };
-        let text = if self.repo.is_some() { git::run(&root, &["ls-files", "--cached", "--others", "--exclude-standard", "-z"], None, true).text() } else { list_files(&root).join("\0") };
-        let mut paths: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-        paths.sort_by_cached_key(|p| p.to_lowercase());
-        paths.dedup();
-        let items: Vec<PickItem> = paths
-            .into_iter()
-            .map(|p| {
-                let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
-                pi(name, dir, '\u{E8A5}', p)
-            })
-            .collect();
-        if items.is_empty() {
-            self.info("There are no files in this repository.");
-            return;
-        }
-        self.pick("Search files by name", items, |app, it| {
-            let rel = it.data.clone();
-            app.open_file_viewer(rel, true);
-        });
-        self.pick_rank = true;
-    }
-
     /// Context menu of Explorer row `i` (usize::MAX: empty space).
     pub fn explorer_menu(&mut self, i: usize, m: &mut Menu) -> Vec<MenuItem> {
         let mut v = vec![m.it("New File...", move |a| a.explorer_new(i, false)), m.it("New Folder...", move |a| a.explorer_new(i, true)), MenuItem::Sep];
@@ -467,7 +412,7 @@ impl App {
     }
 
     /// Expands the folders down to `rel`, selects it and scrolls it into view.
-    fn explorer_reveal(&mut self, rel: &str) {
+    pub fn explorer_reveal(&mut self, rel: &str) {
         let mut p = rel;
         while let Some((parent, _)) = p.rsplit_once('/') {
             self.ex.open.insert(parent.to_string());

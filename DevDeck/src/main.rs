@@ -10,8 +10,10 @@ mod cli;
 mod diff;
 mod editor;
 mod explorer;
+mod fuzzy;
 mod git;
 mod graph;
+mod quickopen;
 mod settings;
 mod tabs;
 mod term;
@@ -583,7 +585,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if asked {
                 return 0;
             }
-            with_app(hwnd, |a| save_placement(hwnd, a));
+            with_app(hwnd, |a| {
+                save_placement(hwnd, a);
+                a.save_history();
+            });
             DestroyWindow(hwnd);
             0
         }
@@ -697,6 +702,14 @@ unsafe extern "system" fn overlay_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
             if matches!(vk, 0x26 | 0x28 | 0x21 | 0x22 | 0x0D | 0x1B) && with_app(main, |a| a.overlay_key(vk)).unwrap_or(false) {
                 return 0;
             }
+            // Ctrl+P / Ctrl+Shift+P (F1): the same picker again selects the next item, the other
+            // one switches pickers (Go to File <-> Command Palette), like VS Code
+            let (ctrl, shift) = (key_down(VK_CONTROL), key_down(VK_SHIFT));
+            if (ctrl && vk == 0x50 || vk == VK_F1 && !ctrl) && !altgr_char(vk) {
+                win::drop_char(hwnd);
+                with_app(main, |a| a.pick_shortcut(shift || vk == VK_F1));
+                return 0;
+            }
             if key_down(VK_CONTROL) && !key_down(VK_SHIFT) && vk == 0x41 && !altgr_char(vk) {
                 SendMessageW(hwnd, 0x00B1, 0, -1);
                 return 0;
@@ -704,6 +717,12 @@ unsafe extern "system" fn overlay_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp
         }
         WM_CHAR => {
             if wp == 0x0D || wp == 0x1B || wp == 0x01 || wp == 0x7F {
+                return 0;
+            }
+        }
+        WM_KEYUP => {
+            // Ctrl released after Ctrl+P, P...: opens the file selected by the extra P presses
+            if wp as u16 == VK_CONTROL && with_app(main, |a| a.pick_ctrl_up()).unwrap_or(false) {
                 return 0;
             }
         }

@@ -2031,6 +2031,45 @@ impl App {
 
     // ------------------------------------------------------------- overlay
 
+    /// Draws `text` at `x` (centered in the row `y`..`y + h`, cut with an ellipsis at `right`)
+    /// with the chars at `hl` (sorted char indices) in the match color and `fonts.1`; returns
+    /// where the text ends.
+    fn draw_highlighted(&self, g: &Gfx, x: i32, y: i32, h: i32, right: i32, text: &str, hl: &[usize], fonts: (HFONT, HFONT), color: u32) -> i32 {
+        if hl.is_empty() {
+            g.text_in(&rect(x, y, right, y + h), text, fonts.0, color, DT_LINE);
+            return (x + g.text_w(text, fonts.0)).min(right);
+        }
+        // runs of matched / unmatched chars
+        let mut runs: Vec<(usize, usize, bool)> = Vec::new();
+        let mut k = 0;
+        for (ci, (bi, _)) in text.char_indices().enumerate() {
+            let on = hl.get(k) == Some(&ci);
+            if on {
+                k += 1;
+            }
+            match runs.last_mut() {
+                Some(r) if r.2 == on => {}
+                _ => {
+                    if let Some(r) = runs.last_mut() {
+                        r.1 = bi;
+                    }
+                    runs.push((bi, text.len(), on));
+                }
+            }
+        }
+        let mut cx = x;
+        for (a, b, on) in runs {
+            if cx >= right {
+                break;
+            }
+            let part = &text[a..b];
+            let f = if on { fonts.1 } else { fonts.0 };
+            g.text_in(&rect(cx, y, right, y + h), part, f, if on { self.t.match_fg } else { color }, DT_LINE);
+            cx += g.text_w(part, f);
+        }
+        cx.min(right)
+    }
+
     fn paint_overlay(&mut self, g: &Gfx) {
         self.overlay_bounds = None;
         if self.overlay.is_none() {
@@ -2043,6 +2082,7 @@ impl App {
         let Some(ov) = &self.overlay else { return };
         match &ov.kind {
             OverlayKind::Pick { items, filtered, sel, .. } => {
+                let files = self.pick_mode == crate::quickopen::PickMode::Files;
                 let vis = (filtered.len() as i32).min(15);
                 let total = rect(b.left, b.top, b.right, b.bottom + vis * rh22 + self.s(6));
                 let shadow = rect(total.left - 1, total.top - 1, total.right + 1, total.bottom + 1);
@@ -2076,20 +2116,36 @@ impl App {
                         }
                         x += self.s(22);
                     }
-                    let right_w = if it.sep.is_empty() { 0 } else { g.text_w(&it.sep, self.fonts.small) + self.s(12) };
-                    let lw = g.text_w(&it.label, self.fonts.ui);
-                    g.text_in(&rect(x, y, row.right - right_w, y + rh22), &it.label, self.fonts.ui, if k == *sel { self.t.fg_strong } else { self.t.fg }, DT_LINE);
-                    if !it.desc.is_empty() && x + lw + self.s(10) < row.right - right_w {
-                        g.text_in(&rect(x + lw + self.s(8), y, row.right - right_w, y + rh22), &it.desc, self.fonts.small, self.t.fg_dim, DT_LINE);
+                    // Go to File: the first row of a group ("recently opened", "file results")
+                    // carries its name, with a line above it like VS Code
+                    let group = if files { self.qo.groups.iter().find(|(r, _)| *r == k).map(|(_, n)| *n) } else { None };
+                    if group.is_some() && k > 0 {
+                        g.hline(row.left, row.right, y, self.t.widget_border);
                     }
-                    if !it.sep.is_empty() {
-                        g.text_in(&rect(row.right - right_w, y, row.right - self.s(8), y + rh22), &it.sep, self.fonts.small, self.t.link, DT_LINE | DT_RIGHT);
+                    let right = if it.sep.is_empty() { group.unwrap_or("") } else { it.sep.as_str() };
+                    let right_w = if right.is_empty() { 0 } else { g.text_w(right, self.fonts.small) + self.s(12) };
+                    let (hl_label, hl_desc) = if files {
+                        crate::quickopen::highlights(&self.qo.words, &it.label, &it.desc, &it.data)
+                    } else {
+                        (crate::fuzzy::substring_positions(&self.qo.words, &it.label), crate::fuzzy::substring_positions(&self.qo.words, &it.desc))
+                    };
+                    // changed files keep their git status color, like VS Code's decorations
+                    let deco = if files { self.qo.deco.get(&it.data).map(|k| self.kind_color(*k)) } else { None };
+                    let color = deco.unwrap_or(if k == *sel { self.t.fg_strong } else { self.t.fg });
+                    let lim = row.right - right_w;
+                    let lx = self.draw_highlighted(g, x, y, rh22, lim, &it.label, &hl_label, (self.fonts.ui, self.fonts.ui_bold), color);
+                    if !it.desc.is_empty() && lx + self.s(10) < lim {
+                        self.draw_highlighted(g, lx + self.s(8), y, rh22, lim, &it.desc, &hl_desc, (self.fonts.small, self.fonts.small), self.t.fg_dim);
+                    }
+                    if !right.is_empty() {
+                        g.text_in(&rect(row.right - right_w, y, row.right - self.s(8), y + rh22), right, self.fonts.small, self.t.link, DT_LINE | DT_RIGHT);
                     }
                     // a row partly scrolled out doesn't cover the filter box
                     hits.push((rect(row.left, row.top.max(lr.top), row.right, row.bottom.min(lr.bottom)), Hit::PickRow(k)));
                 }
                 if filtered.is_empty() {
-                    g.text_in(&rect(b.left + self.s(16), b.bottom, b.right, b.bottom + rh22), "No matching results", self.fonts.ui, self.t.fg_dim, DT_LINE);
+                    let msg = if files && self.qo.loading { "Loading files..." } else { "No matching results" };
+                    g.text_in(&rect(b.left + self.s(16), b.bottom, b.right, b.bottom + rh22), msg, self.fonts.ui, self.t.fg_dim, DT_LINE);
                 }
                 g.unclip(saved);
                 self.hits.push((total, Hit::None));
@@ -3612,7 +3668,8 @@ impl App {
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),                 // Ctrl+Shift+M
             (0x42, true, false) => Some(Cmd::ToggleSidebar),                 // Ctrl+B
             (0x45, true, true) => Some(Cmd::ShowExplorer),                   // Ctrl+Shift+E
-            (0x50, true, false) => Some(Cmd::GotoFile),                      // Ctrl+P
+            (0x50, true, false) | (0x45, true, false) => Some(Cmd::GotoFile), // Ctrl+P, Ctrl+E
+            (0x47, true, false) => Some(Cmd::GotoLine),                      // Ctrl+G
             (0x53, true, false) => Some(Cmd::Save),                          // Ctrl+S
             (0x57, true, false) | (0x73, true, false) => Some(Cmd::CloseEditor), // Ctrl+W, Ctrl+F4
             (0x09, true, false) | (0x22, true, false) => Some(Cmd::NextEditor), // Ctrl+Tab, Ctrl+PageDown

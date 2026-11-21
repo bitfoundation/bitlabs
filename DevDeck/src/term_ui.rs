@@ -669,6 +669,7 @@ impl App {
         // workbench shortcuts that win over the shell (like VS Code's defaults)
         let cmd = match (vk, ctrl, shift) {
             (0x50, true, true) | (0x70, false, false) => Some(Cmd::Palette),
+            (0x50, true, false) if !alt => Some(Cmd::GotoFile),
             (0xC0, true, false) if alt => Some(Cmd::NewTerminal),
             (0xC0, true, false) => Some(Cmd::ToggleTerminal),
             (0xC0, true, true) => Some(Cmd::ToggleEditorTerminal),

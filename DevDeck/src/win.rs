@@ -88,6 +88,8 @@ pub struct Fonts {
     pub ui: HFONT,
     /// Italic UI font (preview tabs).
     pub ui_italic: HFONT,
+    /// Bold UI font (matched characters in Quick Open).
+    pub ui_bold: HFONT,
     pub bold: HFONT,
     pub small: HFONT,
     pub mono: HFONT,
@@ -123,6 +125,7 @@ impl Fonts {
             mono_small_h: s(17.0),
             ui: create_font(s(13.0), 400, "Segoe UI"),
             ui_italic: create_font_ex(s(13.0), 400, true, "Segoe UI"),
+            ui_bold: create_font(s(13.0), 700, "Segoe UI"),
             bold: create_font(s(11.0), 700, "Segoe UI"),
             small: create_font(s(12.0), 400, "Segoe UI"),
             mono,
@@ -139,7 +142,7 @@ impl Fonts {
 impl Drop for Fonts {
     fn drop(&mut self) {
         unsafe {
-            for f in [self.ui, self.ui_italic, self.bold, self.small, self.mono, self.icon, self.icon_small, self.big, self.cap, self.mono_small, self.icon_big] {
+            for f in [self.ui, self.ui_italic, self.ui_bold, self.bold, self.small, self.mono, self.icon, self.icon_small, self.big, self.cap, self.mono_small, self.icon_big] {
                 DeleteObject(f as HGDIOBJ);
             }
         }

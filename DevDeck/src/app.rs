@@ -34,6 +34,8 @@ pub enum JobResult {
     Refresh { gen: u64, status: GitResult<Status>, refs: Vec<RefInfo>, stashes: Vec<Stash>, ignored: Option<HashSet<String>> },
     Log { gen: u64, commits: Vec<Commit>, more: bool, append: bool },
     View { gen: u64, view: MainView, keep_scroll: bool },
+    /// Files of `root` for Quick Open (see `quickopen.rs`).
+    Files { gen: u64, root: PathBuf, files: Vec<String> },
     /// `root`: the repository the op ran in; its callbacks are dropped when another one is open
     /// by the time it finishes (None = always run them).
     Op { title: String, root: Option<PathBuf>, result: GitResult<String>, then: Option<Then>, on_err: Option<OnErr> },
@@ -505,6 +507,7 @@ cmds! {
     ShowExplorer => "View: Show Explorer", "Ctrl+Shift+E";
     ShowScm => "View: Show Source Control", "";
     GotoFile => "Go to File...", "Ctrl+P";
+    GotoLine => "Go to Line/Column...", "Ctrl+G";
     Save => "File: Save", "Ctrl+S";
     SaveAll => "File: Save All", "";
     RevertFile => "File: Revert File", "";
@@ -588,8 +591,10 @@ pub struct App {
     pub overlay_prev_focus: HWND,
     /// The commit box or quick pick that had the keyboard when the window was deactivated.
     pub saved_focus: HWND,
-    /// The open quick pick ranks its matches by file name (Go to File).
-    pub pick_rank: bool,
+    /// What the open quick pick is (Go to File filters and paints its own way).
+    pub pick_mode: crate::quickopen::PickMode,
+    /// Quick Open (Go to File) state: the file list, the recently opened files.
+    pub qo: crate::quickopen::QuickOpen,
     /// Lowercased search text of each quick pick item and the length of its name part, made
     /// once when the pick opens instead of on every keystroke.
     pub pick_hay: Vec<(String, usize)>,
@@ -737,7 +742,8 @@ impl App {
             overlay_edit: std::ptr::null_mut(),
             overlay_prev_focus: std::ptr::null_mut(),
             saved_focus: std::ptr::null_mut(),
-            pick_rank: false,
+            pick_mode: Default::default(),
+            qo: Default::default(),
             pick_hay: Vec::new(),
             edit_brush: std::ptr::null_mut(),
             edit_lines: 1,
@@ -1028,9 +1034,12 @@ impl App {
                     self.has_more = more;
                     self.rebuild_graph();
                 }
+                JobResult::Files { gen, root, files } => self.on_files_listed(gen, root, files),
                 JobResult::View { gen, view, keep_scroll } => {
                     // route the result to the tab that asked for it (it may be in the background now)
                     let Some(ti) = self.tabs.iter().position(|t| t.gen == gen) else { continue };
+                    // a line typed in Quick Open ("app.rs:120") for the file loading in this tab
+                    let goto = self.take_pending_goto(gen);
                     if ti != self.tab_active {
                         let t = &mut self.tabs[ti];
                         // the tab was edited since the reload started: keep the edits
@@ -1082,6 +1091,9 @@ impl App {
                                 }
                             }
                         }
+                    }
+                    if let Some((l, c)) = goto {
+                        self.goto_line(l, c);
                     }
                 }
                 JobResult::Op { title, root, result, then, on_err } => {
@@ -1376,16 +1388,24 @@ impl App {
     }
 
     pub fn pick(&mut self, placeholder: &str, items: Vec<PickItem>, on_pick: impl FnOnce(&mut App, &PickItem) + 'static) {
+        self.open_pick(placeholder, items, crate::quickopen::PickMode::Other, on_pick);
+    }
+
+    pub fn open_pick(&mut self, placeholder: &str, items: Vec<PickItem>, mode: crate::quickopen::PickMode, on_pick: impl FnOnce(&mut App, &PickItem) + 'static) {
         self.remember_focus();
-        self.pick_rank = false;
-        // the name, the description, and both as a path ("src/ui.rs") for file picks
-        self.pick_hay = items
-            .iter()
-            .map(|it| {
-                let (name, desc) = (it.label.to_lowercase(), it.desc.to_lowercase());
-                (format!("{name} {desc} {desc}/{name}"), name.len())
-            })
-            .collect();
+        self.end_pick();
+        self.pick_mode = mode;
+        // the name, the description, and both as a path ("src/ui.rs"); Go to File matches
+        // the items' own fields instead
+        if mode != crate::quickopen::PickMode::Files {
+            self.pick_hay = items
+                .iter()
+                .map(|it| {
+                    let (name, desc) = (it.label.to_lowercase(), it.desc.to_lowercase());
+                    (format!("{name} {desc} {desc}/{name}"), name.len())
+                })
+                .collect();
+        }
         let filtered = (0..items.len()).collect();
         self.overlay = Some(Overlay { kind: OverlayKind::Pick { items, filtered, sel: 0, on_pick: Some(Box::new(on_pick)) } });
         self.scroll[Area::Pick as usize] = 0;
@@ -1394,12 +1414,14 @@ impl App {
 
     pub fn input(&mut self, prompt: &str, value: &str, on_ok: impl FnOnce(&mut App, String) + 'static) {
         self.remember_focus();
+        self.end_pick();
         self.overlay = Some(Overlay { kind: OverlayKind::Input { prompt: format!("{prompt} (Press 'Enter' to confirm or 'Escape' to cancel)"), on_ok: Some(Box::new(on_ok)) } });
         self.show_overlay_edit(prompt, value);
     }
 
     pub fn confirm(&mut self, message: &str, detail: &str, buttons: &[&str], on_choice: impl FnOnce(&mut App, usize) + 'static) {
         self.remember_focus();
+        self.end_pick();
         let mut b: Vec<String> = buttons.iter().map(|s| s.to_string()).collect();
         b.push("Cancel".into());
         self.overlay = Some(Overlay { kind: OverlayKind::Confirm { message: message.into(), detail: detail.into(), buttons: b, sel: 0, on_choice: Some(Box::new(on_choice)) } });
@@ -1412,36 +1434,40 @@ impl App {
 
     pub fn close_overlay(&mut self) {
         self.overlay = None;
-        self.pick_hay = Vec::new();
+        self.end_pick();
         self.hide_overlay_edit();
         self.restore_focus();
         self.invalidate();
     }
 
     pub fn filter_pick(&mut self) {
+        let raw = win::get_text(self.overlay_edit);
+        if !matches!(self.overlay, Some(Overlay { kind: OverlayKind::Pick { .. } })) {
+            return;
+        }
+        if self.pick_mode == crate::quickopen::PickMode::Files {
+            self.filter_files(&raw);
+            self.scroll[Area::Pick as usize] = 0;
+            self.invalidate();
+            return;
+        }
         // a path typed with backslashes matches the "dir/name" of files too
-        let q = win::get_text(self.overlay_edit).to_lowercase().replace('\\', "/");
-        let (rank, hay) = (self.pick_rank, &self.pick_hay);
+        let q = raw.to_lowercase().replace('\\', "/");
+        let hay = &self.pick_hay;
         if let Some(Overlay { kind: OverlayKind::Pick { items, filtered, sel, .. } }) = &mut self.overlay {
             let words: Vec<&str> = q.split_whitespace().collect();
             *filtered = (0..items.len()).filter(|&i| hay.get(i).is_some_and(|(h, _)| words.iter().all(|w| h.contains(w)))).collect();
-            // Go to File: names that start with, then contain, the first word come first
-            if let (true, Some(w)) = (rank, words.first()) {
-                filtered.sort_by_key(|&i| {
-                    let (h, n) = &hay[i];
-                    let name = &h[..*n];
-                    if name.starts_with(w) { 0 } else if name.contains(w) { 1 } else { 2 }
-                });
-            }
             *sel = 0;
         }
+        self.qo.words = q.split_whitespace().map(crate::fuzzy::pattern).collect();
         self.scroll[Area::Pick as usize] = 0;
         self.invalidate();
     }
 
     pub fn accept_overlay(&mut self, index: Option<usize>) {
         let Some(ov) = self.overlay.take() else { return };
-        self.pick_hay = Vec::new();
+        // before the callback, which may open another picker (the typed line stays for it)
+        self.end_pick();
         let text = win::get_text(self.overlay_edit);
         self.hide_overlay_edit();
         // the chosen item usually opens something (a file, a command's view): the keyboard goes
@@ -2515,7 +2541,7 @@ impl App {
                 group(it, "other commands");
             }
         }
-        self.pick("Type the name of a command to run.", items, |app, it| {
+        self.open_pick("Type the name of a command to run.", items, crate::quickopen::PickMode::Palette, |app, it| {
             let id: u32 = it.data.parse().unwrap_or(0);
             if let Some(&(c, t, _)) = COMMANDS.iter().find(|(c, _, _)| *c as u32 == id) {
                 app.st.add_recent_cmd(t);
@@ -2528,7 +2554,7 @@ impl App {
     pub fn exec(&mut self, c: Cmd) {
         let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
         // the Explorer and the editor work in a folder without a repository too
-        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew);
+        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
             self.info("There are no available repositories. Open a folder first.");
             return;
@@ -2715,6 +2741,7 @@ impl App {
                 self.focus = if v == 1 { Focus::Explorer } else { Focus::Changes };
             }
             Cmd::GotoFile => self.goto_file(),
+            Cmd::GotoLine => self.goto_line_pick(),
             Cmd::ExplorerCollapse => self.explorer_collapse_all(),
             Cmd::Save => self.save_active(),
             Cmd::SaveAll => self.save_all(),
