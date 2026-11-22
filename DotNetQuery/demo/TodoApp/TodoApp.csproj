@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <IsAotCompatible>false</IsAotCompatible>
+    <IsPackable>false</IsPackable>
+    <RootNamespace>TodoApp</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.WebAssembly.Server" Version="10.0.14" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.QuickGrid" Version="10.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\TodoApp.Client\TodoApp.Client.csproj" />
+    <ProjectReference Include="..\..\src\DotNetQuery\DotNetQuery.csproj" />
+    <ProjectReference Include="..\..\src\adapters\DotNetQuery.Blazor\DotNetQuery.Blazor.csproj" />
+    <ProjectReference Include="..\..\src\adapters\DotNetQuery.Blazor.Server\DotNetQuery.Blazor.Server.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,46 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DotNetQuery/DotNetQuery.csproj" />
+    <Project Path="src/DotNetQuery.DevTools.Cli/DotNetQuery.DevTools.Cli.csproj" />
+    <Project Path="src/DotNetQuery.SourceGenerators/DotNetQuery.SourceGenerators.csproj" />
+  </Folder>
+  <Folder Name="/src/adapters/">
+    <Project Path="src/adapters/DotNetQuery.Avalonia/DotNetQuery.Avalonia.csproj" />
+    <Project Path="src/adapters/DotNetQuery.Blazor/DotNetQuery.Blazor.csproj" />
+    <Project Path="src/adapters/DotNetQuery.Blazor.Server/DotNetQuery.Blazor.Server.csproj" />
+    <Project Path="src/adapters/DotNetQuery.Wpf/DotNetQuery.Wpf.csproj" />
+    <Project Path="src/adapters/DotNetQuery.Uno/DotNetQuery.Uno.csproj" />
+    <Project Path="src/adapters/DotNetQuery.WinUI/DotNetQuery.WinUI.csproj" />
+  </Folder>
+  <Folder Name="/src/integrations/">
+    <Project Path="src/integrations/DotNetQuery.SignalR/DotNetQuery.SignalR.csproj" />
+  </Folder>
+  <Folder Name="/src/persistence/">
+    <Project Path="src/persistence/DotNetQuery.Persistence.Sqlite/DotNetQuery.Persistence.Sqlite.csproj" />
+    <Project Path="src/persistence/DotNetQuery.Persistence.Redis/DotNetQuery.Persistence.Redis.csproj" />
+  </Folder>
+  <Folder Name="/aot/">
+    <Project Path="aot/DotNetQuery.AotHarness/DotNetQuery.AotHarness.csproj" />
+  </Folder>
+  <Folder Name="/demo/">
+    <Project Path="demo/TodoApp/TodoApp.csproj" />
+    <Project Path="demo/TodoApp.Client/TodoApp.Client.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.Avalonia/DotNetQuery.Demo.Avalonia.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.Chat/DotNetQuery.Demo.Chat.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.Realtime/DotNetQuery.Demo.Realtime.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.OfflineFirst/DotNetQuery.Demo.OfflineFirst.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.ECommerce/DotNetQuery.Demo.ECommerce.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.Dashboard/DotNetQuery.Demo.Dashboard.csproj" />
+    <Project Path="demo/DotNetQuery.Demo.Wpf/DotNetQuery.Demo.Wpf.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DotNetQuery.Benchmarks/DotNetQuery.Benchmarks.csproj" />
+    <Project Path="tests/DotNetQuery.Blazor.Tests/DotNetQuery.Blazor.Tests.csproj" />
+    <Project Path="tests/DotNetQuery.Desktop.Tests/DotNetQuery.Desktop.Tests.csproj" />
+    <Project Path="tests/DotNetQuery.E2E/DotNetQuery.E2E.csproj" />
+    <Project Path="tests/DotNetQuery.SignalR.Tests/DotNetQuery.SignalR.Tests.csproj" />
+    <Project Path="tests/DotNetQuery.SourceGenerators.Tests/DotNetQuery.SourceGenerators.Tests.csproj" />
+    <Project Path="tests/DotNetQuery.Tests/DotNetQuery.Tests.csproj" />
+    <Project Path="tests/DotNetQuery.Uno.Tests/DotNetQuery.Uno.Tests.csproj" />
+  </Folder>
+</Solution>

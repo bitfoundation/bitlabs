@@ -1,0 +1,105 @@
+# DotNetQuery - Path to 1.0
+
+Status: **feature-complete core and Blazor adapter, 8 UI adapters (Blazor, Blazor Server, MVVM, WPF, WinUI, Avalonia,
+MAUI, Uno), real-time synchronization with a SignalR integration, 1,272 tests, 11 NuGet packages, nine verified demos,
+a BenchmarkDotNet suite, a verified NativeAOT
+publish and trimmed Blazor WebAssembly publish, CI with coverage, a scripted release checklist, and a frozen public API
+surface for every package.** This document tracks what remains before a formal 1.0 tag. See
+[CHANGELOG.md](CHANGELOG.md) for the latest changes and [IMPLEMENTATION-STATUS.md](IMPLEMENTATION-STATUS.md) for the
+verified evidence.
+
+## Done
+
+- **Core engine** - `QueryClient`, `QueryCache`, structural/hierarchical `QueryKey`, reusable
+  `QueryDefinition<T>`, immutable state/options, retry policies, deduplication with supersession
+  (invalidation cancels outdated fetches), ordered observer notifications, cancellation with state
+  restore, atomic cache updates, hydration, race-free background GC, query and mutation `Meta`.
+- **Mutations** - declarative optimistic updates with exact, conflict-safe, atomic multi-key rollback and overlapping
+  layers; refreshes of a query wait while its optimistic updates are pending, then run once; `Invalidates` that join a
+  refetch started after the mutation's server call (mutations settling together refetch once); retries with `ShouldRetry` (a mutation can opt out of default retries with `RetryCount = 0`);
+  lifecycle callbacks that never re-run the mutation; cancellation; mutation keys and ids; the mutation cache
+  (`client.Cache.Mutations`) and serial `Scope`s.
+- **Query engine additions** - query filters and bulk operations, atomic multi-query transactions, initial and
+  placeholder data, selectors with fine-grained notifications, opt-in structural sharing.
+- **Infinite queries** - cache-backed (shared, invalidated, persisted, hydrated, inspected),
+  offset/cursor/bidirectional, sliding window, cursor re-derivation on refetch.
+- **Background sync** - interval, focus/reconnect/resume triggers, dependency invalidation.
+- **Offline** - every refetch path pauses offline and resumes on reconnect; in-memory
+  `OfflineMutationQueue` and durable `PersistentMutationQueue`, both strictly ordered; the durable queue coordinates
+  instances sharing a store (browser tabs over IndexedDB with `WebLocksMutationQueueLock`, processes with
+  `FileMutationQueueLock`), so each queued write is replayed once.
+- **Persistence** - pluggable `IQueryPersister` (in-memory, file system, SQLite, Redis, localStorage,
+  IndexedDB) with timestamp-preserving restore, `MaxAge`, `Buster`, auto-persist, and trim-safe registration.
+- **Synchronization** - `QuerySynchronizer` over `BroadcastChannel` (tabs), in-memory hubs and Redis pub/sub
+  (`RedisQuerySyncChannel`, server instances); a SignalR transport recipe.
+- **Real-time events** - `QueryEventSynchronizer` in the core (typed event mappings to invalidations, incremental
+  updates and entity upserts/removals; duplicate, version and sequence protection; coalesced refetches; recovery by
+  invalidation, snapshot or replay after reconnects, gaps and overflows; diagnostics, metrics, DevTools);
+  `DotNetQuery.SignalR` (hub event source with group resubscription, restart policy, connection ownership,
+  `AddSignalRSync`); Blazor component-scoped mappings, status hook and a cross-tab notice relay; a real-time demo and
+  live updates in the TodoApp WebAssembly pages.
+- **Blazor** - .NET 8 + .NET 10; scoped per-circuit clients; `<Query>` with templates, keep-previous-data,
+  dependent queries and automatic prerender hydration (trim-safe with `UseHydrationJson`); hook-style
+  `UseQuery`/`UseMutation`/`UseInfiniteQuery`; browser signals; inline/floating DevTools panel; Blazor Server circuit
+  reconnection (`DotNetQuery.Blazor.Server`); Blazor Hybrid guidance.
+- **Diagnostics** - event stream, `ILogger` integration (`AddDiagnosticLogging`), OpenTelemetry `ActivitySource`/`Meter`,
+  DevTools model with data previews and mutation history, a live DevTools endpoint (`QueryDevToolsServer`) for any app
+  and the CLI dashboard (`watch` mode).
+- **Adapters** - Blazor, Blazor Server, MVVM, WPF and WinUI (.NET 8 and 10), Avalonia, MAUI, Uno Platform.
+- **Transport** - HTTP/JSON and GraphQL fetchers/definitions with source-generated (AOT-safe) overloads;
+  `StreamIntoCacheAsync` for SignalR/channels/gRPC streams.
+- **Source generator** - `[GenerateQueries]` on interfaces and classes (Refit, NSwag/Refitter, Kiota wrappers):
+  keys, definitions, mutations, generic methods and infinite queries (`[InfiniteQueryMethod]`).
+- **Trimming / NativeAOT** - the core, Blazor, Blazor Server and persistence packages are `IsAotCompatible` (the XAML
+  adapters are not annotated, like their UI frameworks); the AOT harness exercises definitions, optimistic updates, persistence, the durable queue with a
+  lock, logging, generated queries and HTTP queries; CI checks a trimmed Blazor WebAssembly publish.
+- **Infra** - DI integration, multi-target net8.0/net10.0, NuGet packaging with symbols + SourceLink + package
+  validation, 18 doc guides and a DocFX site whose API reference includes the Razor components, API freeze via
+  PublicApiAnalyzers on every package, CI (Windows build/test/pack with coverage, Linux tests with Redis,
+  latest-runtime forward-compatibility tests, AOT publish, trimmed WebAssembly publish, MAUI Android, WPF/Avalonia
+  smoke tests) in the bitlabs DotNetQuery workflow, `eng/prepare-release.ps1` and a release checklist
+  ([docs/releasing.md](docs/releasing.md)), security policy, code of conduct.
+
+## Remaining work before 1.0
+
+| Item | Notes | Priority |
+| --- | --- | --- |
+| **Resolve the NuGet package ID collision** | Owner action on nuget.org: `DotNetQuery` and `DotNetQuery.Blazor` currently belong to other accounts and cannot be published until they are transferred or this project's IDs change; request prefix reservation for the remaining `DotNetQuery.*` IDs where possible. | P1 |
+| **Release automation** | bitlabs has no release workflow, so packages are packed and pushed by hand ([docs/releasing.md](docs/releasing.md)). A project-scoped workflow triggered by `dotnetquery-v*` tags, with nuget.org trusted publishing and build provenance, would remove the manual steps. | P2 |
+| **Publish the documentation site** | The DocFX site builds locally ([CONTRIBUTING.md](CONTRIBUTING.md#documentation-site)) but nothing builds or hosts it in bitlabs; GitHub Pages is one site for the whole repository, so hosting is an owner decision. | P2 |
+| **First public release (0.9.0)** | Run `eng/prepare-release.ps1 -Version 0.9.0`, commit, then follow [docs/releasing.md](docs/releasing.md) (pack, push, tag `dotnetquery-v0.9.0`). 0.8.0 was never published, so 0.9.0 is the first version on nuget.org. | P1 |
+| **Package validation baseline** | After 0.9.0 is on nuget.org, set `PackageValidationBaselineVersion` to it in `Directory.Build.props`, so later releases are checked for binary compatibility. | P1 |
+| **Ship the API baselines for 1.0** | `eng/prepare-release.ps1 -Version 1.0.0` moves `PublicAPI.Unshipped.txt` and `AnalyzerReleases.Unshipped.md` into the shipped files. | P1 |
+| **Benchmark baseline** | A ShortRun baseline is committed; re-run with the default job on a quiet machine for the 1.0 baseline. | P2 |
+| **MAUI iOS/macCatalyst heads** | Wired to build on macOS; needs a Mac build host. | P2 |
+| **.NET 11 target** | .NET 11 (STS) is validated by the `test-latest-runtime` CI job (the net10.0 build rolled forward). Add a `net11.0` target only if an API needs it; otherwise the LTS targets cover STS releases. | P3 |
+
+## Backlog (after 1.0)
+
+| Item | Notes |
+| --- | --- |
+| Visual DevTools for XAML apps | The live endpoint and CLI cover any app; an in-app panel for WPF/WinUI/Avalonia/MAUI/Uno would match the Blazor one. |
+| SignalR `IQuerySyncChannel` | Event synchronization ships in `DotNetQuery.SignalR`; a ready-made channel + hub for relaying `QuerySynchronizer` *data* through a server is still a recipe. |
+| Prefix index for event mappings | Data mappings matching by key prefix scan the cache once per event (~19 µs with 1,000 cached queries); an index would make dispatch independent of the cache size. |
+| Durable deduplication/checkpoints | Deduplication and checkpoints are in memory; a pluggable store would let replay resume across restarts without application code. |
+| Native Kiota request-builder generation | Kiota clients are supported through a thin wrapper class; generating from request builders directly would remove it. |
+
+## Known characteristics (documented, not bugs)
+
+- A `Mutation` instance's observable state tracks its most recent run; use one instance per independently
+  observed operation (or the one-shot `client.MutateAsync`).
+- Observers, `InfiniteQuery` and `ObservableQuery` instances must be disposed (Blazor components do this
+  for you) - an undisposed observer keeps its query active.
+- `PersistentMutationQueue` replays at-least-once: a crash between a successful request and its removal from
+  the store replays it on the next start, so handlers should be idempotent. Instances sharing a store need a
+  `ReplayLock`.
+- Queries are persisted by exact registered key or by key prefix; prefixed records are restored when the
+  matching query is first used (a key cannot be rebuilt from its persisted text).
+- Removals are not synchronized between caches; prefix synchronization updates only queries the receiving cache holds.
+- `NetworkConnectivityMonitor` reports whether a network interface is up, not whether the server is reachable.
+- Real-time event synchronization: deduplication is in memory (no exactly-once delivery across restarts); incremental
+  updates are only ordered when events carry versions or sequences (otherwise use invalidation); replay recovery needs a
+  server that retains its event history; payload deserialization failures happen in SignalR, before the synchronizer.
+- Structural sharing is opt-in: it relies on `Equals` meaning full value equality.
+- In a trimmed app that trims its own assemblies, prerender hydration needs `UseHydrationJson` for the app's types
+  (Blazor's default partial trimming keeps them).

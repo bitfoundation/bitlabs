@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <!-- Not a shipped package; exists purely to validate NativeAOT / trimming of the core. -->
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+
+    <!-- AOT + trimming knobs. `dotnet publish -p:PublishAot=true` must complete with zero
+         IL2xxx (trim) / IL3xxx (AOT) analyzer warnings. Warnings are errors here so CI catches
+         any regression in the core's AOT-compatibility annotations. -->
+    <PublishAot>true</PublishAot>
+    <IsAotCompatible>true</IsAotCompatible>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DotNetQuery\DotNetQuery.csproj" />
+    <!-- The SignalR integration must stay trim/AOT-clean as well. -->
+    <ProjectReference Include="..\..\src\integrations\DotNetQuery.SignalR\DotNetQuery.SignalR.csproj" />
+    <!-- [GenerateQueries]: generated code must stay trim/AOT-clean too. -->
+    <ProjectReference Include="..\..\src\DotNetQuery.SourceGenerators\DotNetQuery.SourceGenerators.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+</Project>

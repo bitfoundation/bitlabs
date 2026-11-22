@@ -1,0 +1,72 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- Each project declares its own TargetFramework(s); this avoids a singular default
+         silently overriding a multi-targeting project's TargetFrameworks. -->
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Package metadata">
+    <Product>DotNetQuery</Product>
+    <Authors>DotNetQuery</Authors>
+    <Company>DotNetQuery</Company>
+    <VersionPrefix>0.9.0</VersionPrefix>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Copyright>Copyright (c) DotNetQuery contributors</Copyright>
+    <PackageProjectUrl>https://github.com/bitfoundation/bitlabs/tree/main/DotNetQuery</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/bitfoundation/bitlabs</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>server-state;cache;query;data-fetching;async;tanstack;caching;http;api</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageRequireLicenseAcceptance>false</PackageRequireLicenseAcceptance>
+  </PropertyGroup>
+
+  <PropertyGroup Label="Reproducible packaging">
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <Deterministic>true</Deterministic>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <!-- SourceLink: embed repository/commit metadata so debuggers can fetch matching sources. -->
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <!-- Deterministic path mapping on CI for reproducible, verifiable builds. -->
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <!-- Package validation: every target framework of a package exposes a compatible API (and, once a version is
+         published, set PackageValidationBaselineVersion to it so later releases are checked against it - see
+         docs/releasing.md). -->
+    <EnablePackageValidation>true</EnablePackageValidation>
+  </PropertyGroup>
+
+  <!-- SourceLink ships in the .NET 8+ SDK (no package reference needed); the separate
+       Microsoft.SourceLink.GitHub 8.0.0 package pulls in a vulnerable Microsoft.Build.Tasks.Git (NU1902). -->
+
+  <!-- Public API surface lock. Shipped libraries opt in with <EnablePublicApiAnalyzer>true; the
+       analyzer then flags any addition/removal/change to the public API that is not recorded in the
+       PublicAPI.*.txt baselines, failing the build (warnings are errors). -->
+  <!-- RS0026/RS0027: advisory guidance against optional parameters across overloads. Our overloads
+       are unambiguous (distinct first-parameter types, e.g. InvalidateQueriesAsync(QueryKey) vs
+       (Func<QueryKey,bool>)), matching BCL conventions, so we opt out of this stylistic pair. These
+       IDs only surface when the analyzer is referenced, so the suppression is unconditional. -->
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);RS0026;RS0027</NoWarn>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(EnablePublicApiAnalyzer)' == 'true'">
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="3.11.0-beta1.24605.2" PrivateAssets="All" />
+    <AdditionalFiles Include="PublicAPI.Shipped.txt" />
+    <AdditionalFiles Include="PublicAPI.Unshipped.txt" />
+  </ItemGroup>
+
+  <!-- Ship the README and icon inside every package (harmless for non-packable projects). -->
+  <ItemGroup Condition="'$(IsPackable)' != 'false'">
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="$(MSBuildThisFileDirectory)icon.png" Pack="true" PackagePath="\" Visible="false" />
+  </ItemGroup>
+
+</Project>
