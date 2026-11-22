@@ -321,6 +321,9 @@ impl App {
             let abs = root.join(&r.path).display().to_string().replace('/', "\\");
             let (a1, a2, a3) = (abs.clone(), abs.clone(), abs);
             let rel = r.path.clone();
+            // a folder opens the terminal in itself, a file in the folder that holds it
+            let full = root.join(&r.path);
+            let term_dir = if r.dir { full } else { full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone()) };
             if r.dir {
                 let open = self.ex.open.contains(&r.path);
                 v.push(m.it(if open { "Collapse" } else { "Expand" }, move |a| a.toggle_explorer_dir(i, Some(!open))));
@@ -339,6 +342,7 @@ impl App {
             }
             v.push(MenuItem::Sep);
             v.push(m.it("Reveal in File Explorer", move |_| win::reveal(&a2)));
+            v.push(m.it("Open in Integrated Terminal", move |a| a.new_terminal_in(term_dir)));
             v.push(MenuItem::Sep);
             v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &a3)));
             v.push(m.it("Copy Relative Path", move |a| win::set_clipboard(a.hwnd, &rel)));
