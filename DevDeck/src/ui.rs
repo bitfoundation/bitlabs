@@ -390,8 +390,8 @@ impl App {
             Area::Explorer => self.ex.rows.len() as i32 * rh22,
             Area::Graph => (self.commits.len() as i32 + if self.has_more { 1 } else { 0 }) * rh22,
             Area::Main => match &self.view {
-                MainView::Diff(d) => d.rows.len() as i32 * self.line_h() + self.s(8),
-                MainView::File(f) => (f.lines.len() + f.conflicts.len()) as i32 * self.line_h() + self.s(8),
+                MainView::Diff(d) => crate::wrap::vtotal(self.wrap_map(), d.rows.len()) as i32 * self.line_h() + self.s(8) + self.hbar().map_or(0, |_| self.s(10)),
+                MainView::File(f) => crate::wrap::vtotal(self.wrap_map(), f.lines.len() + f.conflicts.len()) as i32 * self.line_h() + self.s(8) + self.hbar().map_or(0, |_| self.s(10)),
                 MainView::Commit(c) => self.commit_header_h(c) + c.files.len() as i32 * rh22 + self.s(8),
                 _ => 0,
             },
@@ -407,6 +407,9 @@ impl App {
     }
 
     pub fn clamp_scroll(&mut self, a: Area) {
+        if a == Area::Main {
+            self.wrap_update();
+        }
         let view = rh(&self.area_rect(a));
         let max = (self.content_h(a) - view).max(0);
         let s = &mut self.scroll[a as usize];
@@ -421,6 +424,8 @@ impl App {
 
     pub fn reveal_row(&mut self, a: Area, row: usize) {
         let rh22 = if a == Area::Main { self.line_h() } else { self.s(22) };
+        // a row of the main view starts at its first visual row with word wrap
+        let row = if a == Area::Main { crate::wrap::vrow(self.wrap_map(), row) } else { row };
         let top = row as i32 * rh22;
         let view = rh(&self.area_rect(a));
         let s = self.scroll[a as usize];
@@ -430,6 +435,41 @@ impl App {
             self.scroll[a as usize] = top + rh22 - view;
         }
         self.clamp_scroll(a);
+    }
+
+    /// The main view's horizontal scroll bar: its track, the thumb's width and the widest
+    /// scroll; None when the text fits (or wraps).
+    fn hbar(&self) -> Option<(RECT, i32, i32)> {
+        if !matches!(self.view, MainView::File(_) | MainView::Diff(_)) || self.wrapping() {
+            return None;
+        }
+        let max = self.diff_hscroll_max();
+        if max <= 0 {
+            return None;
+        }
+        let b = self.l.main_body;
+        // under the text of a file (right of the line numbers), under both sides of a diff
+        let left = match &self.view {
+            MainView::File(f) => b.left + self.gutter_w(f.lines.len()),
+            _ => b.left,
+        };
+        let track = rect(left, b.bottom - self.s(10), b.right - self.s(10), b.bottom);
+        let tw = rw(&track);
+        if tw < self.s(40) || rh(&b) < self.s(40) {
+            return None;
+        }
+        let thumb = ((tw as f32 * tw as f32 / (tw + max) as f32) as i32).clamp(self.s(20), tw);
+        Some((track, thumb, max))
+    }
+
+    fn draw_hscrollbar(&mut self, g: &Gfx) {
+        let Some((track, tw, max)) = self.hbar() else { return };
+        let x = track.left + ((rw(&track) - tw) as f32 * self.hscroll.min(max) as f32 / max as f32) as i32;
+        let thumb = rect(x, track.top, x + tw, track.bottom);
+        let hot = self.hover == Hit::HThumb || matches!(self.drag, Some(Drag::HThumb(..)));
+        g.fill(&thumb, if hot { self.t.scroll_thumb_hover } else { self.t.scroll_thumb });
+        self.hits.push((track, Hit::HTrack));
+        self.hits.push((thumb, Hit::HThumb));
     }
 
     fn draw_scrollbar(&mut self, g: &Gfx, a: Area) {
@@ -445,6 +485,9 @@ impl App {
         let thumb = rect(r.right - w, ty, r.right, ty + th);
         let hot = self.hover == Hit::Thumb(a) || matches!(self.drag, Some(Drag::Thumb(x, _, _)) if x == a);
         g.fill(&thumb, if hot { self.t.scroll_thumb_hover } else { self.t.scroll_thumb });
+        if a == Area::Main {
+            self.paint_find_marks(g, r, content);
+        }
         self.hits.push((thumb, Hit::Thumb(a)));
     }
 
@@ -503,7 +546,8 @@ impl App {
         unsafe {
             BitBlt(hdc, 0, 0, w, h, self.buf.0, 0, 0, SRCCOPY);
         }
-        self.clip_commit_edit();
+        self.find_place();
+        self.clip_edits();
         // after a wheel scroll: hover (highlight, row actions, tooltip) follows what is now under
         // the pointer; one more paint shows it
         if std::mem::take(&mut self.hover_stale) && self.drag.is_none() {
@@ -515,23 +559,32 @@ impl App {
         }
     }
 
-    /// The commit box is a child window, so it draws on top of anything painted on the main
-    /// window, including overlays (command palette, quick pick, input box, dialog). While an
-    /// overlay covers it, the covered part is cut out of its window region so the overlay shows
-    /// through. Changing the region invalidates the uncovered area, which then repaints once.
-    fn clip_commit_edit(&mut self) {
+    /// The commit box and the find widget's boxes are child windows, so they draw on top of
+    /// anything painted on the main window, including overlays (command palette, quick pick,
+    /// input box, dialog) and tooltips. While one covers them, the covered part is cut out of
+    /// their window region so it shows through. Changing the region invalidates the uncovered
+    /// area, which then repaints once.
+    fn clip_edits(&mut self) {
+        for (k, h) in [self.commit_edit, self.find.find_edit, self.find.repl_edit].into_iter().enumerate() {
+            if !h.is_null() && unsafe { IsWindowVisible(h) } != 0 {
+                self.clip_edit(h, k);
+            }
+        }
+    }
+
+    fn clip_edit(&mut self, edit: HWND, k: usize) {
         let mut er = rect(0, 0, 0, 0);
         unsafe {
-            GetWindowRect(self.commit_edit, &mut er);
+            GetWindowRect(edit, &mut er);
             MapWindowPoints(null_mut(), self.hwnd, &mut er as *mut RECT as *mut POINT, 2);
         }
         let hits = |o: &RECT| o.left < er.right && er.left < o.right && o.top < er.bottom && er.top < o.bottom;
         let ov = self.overlay_bounds.filter(hits).or(self.tip_bounds.filter(hits));
         let key = ov.map(|o| [er.left, er.top, er.right, er.bottom, o.left, o.top, o.right, o.bottom]);
-        if key == self.edit_clip {
+        if key == self.edit_clip[k] {
             return;
         }
-        self.edit_clip = key;
+        self.edit_clip[k] = key;
         unsafe {
             match ov {
                 Some(o) => {
@@ -539,10 +592,10 @@ impl App {
                     let cut = CreateRectRgn(o.left - er.left, o.top - er.top, o.right - er.left, o.bottom - er.top);
                     CombineRgn(rgn, rgn, cut, RGN_DIFF);
                     DeleteObject(cut as HGDIOBJ);
-                    SetWindowRgn(self.commit_edit, rgn, 1); // the system owns rgn from here on
+                    SetWindowRgn(edit, rgn, 1); // the system owns rgn from here on
                 }
                 None => {
-                    SetWindowRgn(self.commit_edit, null_mut(), 1);
+                    SetWindowRgn(edit, null_mut(), 1);
                 }
             }
         }
@@ -1357,6 +1410,13 @@ impl App {
         let body = l.main_body;
         let saved = g.clip(&body);
         let m = self.hits.len();
+        if self.find_visible() {
+            self.find_update();
+        }
+        // wrapped text has nothing to scroll sideways
+        if self.wrapping() {
+            self.hscroll = 0;
+        }
         match &self.view {
             MainView::Empty => self.paint_watermark(g),
             MainView::Loading(_) => g.text_in(&body, "Loading...", self.fonts.ui, self.t.fg_dim, DT_LINE | DT_CENTER),
@@ -1376,9 +1436,11 @@ impl App {
                 }
             }
         }
+        self.paint_find(g);
         self.clip_hits(m, body);
         g.unclip(saved);
         self.draw_scrollbar(g, Area::Main);
+        self.draw_hscrollbar(g);
     }
 
     /// Rows partly scrolled out of a list must not catch clicks meant for what is next to it
@@ -1487,11 +1549,15 @@ impl App {
             MainView::File(f) => (false, None, false, f.change.is_some()),
             _ => (false, None, false, false),
         };
-        if is_diff {
+        // a file with merge conflicts steps through its conflicts like a diff through its changes
+        let conflicts = matches!(&self.view, MainView::File(f) if !f.conflicts.is_empty());
+        if is_diff || conflicts {
             self.icon_button(g, xywh(x, y, bs, bs), I_DOWN_ARROW, Hit::Cmd(Cmd::NextChange), true);
             x -= bs + self.s(2);
             self.icon_button(g, xywh(x, y, bs, bs), I_UP_ARROW, Hit::Cmd(Cmd::PrevChange), true);
-            x -= self.s(4);
+            x -= if is_diff { self.s(4) } else { bs + self.s(2) };
+        }
+        if is_diff {
             let l1 = if self.st.compact_diff { "Show All" } else { "Collapse" };
             x = self.text_button(g, x, y, bs, l1, Hit::Cmd(Cmd::ToggleCompact)) - self.s(2);
             let l2 = if self.st.inline_diff { "Side by Side" } else { "Inline" };
@@ -1547,10 +1613,12 @@ impl App {
         let inline = self.st.inline_diff;
         let mw = self.fonts.mono_w;
         let MainView::Diff(d) = &self.view else { return };
-        let digits = d.fd.hunks.iter().map(|h| (h.old_start + h.old_len).max(h.new_start + h.new_len)).max().unwrap_or(1).to_string().len() as i32;
-        let num_w = digits.max(3) * mw + self.s(14);
-        let first = (scroll / lh).max(0) as usize;
-        let n = (rh(&body) / lh + 2) as usize;
+        let num_w = self.diff_num_w(d);
+        // word wrap: a row is as tall as the most visual rows of its two sides (the field, not
+        // `wrap_map()`, so the hits can be added meanwhile)
+        let wm = if self.wrap_map().is_some() { self.wrap.as_ref() } else { None };
+        let cols = if wm.is_some() { self.wrap_cols() } else { None };
+        let first = crate::wrap::row_at(wm, (scroll / lh).max(0) as usize).0;
         let top = body.top + self.s(4);
         let width = rw(&body) - self.s(12);
         let (left_x, right_x, half) = if inline { (body.left, body.left, width) } else { (body.left, body.left + width / 2, width / 2) };
@@ -1565,9 +1633,13 @@ impl App {
         };
         let hs = self.hscroll;
         let mut block_btns: Vec<(usize, i32)> = Vec::new();
-        for i in first..(first + n).min(d.rows.len()) {
+        for i in first..d.rows.len() {
             let row = &d.rows[i];
-            let y = top + i as i32 * lh - scroll;
+            let y = top + crate::wrap::vrow(wm, i) as i32 * lh - scroll;
+            if y >= body.bottom {
+                break;
+            }
+            let rows_h = (crate::wrap::vrow(wm, i + 1) - crate::wrap::vrow(wm, i)).max(1) as i32 * lh;
             let full = rect(body.left, y, body.right, y + lh);
             if let Some(hi) = row.sep {
                 let h = &d.fd.hunks[hi];
@@ -1579,7 +1651,7 @@ impl App {
             }
             let selected = sel.map(|(a, b)| i >= a && i <= b).unwrap_or(false);
             let draw_side = |id: Option<(usize, usize)>, x: i32, wdt: i32, right_side: bool| {
-                let side = rect(x, y, x + wdt, y + lh);
+                let side = rect(x, y, x + wdt, y + rows_h);
                 match id {
                     None => g.fill(&side, self.t.empty_line),
                     Some((hi, li)) => {
@@ -1593,7 +1665,7 @@ impl App {
                         let mut nx = x;
                         if inline {
                             let ow = num_w;
-                            let gr = rect(x, y, x + ow * 2, y + lh);
+                            let gr = rect(x, y, x + ow * 2, y + rows_h);
                             if gut != self.t.editor {
                                 g.fill(&gr, gut);
                             }
@@ -1605,7 +1677,7 @@ impl App {
                             }
                             nx += ow * 2;
                         } else {
-                            let gr = rect(x, y, x + num_w, y + lh);
+                            let gr = rect(x, y, x + num_w, y + rows_h);
                             if gut != self.t.editor {
                                 g.fill(&gr, gut);
                             }
@@ -1620,21 +1692,41 @@ impl App {
                             _ => " ",
                         };
                         g.text(nx + self.s(2), y + self.s(1), marker, self.fonts.mono, self.t.fg_dim);
-                        let text = expand_tabs(&line.text);
-                        let clip = rect(nx + mw + self.s(4), y, x + wdt, y + lh);
-                        let tx = nx + mw + self.s(6) - hs;
+                        let t = line.text.trim_end_matches('\r');
                         let sd = if right_side { 1 } else { 0 };
-                        if let Some((_, a, b)) = tsel.filter(|(ts, a, b)| *ts == sd && i >= a.0 && i <= b.0) {
-                            let t = line.text.trim_end_matches('\r');
-                            let c0 = if i == a.0 { crate::editor::vcol(t, a.1) } else { 0 } as i32;
-                            // the line break of a selected line shows as one extra cell
-                            let c1 = if i == b.0 { crate::editor::vcol(t, b.1) as i32 } else { crate::editor::vcol(t, usize::MAX) as i32 + 1 };
-                            let r = rect((tx + c0 * mw).max(clip.left), y, (tx + c1 * mw).min(clip.right), y + lh);
-                            if r.right > r.left {
-                                g.fill(&r, sel_bg);
+                        let text_left = nx + mw + self.s(6);
+                        let segs = crate::wrap::segments(t, cols);
+                        let cells = if cols.is_some() { crate::editor::display_chars(t, segs.last().map_or(0, |g| g.ve)) } else { Vec::new() };
+                        for (k, sg) in segs.iter().enumerate() {
+                            let ry = y + k as i32 * lh;
+                            if ry >= body.bottom {
+                                break;
+                            }
+                            // each visual row has its own x origin and is cut at its ends
+                            let (tx, clip) = if cols.is_some() {
+                                let right = if k + 1 == segs.len() { x + wdt } else { (text_left + (sg.ve - sg.vs) as i32 * mw).min(x + wdt) };
+                                (text_left - sg.vs as i32 * mw, rect(text_left, ry, right, ry + lh))
+                            } else {
+                                (text_left - hs, rect(nx + mw + self.s(4), ry, x + wdt, ry + lh))
+                            };
+                            if let Some((_, a, b)) = tsel.filter(|(ts, a, b)| *ts == sd && i >= a.0 && i <= b.0) {
+                                let c0 = if i == a.0 { crate::editor::vcol(t, a.1) } else { 0 } as i32;
+                                // the line break of a selected line shows as one extra cell
+                                let c1 = if i == b.0 { crate::editor::vcol(t, b.1) as i32 } else { crate::editor::vcol(t, usize::MAX) as i32 + 1 };
+                                let r = rect((tx + c0 * mw).max(clip.left), ry, (tx + c1 * mw).min(clip.right), ry + lh);
+                                if r.right > r.left {
+                                    g.fill(&r, sel_bg);
+                                }
+                            }
+                            if cols.is_some() {
+                                let to = sg.ve.min(cells.len());
+                                if sg.vs < to {
+                                    g.text_cells(text_left, ry + self.s(1), &cells[sg.vs..to], mw, self.fonts.mono, self.t.fg, &clip);
+                                }
+                            } else {
+                                g.text_clip(tx, ry + self.s(1), &expand_tabs(&line.text), self.fonts.mono, self.t.fg, &clip);
                             }
                         }
-                        g.text_clip(tx, y + self.s(1), &text, self.fonts.mono, self.t.fg, &clip);
                     }
                 }
             };
@@ -1643,18 +1735,18 @@ impl App {
             } else {
                 draw_side(row.left, left_x, half, false);
                 draw_side(row.right, right_x, width - half, true);
-                g.vline(right_x - 1, y, y + lh, self.t.border);
+                g.vline(right_x - 1, y, y + rows_h, self.t.border);
             }
             if selected {
                 // the lines Stage / Unstage / Revert Selected Lines act on; framed unless text
                 // is selected (that shows them already)
-                g.fill(&rect(body.left, y, body.left + self.s(3), y + lh), self.t.accent);
+                g.fill(&rect(body.left, y, body.left + self.s(3), y + rows_h), self.t.accent);
                 if tsel.is_none() {
-                    let ov = rect(body.left + self.s(3), y, body.right - self.s(12), y + lh);
+                    let ov = rect(body.left + self.s(3), y, body.right - self.s(12), y + rows_h);
                     g.frame(&ov, crate::theme::blend_colorref(self.t.editor, self.t.accent, 0.6));
                 }
             }
-            self.hits.push((rect(body.left, y, body.right - self.s(12), y + lh), Hit::DiffRow(i)));
+            self.hits.push((rect(body.left, y, body.right - self.s(12), y + rows_h), Hit::DiffRow(i)));
             if let Some(b) = row.block {
                 if Some(b) == hover_block && (i == 0 || d.rows[i - 1].block != Some(b)) {
                     block_btns.push((b, y));
@@ -1691,32 +1783,36 @@ impl App {
         let MainView::File(f) = &self.view else { return };
         // virtual rows: a conflict action row before each conflict start; conflict j's action
         // row is row start + j, so only the visible rows are worked out (big files stay cheap)
-        let first = (scroll / lh).max(0) as usize;
-        let n = (rh(&body) / lh + 2) as usize;
-        let rows: Vec<(usize, (bool, usize))> = (first..first + n)
-            .filter_map(|k| {
-                // conflicts whose action row is at or before row k
-                let (mut a, mut hi) = (0, f.conflicts.len());
-                while a < hi {
-                    let m = (a + hi) / 2;
-                    if f.conflicts[m].start + m <= k {
-                        a = m + 1;
-                    } else {
-                        hi = m;
-                    }
+        let row_kind = |k: usize| -> Option<(bool, usize)> {
+            // conflicts whose action row is at or before row k
+            let (mut a, mut hi) = (0, f.conflicts.len());
+            while a < hi {
+                let m = (a + hi) / 2;
+                if f.conflicts[m].start + m <= k {
+                    a = m + 1;
+                } else {
+                    hi = m;
                 }
-                if a > 0 && f.conflicts[a - 1].start + a - 1 == k {
-                    return Some((k, (true, f.conflicts[a - 1].start)));
-                }
-                let li = k - a;
-                (li < f.lines.len()).then_some((k, (false, li)))
-            })
-            .collect();
+            }
+            if a > 0 && f.conflicts[a - 1].start + a - 1 == k {
+                return Some((true, f.conflicts[a - 1].start));
+            }
+            let li = k - a;
+            (li < f.lines.len()).then_some((false, li))
+        };
+        let wm = self.wrap_map();
+        let cols = if wm.is_some() { self.wrap_cols() } else { None };
         let num_w = (f.lines.len().to_string().len() as i32).max(3) * mw + self.s(16);
         let top = body.top + self.s(4);
-        let mut hits = Vec::new();
-        for &(k, (is_action, li)) in &rows {
-            let y = top + k as i32 * lh - scroll;
+        let text_left = body.left + num_w + self.s(4);
+        let mut hits = vec![(rect(body.left, body.top, body.right - self.s(12), body.bottom), Hit::EditorText)];
+        let mut k = crate::wrap::row_at(wm, (scroll / lh).max(0) as usize).0;
+        while let Some((is_action, li)) = row_kind(k) {
+            let y = top + crate::wrap::vrow(wm, k) as i32 * lh - scroll;
+            k += 1;
+            if y >= body.bottom {
+                break;
+            }
             if is_action {
                 let mut x = body.left + num_w + self.s(8);
                 for (label, w) in [("Accept Current Change", 0u8), ("Accept Incoming Change", 1), ("Accept Both Changes", 2)] {
@@ -1731,7 +1827,9 @@ impl App {
                 }
                 continue;
             }
-            let full = rect(body.left, y, body.right, y + lh);
+            let line = &f.lines[li];
+            let segs = crate::wrap::segments(line, cols);
+            let full = rect(body.left, y, body.right, y + segs.len() as i32 * lh);
             let mut label = None;
             for c in &f.conflicts {
                 if li == c.start {
@@ -1747,12 +1845,40 @@ impl App {
                 }
             }
             g.text_in(&rect(body.left, y, body.left + num_w - self.s(8), y + lh), &(li + 1).to_string(), self.fonts.mono, self.t.line_no, DT_LINE | DT_RIGHT);
-            let text = expand_tabs(&f.lines[li]);
-            let clip = rect(body.left + num_w, y, body.right - self.s(12), y + lh);
-            g.text_clip(body.left + num_w + self.s(4) - self.hscroll, y + self.s(1), &text, self.fonts.mono, self.t.fg, &clip);
-            if let Some(lbl) = label {
-                let tw = text.len() as i32 * mw;
-                g.text(body.left + num_w + self.s(4) + tw - self.hscroll, y + self.s(1), lbl, self.fonts.mono, self.t.fg_dim);
+            if cols.is_none() {
+                let text = expand_tabs(line);
+                let clip = rect(body.left + num_w, y, body.right - self.s(12), y + lh);
+                let x0 = text_left - self.hscroll;
+                self.paint_find_line(g, li, line, y, x0, &clip, false);
+                self.paint_find_line(g, li, line, y, x0, &clip, true);
+                g.text_clip(x0, y + self.s(1), &text, self.fonts.mono, self.t.fg, &clip);
+                if let Some(lbl) = label {
+                    g.text(x0 + text.len() as i32 * mw, y + self.s(1), lbl, self.fonts.mono, self.t.fg_dim);
+                }
+                continue;
+            }
+            // wrapped: each visual row from the left, cut at its ends
+            let last_vis = (((body.bottom - y) / lh).max(0) as usize).min(segs.len() - 1);
+            let cells = crate::editor::display_chars(line, segs[last_vis].ve);
+            for (j, sg) in segs.iter().enumerate().take(last_vis + 1) {
+                let ry = y + j as i32 * lh;
+                if ry + lh <= body.top {
+                    continue;
+                }
+                let right = if j + 1 == segs.len() { body.right - self.s(12) } else { text_left + (sg.ve - sg.vs) as i32 * mw };
+                let clip = rect(text_left, ry, right.min(body.right - self.s(12)), ry + lh);
+                let x0 = text_left - sg.vs as i32 * mw;
+                self.paint_find_line(g, li, line, ry, x0, &clip, false);
+                self.paint_find_line(g, li, line, ry, x0, &clip, true);
+                let to = sg.ve.min(cells.len());
+                if sg.vs < to {
+                    g.text_cells(text_left, ry + self.s(1), &cells[sg.vs..to], mw, self.fonts.mono, self.t.fg, &clip);
+                }
+                if j + 1 == segs.len() {
+                    if let Some(lbl) = label {
+                        g.text(text_left + (sg.ve - sg.vs) as i32 * mw, ry + self.s(1), lbl, self.fonts.mono, self.t.fg_dim);
+                    }
+                }
             }
         }
         self.hits.extend(hits);
@@ -2220,6 +2346,9 @@ impl App {
 
     pub fn on_mouse_move(&mut self, x: i32, y: i32) {
         self.mouse = (x, y);
+        if self.drag.is_some() {
+            self.wrap_update();
+        }
         if let Some(d) = &self.drag {
             match *d {
                 Drag::Sash(s, start, orig) => {
@@ -2250,6 +2379,13 @@ impl App {
                         Sash::Output => self.st.output_h = ((orig - delta) as f32 / self.scale) as i32,
                     }
                     self.layout();
+                }
+                Drag::HThumb(start, orig) => {
+                    if let Some((track, tw, max)) = self.hbar() {
+                        let ratio = max as f32 / (rw(&track) - tw).max(1) as f32;
+                        self.hscroll = (orig + ((x - start) as f32 * ratio) as i32).clamp(0, max);
+                        self.invalidate();
+                    }
                 }
                 Drag::Thumb(a, start, orig) => {
                     let r = self.area_rect(a);
@@ -2409,6 +2545,8 @@ impl App {
             Cmd::ToggleTheme => if self.t.dark { "Switch to the Light Theme" } else { "Switch to the Dark Theme" },
             Cmd::ToggleCompact => if self.st.compact_diff { "Show All Lines" } else { "Collapse Unchanged Regions" },
             Cmd::ToggleInline => if self.st.inline_diff { "Show Side by Side" } else { "Show Inline" },
+            Cmd::NextChange if matches!(self.view, MainView::File(_)) => "Next Conflict",
+            Cmd::PrevChange if matches!(self.view, MainView::File(_)) => "Previous Conflict",
             Cmd::ToggleGraphAll => {
                 return if self.st.graph_all {
                     "Showing all branches. Click to show the current branch only".into()
@@ -2449,6 +2587,7 @@ impl App {
         };
         let t: String = match h {
             Hit::Cmd(c) => self.cmd_tooltip(c),
+            Hit::Find(w) => self.find_tooltip(w)?,
             Hit::GroupRow(i) => {
                 let g = group_of_row(i)?;
                 let n = self.status().map(|s| s.count(g)).unwrap_or(0);
@@ -2639,7 +2778,7 @@ impl App {
             Hit::CaptionMin => "Minimize".into(),
             Hit::CaptionMax => if unsafe { IsZoomed(self.hwnd) } != 0 { "Restore Down" } else { "Maximize" }.into(),
             Hit::CaptionClose => "Close".into(),
-            Hit::None | Hit::Backdrop | Hit::Sash(_) | Hit::DiffRow(_) | Hit::EditorText | Hit::Thumb(_) | Hit::PickRow(_) | Hit::DialogBtn(_) | Hit::TermBody | Hit::EditorTerm => return None,
+            Hit::None | Hit::Backdrop | Hit::FindBox | Hit::HThumb | Hit::HTrack | Hit::Sash(_) | Hit::DiffRow(_) | Hit::EditorText | Hit::Thumb(_) | Hit::PickRow(_) | Hit::DialogBtn(_) | Hit::TermBody | Hit::EditorTerm => return None,
         };
         Some(t)
     }
@@ -2675,7 +2814,7 @@ impl App {
         match self.hit_test(x, y) {
             Hit::Sash(Sash::Sidebar) => Some(IDC_SIZEWE),
             Hit::Sash(_) => Some(IDC_SIZENS),
-            Hit::TermBody | Hit::EditorTerm | Hit::EditorText | Hit::DiffRow(_) => Some(IDC_IBEAM),
+            Hit::TermBody | Hit::EditorTerm | Hit::EditorText | Hit::DiffRow(_) | Hit::Find(crate::find::F_FIND_INPUT | crate::find::F_REPLACE_INPUT) => Some(IDC_IBEAM),
             // everything that does something when clicked: buttons, links, tabs, list rows
             Hit::Cmd(_)
             | Hit::GroupRow(_)
@@ -2713,10 +2852,11 @@ impl App {
             | Hit::TermShellMenu
             | Hit::TermKillPanel
             | Hit::TermTab(_)
-            | Hit::TermTabKill(_) => Some(IDC_HAND),
+            | Hit::TermTabKill(_)
+            | Hit::Find(_) => Some(IDC_HAND),
             // scroll bar thumbs, the caption buttons (arrow, like every Windows title bar) and
             // empty space keep the arrow
-            Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::Thumb(_) | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose => None,
+            Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::Thumb(_) | Hit::HThumb | Hit::HTrack | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose | Hit::FindBox => None,
         }
     }
 
@@ -2876,12 +3016,14 @@ impl App {
 
     pub fn on_lbutton_down(&mut self, x: i32, y: i32, ctrl: bool, shift: bool) {
         self.hide_tip();
+        self.wrap_update();
         let hit = self.hit_test(x, y);
         if self.focus == Focus::Terminal && !matches!(hit, Hit::TermBody | Hit::EditorTerm | Hit::TermShellMenu | Hit::TermTab(_) | Hit::TermTabKill(_) | Hit::PanelTab(_) | Hit::Cmd(_) | Hit::Sash(_)) {
             self.focus = self.side_focus();
         }
         unsafe {
-            if GetFocus() != self.hwnd && hit != Hit::Backdrop && !matches!(hit, Hit::None) && self.overlay.is_none() {
+            // the find widget's buttons leave the keyboard where it is (its boxes or the editor)
+            if GetFocus() != self.hwnd && hit != Hit::Backdrop && !matches!(hit, Hit::None | Hit::Find(_) | Hit::FindBox) && self.overlay.is_none() {
                 SetFocus(self.hwnd);
             }
             SetCapture(self.hwnd);
@@ -2905,6 +3047,13 @@ impl App {
                 }
             }
             Hit::Backdrop => self.close_overlay(),
+            Hit::Find(w) => {
+                unsafe {
+                    ReleaseCapture();
+                }
+                self.find_click(w);
+            }
+            Hit::FindBox => {}
             Hit::Sash(s) => {
                 let orig = match s {
                     Sash::Sidebar => rw(&self.l.sidebar),
@@ -2915,6 +3064,16 @@ impl App {
                 self.drag = Some(Drag::Sash(s, if s == Sash::Sidebar { x } else { y }, orig));
             }
             Hit::Thumb(a) => self.drag = Some(Drag::Thumb(a, y, self.scroll[a as usize])),
+            Hit::HThumb => self.drag = Some(Drag::HThumb(x, self.hscroll)),
+            // a click beside the thumb scrolls by a page
+            Hit::HTrack => {
+                if let Some((track, tw, max)) = self.hbar() {
+                    let thumb_x = track.left + ((rw(&track) - tw) as f32 * self.hscroll.min(max) as f32 / max as f32) as i32;
+                    let page = (rw(&track) - self.fonts.mono_w * 4).max(self.fonts.mono_w);
+                    self.hscroll = if x < thumb_x { self.hscroll.min(max) - page } else { self.hscroll + page }.clamp(0, max);
+                    self.invalidate();
+                }
+            }
             Hit::Cmd(c) => self.exec(c),
             Hit::ActionBtn => self.more_menu(x, y),
             Hit::GroupRow(i) => {
@@ -3170,6 +3329,7 @@ impl App {
     }
 
     pub fn on_dblclick(&mut self, x: i32, y: i32, ctrl: bool, shift: bool) {
+        self.wrap_update();
         match self.hit_test(x, y) {
             // like VS Code: the first click opened a preview tab, the double click keeps it open
             Hit::FileRow(_) | Hit::GraphRow(_) | Hit::Tab(_) => self.keep_tab(self.tab_active),
@@ -3188,7 +3348,7 @@ impl App {
             // a second click on buttons used in quick succession (closing tabs, staging files,
             // stepping through changes); toggles (sections, folders, views), commits and
             // terminal create / kill buttons take one action per double click
-            Hit::TabClose(_) | Hit::ToastClose(_) | Hit::FileAct(..) | Hit::DirAct(..) | Hit::GroupAct(..) | Hit::DiffBlock(..) | Hit::Cmd(Cmd::NextChange | Cmd::PrevChange) | Hit::Thumb(_) | Hit::Sash(_) => self.on_lbutton_down(x, y, ctrl, shift),
+            Hit::TabClose(_) | Hit::ToastClose(_) | Hit::FileAct(..) | Hit::DirAct(..) | Hit::GroupAct(..) | Hit::DiffBlock(..) | Hit::Cmd(Cmd::NextChange | Cmd::PrevChange) | Hit::Find(crate::find::F_PREV | crate::find::F_NEXT | crate::find::F_REPLACE) | Hit::Thumb(_) | Hit::HThumb | Hit::HTrack | Hit::Sash(_) => self.on_lbutton_down(x, y, ctrl, shift),
             _ => {}
         }
     }
@@ -3312,6 +3472,7 @@ impl App {
 
     pub fn on_rbutton_up(&mut self, x: i32, y: i32) {
         self.hide_tip();
+        self.wrap_update();
         let hit = self.hit_test(x, y);
         if hit == Hit::TermBody || hit == Hit::EditorTerm {
             // Windows Terminal behavior: copy the selection, otherwise paste
@@ -3548,6 +3709,7 @@ impl App {
                 v.push(m.it_if("Copy\tCtrl+C", has_sel, |a| a.copy_diff_selection()));
                 v.push(m.check_cmd("Inline View", self.st.inline_diff, Cmd::ToggleInline));
                 v.push(m.check_cmd("Collapse Unchanged Regions", self.st.compact_diff, Cmd::ToggleCompact));
+                v.push(m.check_cmd("Word Wrap", self.st.word_wrap, Cmd::ToggleWordWrap));
                 v.push(MenuItem::Sep);
                 v.push(m.cmd("Go to Next Change", Cmd::NextChange));
                 v.push(m.cmd("Go to Previous Change", Cmd::PrevChange));
@@ -3566,11 +3728,20 @@ impl App {
     /// How far the diff scrolls sideways: until its longest line is in view, roughly (the
     /// line-number gutter is estimated). Other views (the editor) are not limited here.
     fn diff_hscroll_max(&self) -> i32 {
+        if self.wrapping() {
+            return 0;
+        }
         let width = rw(&self.l.main_body) - self.s(12);
         let (cols, pane) = match &self.view {
             MainView::Diff(d) => (d.max_cols, if d.inline { width } else { width / 2 } - self.s(80)),
-            // the longest line (tabs count as up to 4 columns), next to the line numbers
-            MainView::File(f) => (f.lines.iter().map(|l| l.chars().count() + l.matches('\t').count() * 3).max().unwrap_or(0), width - self.s(80)),
+            // the longest line (tabs count as up to 4 columns), next to the line numbers; worked
+            // out once per version of the text
+            MainView::File(f) => {
+                let (uid, ver, cols) = self.file_cols.get();
+                let cols = if uid == f.ed.uid.0 && ver == f.ed.version { cols } else { f.lines.iter().map(|l| l.chars().count() + l.matches('\t').count() * 3).max().unwrap_or(0) };
+                self.file_cols.set((f.ed.uid.0, f.ed.version, cols));
+                (cols, width - self.s(80))
+            }
             _ => return 0,
         };
         (cols as i32 * self.fonts.mono_w - pane + self.fonts.mono_w * 4).max(0)
@@ -3586,17 +3757,25 @@ impl App {
         let body = self.l.main_body;
         let (lh, mw) = (self.line_h().max(1), self.fonts.mono_w.max(1));
         let inline = self.st.inline_diff;
-        let digits = d.fd.hunks.iter().map(|h| (h.old_start + h.old_len).max(h.new_start + h.new_len)).max().unwrap_or(1).to_string().len() as i32;
-        let num_w = digits.max(3) * mw + self.s(14);
+        let num_w = self.diff_num_w(d);
         let width = rw(&body) - self.s(12);
         let side = if inline { 0 } else { side.unwrap_or(if x >= body.left + width / 2 { 1 } else { 0 }) };
-        let row = ((y - body.top - self.s(4) + self.scroll[Area::Main as usize]).max(0) / lh) as usize;
+        let v = ((y - body.top - self.s(4) + self.scroll[Area::Main as usize]).max(0) / lh) as usize;
+        let wm = self.wrap_map();
+        let (row, sub) = crate::wrap::row_at(wm, v);
         let row = row.min(d.rows.len() - 1);
         // as painted: the side's left edge, its line numbers, the +/- marker
         let side_x = if side == 1 { body.left + width / 2 } else { body.left };
         let tx = side_x + if inline { num_w * 2 } else { num_w } + mw + self.s(6) - self.hscroll;
+        let half = ((x - tx).max(0) * 2 / mw) as usize;
+        let cols = if wm.is_some() { self.wrap_cols() } else { None };
         let col = match d.side_line(row, side) {
-            Some(l) => crate::editor::col_at_vcol(l.text.trim_end_matches('\r'), ((x - tx).max(0) * 2 / mw) as usize),
+            Some(l) if cols.is_some() => {
+                let t = l.text.trim_end_matches('\r');
+                let segs = crate::wrap::segments(t, cols);
+                crate::wrap::col_in_seg(t, &segs, sub.min(segs.len() - 1), half)
+            }
+            Some(l) => crate::editor::col_at_vcol(l.text.trim_end_matches('\r'), half),
             None => 0,
         };
         Some((side, (row, col)))
@@ -3653,6 +3832,8 @@ impl App {
     /// Global shortcuts (handled for the main window and the edit controls).
     pub fn global_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> bool {
         let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
+        // in the commit box Ctrl+F / Ctrl+H stay the box's (Ctrl+H is a backspace)
+        let find_ok = unsafe { GetFocus() } != self.commit_edit;
         let c = match (vk, ctrl, shift) {
             (0xC0, true, false) if alt => Some(Cmd::NewTerminal),          // Ctrl+Alt+`
             (0x50, true, true) | (0x70, false, false) => Some(Cmd::Palette), // Ctrl+Shift+P, F1
@@ -3670,6 +3851,12 @@ impl App {
             (0x45, true, true) => Some(Cmd::ShowExplorer),                   // Ctrl+Shift+E
             (0x50, true, false) | (0x45, true, false) => Some(Cmd::GotoFile), // Ctrl+P, Ctrl+E
             (0x47, true, false) => Some(Cmd::GotoLine),                      // Ctrl+G
+            (0x46, true, false) if find_ok => Some(Cmd::Find),               // Ctrl+F
+            (0x48, true, false) if find_ok => Some(Cmd::Replace),            // Ctrl+H
+            (0x72, false, false) => Some(Cmd::FindNext),                     // F3
+            (0x72, false, true) => Some(Cmd::FindPrev),                      // Shift+F3
+            (0x72, true, false) => Some(Cmd::FindNextSel),                   // Ctrl+F3
+            (0x72, true, true) => Some(Cmd::FindPrevSel),                    // Ctrl+Shift+F3
             (0x53, true, false) => Some(Cmd::Save),                          // Ctrl+S
             (0x57, true, false) | (0x73, true, false) => Some(Cmd::CloseEditor), // Ctrl+W, Ctrl+F4
             (0x09, true, false) | (0x22, true, false) => Some(Cmd::NextEditor), // Ctrl+Tab, Ctrl+PageDown
@@ -3773,6 +3960,10 @@ impl App {
         if self.term_has_focus() {
             let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
             self.term_key(vk, ctrl, shift, alt);
+            return;
+        }
+        let alt = unsafe { (GetKeyState(0x12) as u16 & 0x8000) != 0 };
+        if self.find_view_key(vk, ctrl, shift, alt) {
             return;
         }
         if self.editor_focused() && self.editor_key(vk, ctrl, shift) {

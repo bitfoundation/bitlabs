@@ -469,7 +469,8 @@ impl App {
             f.ed.want_vcol = None;
         }
         let area = Area::Main as usize;
-        let top = l as i32 * lh;
+        self.wrap_update();
+        let top = crate::wrap::vrow(self.wrap_map(), l) as i32 * lh;
         let s = self.scroll[area];
         if top < s || top + lh > s + view_h {
             self.scroll[area] = (top - (view_h - lh) / 2).max(0);

@@ -165,7 +165,7 @@ pub fn load_text(root: &Path, rel: &str) -> MainView {
     let (lines, crlf) = split_lines(&text);
     // a file with invalid UTF-8 / UTF-16 is shown read-only: saving would change those bytes
     let ed = EditState::new(&lines, enc, crlf, lossless);
-    MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok(), ed })
+    MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok(), ed, nav: None })
 }
 
 impl App {

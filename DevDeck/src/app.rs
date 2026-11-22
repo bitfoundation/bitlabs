@@ -150,6 +150,8 @@ pub struct DiffView {
     pub nav: Option<usize>,
     /// Text selected on one side (copied with Ctrl+C), as in an editor.
     pub tsel: Option<TextSel>,
+    /// Identifies the diff for word wrap's visual rows.
+    pub uid: crate::editor::Uid,
 }
 
 /// A text selection in a diff: `side` 0 is the original (or the inline column), 1 the
@@ -195,6 +197,8 @@ pub struct FileView {
     pub mtime: Option<std::time::SystemTime>,
     /// Caret, selection, undo history and save format of an editable file.
     pub ed: crate::editor::EditState,
+    /// Row of the conflict F7 / Shift+F7 went to last.
+    pub nav: Option<usize>,
 }
 
 pub struct CommitView {
@@ -335,6 +339,13 @@ pub enum Hit {
     DiffBack,
     /// The text of an editable file.
     EditorText,
+    /// The horizontal scroll bar of the editor / diff: its thumb, and the track around it.
+    HThumb,
+    HTrack,
+    /// A button or input box of the find widget (`find::F_*`).
+    Find(u8),
+    /// The find widget's background.
+    FindBox,
     CommitFile(usize),
     Conflict(usize, u8),
     Thumb(Area),
@@ -364,6 +375,8 @@ pub enum Hit {
 pub enum Drag {
     Sash(Sash, i32, i32),
     Thumb(Area, i32, i32),
+    /// Dragging the horizontal scroll bar's thumb: the x where it started, hscroll then.
+    HThumb(i32, i32),
     DiffSelect,
     TermSelect,
     EditSelect,
@@ -508,6 +521,13 @@ cmds! {
     ShowScm => "View: Show Source Control", "";
     GotoFile => "Go to File...", "Ctrl+P";
     GotoLine => "Go to Line/Column...", "Ctrl+G";
+    Find => "Find", "Ctrl+F";
+    Replace => "Replace", "Ctrl+H";
+    FindNext => "Find Next", "F3";
+    FindPrev => "Find Previous", "Shift+F3";
+    FindNextSel => "Find Next Selection", "Ctrl+F3";
+    FindPrevSel => "Find Previous Selection", "Ctrl+Shift+F3";
+    ReplaceAll => "Replace All", "Ctrl+Alt+Enter";
     Save => "File: Save", "Ctrl+S";
     SaveAll => "File: Save All", "";
     RevertFile => "File: Revert File", "";
@@ -520,6 +540,7 @@ cmds! {
     ToggleTreeView => "Source Control: Toggle View as Tree / List", "";
     ToggleInline => "Diff: Toggle Inline View", "";
     ToggleCompact => "Diff: Toggle Collapse Unchanged Regions", "";
+    ToggleWordWrap => "View: Toggle Word Wrap", "Alt+Z";
     ToggleGraphAll => "Graph: Toggle Show All Branches", "";
     NextChange => "Diff: Go to Next Change", "F7";
     PrevChange => "Diff: Go to Previous Change", "Shift+F7";
@@ -602,8 +623,16 @@ pub struct App {
     pub edit_lines: i32,
     /// Area the open overlay covers (client coordinates), recorded while painting it.
     pub overlay_bounds: Option<RECT>,
-    /// Commit box and overlay rectangles its window region was last cut for (None = unclipped).
-    pub edit_clip: Option<[i32; 8]>,
+    /// Edit control and overlay rectangles the window region of the commit box, the find box
+    /// and the replace box was last cut for (None = unclipped).
+    pub edit_clip: [Option<[i32; 8]>; 3],
+    /// Find / Replace widget of file views.
+    pub find: crate::find::Find,
+    /// Visual rows of the active file or diff with word wrap.
+    pub wrap: Option<crate::wrap::WrapMap>,
+    /// Columns of the widest line of a file view, for the horizontal scroll bar: (view id,
+    /// text version, columns).
+    pub file_cols: std::cell::Cell<(u64, u64, usize)>,
     pub l: Layout,
     pub graph_sel: Option<usize>,
     pub git_version: Option<String>,
@@ -748,7 +777,10 @@ impl App {
             edit_brush: std::ptr::null_mut(),
             edit_lines: 1,
             overlay_bounds: None,
-            edit_clip: None,
+            edit_clip: [None; 3],
+            find: crate::find::Find::new(),
+            wrap: None,
+            file_cols: std::cell::Cell::new((0, 0, 0)),
             l: Layout::default(),
             graph_sel: None,
             brows: Vec::new(),
@@ -1375,7 +1407,8 @@ impl App {
     fn remember_focus(&mut self) {
         if self.overlay.is_none() {
             let f = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
-            self.overlay_prev_focus = if f == self.commit_edit { f } else { std::ptr::null_mut() };
+            let back = f == self.commit_edit || f == self.find.find_edit || f == self.find.repl_edit;
+            self.overlay_prev_focus = if back && !f.is_null() { f } else { std::ptr::null_mut() };
         }
     }
 
@@ -1628,6 +1661,7 @@ impl App {
             d.blocks = blocks;
             d.inline = inline;
             d.sel = None;
+            d.uid = Default::default();
         }
     }
 
@@ -2510,6 +2544,12 @@ impl App {
         win::set_app_dark_mode(self.t.dark);
         win::set_control_theme(self.commit_edit, self.t.dark);
         win::set_control_theme(self.overlay_edit, self.t.dark);
+        for h in [self.find.find_edit, self.find.repl_edit] {
+            if !h.is_null() {
+                win::set_control_theme(h, self.t.dark);
+                unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(h, std::ptr::null(), 1) };
+            }
+        }
         unsafe {
             if !self.edit_brush.is_null() {
                 windows_sys::Win32::Graphics::Gdi::DeleteObject(self.edit_brush as _);
@@ -2552,7 +2592,7 @@ impl App {
     }
 
     pub fn exec(&mut self, c: Cmd) {
-        let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal);
+        let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal | Cmd::Find | Cmd::Replace | Cmd::FindNext | Cmd::FindPrev | Cmd::FindNextSel | Cmd::FindPrevSel | Cmd::ReplaceAll | Cmd::ToggleWordWrap);
         // the Explorer and the editor work in a folder without a repository too
         let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
@@ -2743,6 +2783,16 @@ impl App {
             Cmd::GotoFile => self.goto_file(),
             Cmd::GotoLine => self.goto_line_pick(),
             Cmd::ExplorerCollapse => self.explorer_collapse_all(),
+            Cmd::ToggleWordWrap => self.toggle_word_wrap(),
+            Cmd::Find => self.find_open(false),
+            Cmd::Replace => self.find_open(true),
+            Cmd::FindNext => self.find_move(false),
+            Cmd::FindPrev => self.find_move(true),
+            Cmd::FindNextSel => self.find_selection(false),
+            Cmd::FindPrevSel => self.find_selection(true),
+            // without the widget there is no replacement text yet: it opens instead
+            Cmd::ReplaceAll if self.find_visible() && self.find.replace => self.find_replace_all(),
+            Cmd::ReplaceAll => self.find_open(true),
             Cmd::Save => self.save_active(),
             Cmd::SaveAll => self.save_all(),
             Cmd::RevertFile => self.revert_file(),
@@ -2793,18 +2843,30 @@ impl App {
         let lh = self.line_h();
         let body_h = crate::win::rh(&self.l.main_body) - self.s(26);
         let scroll = self.scroll[Area::Main as usize];
-        let MainView::Diff(d) = &mut self.view else { return };
-        if d.blocks.is_empty() {
+        // the changes of a diff, or the conflicts of a file with merge conflicts (their action
+        // rows: conflict j's is row start + j)
+        let (starts, nav): (Vec<usize>, Option<usize>) = match &self.view {
+            MainView::Diff(d) => (d.blocks.iter().map(|b| b.first_row).collect(), d.nav),
+            MainView::File(f) => (f.conflicts.iter().enumerate().map(|(j, c)| c.start + j).collect(), f.nav),
+            _ => return,
+        };
+        if starts.is_empty() {
             return;
         }
         // like VS Code, go from the change visited last while it is on screen, else from a
         // third down the view (where a visited change is placed)
-        let (top, rows) = ((scroll / lh.max(1)) as usize, (body_h / lh.max(1)).max(1) as usize);
-        let cur = d.nav.filter(|&r| r >= top && r < top + rows).unwrap_or(((scroll + body_h / 3) / lh.max(1)) as usize);
-        let starts: Vec<usize> = d.blocks.iter().map(|b| b.first_row).collect();
+        // in rows of the view (visual rows with word wrap)
+        let wm = if self.wrap_map().is_some() { self.wrap.as_ref() } else { None };
+        let row_of = |v: i32| crate::wrap::row_at(wm, (v / lh.max(1)).max(0) as usize).0;
+        let (top, bottom) = (row_of(scroll), row_of(scroll + body_h));
+        let cur = nav.filter(|&r| r >= top && r < bottom).unwrap_or(row_of(scroll + body_h / 3));
         let target = if dir > 0 { starts.iter().copied().find(|&s| s > cur).unwrap_or(starts[0]) } else { starts.iter().rev().copied().find(|&s| s < cur).unwrap_or(*starts.last().unwrap()) };
-        d.nav = Some(target);
-        let y = (target as i32 * lh - body_h / 3).max(0);
+        match &mut self.view {
+            MainView::Diff(d) => d.nav = Some(target),
+            MainView::File(f) => f.nav = Some(target),
+            _ => {}
+        }
+        let y = (crate::wrap::vrow(wm, target) as i32 * lh - body_h / 3).max(0);
         self.scroll[Area::Main as usize] = y;
         self.clamp_scroll(Area::Main);
         self.invalidate();
@@ -3008,7 +3070,7 @@ pub fn diff_view_from(text: &str, f: &FileChange, kind: DiffKind, inline: bool, 
     }
     let (rows, blocks) = diff::build_rows(&fd, inline);
     let max_cols = fd.hunks.iter().flat_map(|h| h.lines.iter()).map(|l| l.text.chars().count() + l.text.matches('\t').count() * 3).max().unwrap_or(0);
-    MainView::Diff(DiffView { title: title.into(), desc: f.path.clone(), path: f.path.clone(), kind, change: Some(f.clone()), fd, rows, blocks, sel: None, back: None, max_cols, inline, nav: None, tsel: None })
+    MainView::Diff(DiffView { title: title.into(), desc: f.path.clone(), path: f.path.clone(), kind, change: Some(f.clone()), fd, rows, blocks, sel: None, back: None, max_cols, inline, nav: None, tsel: None, uid: Default::default() })
 }
 
 pub fn build_change_view(root: &Path, f: &FileChange, ctx: &str, inline: bool) -> MainView {
@@ -3029,7 +3091,7 @@ pub fn build_change_view(root: &Path, f: &FileChange, ctx: &str, inline: bool) -
             let lines: Vec<String> = text.split('\n').map(|l| l.trim_end_matches('\r').to_string()).collect();
             let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
             let conflicts = diff::parse_conflicts(&refs);
-            MainView::File(FileView { title: format!("{name} (Merge Conflicts)"), path: f.path.clone(), lines, conflicts, change: Some(f.clone()), mtime: None, ed: Default::default() })
+            MainView::File(FileView { title: format!("{name} (Merge Conflicts)"), path: f.path.clone(), lines, conflicts, change: Some(f.clone()), mtime: None, ed: Default::default(), nav: None })
         }
         (Group::Changes, Kind::Untracked) => {
             let o = git::run(root, &["--literal-pathspecs", "diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", ctx, "--", "/dev/null", &f.path], None, false);

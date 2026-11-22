@@ -10,6 +10,7 @@ mod cli;
 mod diff;
 mod editor;
 mod explorer;
+mod find;
 mod fuzzy;
 mod git;
 mod graph;
@@ -21,6 +22,7 @@ mod term_ui;
 mod theme;
 mod ui;
 mod watch;
+mod wrap;
 #[cfg(test)]
 mod tests;
 mod win;
@@ -412,7 +414,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // the keyboard (DefWindowProc would focus the main window)
                 if !activating {
                     let f = unsafe { GetFocus() };
-                    a.saved_focus = if f == a.commit_edit || f == a.overlay_edit { f } else { std::ptr::null_mut() };
+                    let edit = f == a.commit_edit || f == a.overlay_edit || f == a.find.find_edit || f == a.find.repl_edit;
+                    a.saved_focus = if edit && !f.is_null() { f } else { std::ptr::null_mut() };
                     false
                 } else if !minimized && !a.saved_focus.is_null() && unsafe { IsWindowVisible(a.saved_focus) } != 0 {
                     unsafe { SetFocus(a.saved_focus) };
@@ -532,6 +535,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let vk = wp as u16;
             let (ctrl, shift) = (key_down(VK_CONTROL), key_down(VK_SHIFT));
             if msg == WM_SYSKEYDOWN {
+                // Alt+C / W / R / P / L toggle the find widget's options, also from the editor;
+                // Alt+Z toggles word wrap
+                if with_app(hwnd, |a| !a.term_has_focus() && a.overlay.is_none() && a.alt_key(vk)).unwrap_or(false) {
+                    let mut m: MSG = std::mem::zeroed();
+                    PeekMessageW(&mut m, hwnd, WM_SYSCHAR, WM_SYSCHAR, PM_REMOVE);
+                    return 0;
+                }
                 let term_focus = with_app(hwnd, |a| a.term_has_focus()).unwrap_or(false);
                 // Alt+Space opens the window menu, also from the terminal
                 if vk == VK_F4 || vk == VK_SPACE || !(term_focus || vk == VK_F10) {
@@ -554,6 +564,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         a.edit_changed();
                     } else if ctl == a.overlay_edit {
                         a.filter_pick();
+                    } else if ctl == a.find.find_edit {
+                        a.find_query_changed();
                     }
                 });
             } else if code == EN_SETFOCUS || code == EN_KILLFOCUS {
@@ -655,6 +667,8 @@ unsafe extern "system" fn commit_edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp:
                 return 0;
             }
             if (ctrl || vk >= VK_F1 && vk <= VK_F12) && with_app(main, |a| a.global_key(vk, ctrl, shift)).unwrap_or(false) {
+                // the shortcut's control char (Ctrl+H is a backspace) doesn't reach the box
+                win::drop_char(hwnd);
                 return 0;
             }
         }
@@ -759,6 +773,11 @@ fn set_edit_fonts(a: &App) {
     unsafe {
         SendMessageW(a.commit_edit, WM_SETFONT, a.fonts.ui as WPARAM, 1);
         SendMessageW(a.overlay_edit, WM_SETFONT, a.fonts.ui as WPARAM, 1);
+        for h in [a.find.find_edit, a.find.repl_edit] {
+            if !h.is_null() {
+                SendMessageW(h, WM_SETFONT, a.fonts.ui as WPARAM, 1);
+            }
+        }
         let m = a.s(2) as isize;
         SendMessageW(a.commit_edit, 0x00D3, 3, m | (m << 16));
     }
