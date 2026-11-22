@@ -1,0 +1,213 @@
+# BlazorTestPlatform
+
+**Write a component story once. Run it as a bUnit test, a real-browser interaction test, a visual snapshot, an accessibility audit, a render-performance check and a cross-hosting regression test. Browse it in a component workbench, and review, analyze and decide in a self-hosted test hub.**
+
+BlazorTestPlatform is a quality platform for Blazor component libraries and apps. It does not replace bUnit or Playwright. It joins them, together with axe-core and a visual-regression engine, into one workflow built around a single source of truth: the **story**.
+
+```csharp
+public sealed class ButtonStories : Stories<Button>
+{
+    public override string Title => "Inputs/Button";
+
+    protected override void Define(StoryCollectionBuilder<Button> stories)
+    {
+        stories.Defaults(s => s.ChildContent("Save changes"));
+
+        stories.Add("Primary");
+        stories.Add("Disabled", s => s.Arg(b => b.Disabled, true));
+
+        stories.Add("Keyboard activation", s => s.Play(async ctx =>
+        {
+            await ctx.TabAsync();
+            await ctx.Expect(ctx.GetByRole("button", "Save changes")).ToBeFocusedAsync();
+            await ctx.PressAsync(Keys.Enter);
+            await ctx.ExpectAction("OnClick").ToHaveBeenCalledAsync(times: 1);
+        }));
+    }
+}
+```
+
+That one definition runs in all of these places:
+
+| Where | What happens | Speed |
+|---|---|---|
+| **bUnit** (`BunitStoryRunner`) | Renders the story, runs the play script with browser-faithful keyboard, pointer and focus emulation, applies static accessibility rules, and checks render budgets | milliseconds |
+| **Real browsers** (`BrowserStoryRunner`) | Runs the same play script in Chromium, Firefox or WebKit under **Static SSR, Interactive Server, WebAssembly and Auto**, then takes a visual snapshot, runs an axe-core scan, and checks console errors and the Blazor error UI | seconds |
+| **Workbench** (`/_workbench`) | Lets you browse every story across themes, viewports and render modes, edit its parameters live with generated controls (kept in the URL, so links reproduce what you see), run its play script inside the frame (**▶ Run interactions**), and see its quality gates and manual review status | interactive A documentation page per component shows its summary, a parameter table from XML docs and every story live. |
+| **Test hub** (`/_btp`) | A self-hosted test platform website over your results and run history: dashboard and trends, runs and comparisons, stability (flaky, broken, fixed) with quarantine, failures grouped by cause, visual review with grouped accept/reject, accessibility baselines, performance trends, coverage and WCAG traceability, impact analysis and sharding, live in-memory runs and a release-readiness verdict ([guide](docs/hub.md)) | interactive |
+| **Reports** (`btp report`) | Produces an HTML report with a visual-diff viewer, timelines, accessibility and performance details and story state coverage, JUnit XML, a GitHub step summary, a self-updating pull-request comment, cross-run flake history and the run archive the hub reads | — |
+
+## Why this exists
+
+The Blazor ecosystem already has good engines. bUnit is fast at component testing, Playwright drives real browsers, and axe-core is the standard accessibility engine. Visual regression is mostly available as a SaaS add-on. Each of these tools needs its own fixtures, its own selectors and its own CI wiring, and none of them knows about Blazor's render modes.
+
+BlazorTestPlatform puts one layer above all of them:
+
+* **One scenario model.** Locators (`GetByRole`, `GetByLabel`, `GetByText`...), actions and auto-waiting assertions behave the same in bUnit and in browsers. If a play script passes in-memory and fails in WebAssembly, you have found a real hosting bug, not a difference in test tooling.
+* **Blazor-aware.** Waiting is hydration-aware, so a step never clicks before the circuit or the WebAssembly runtime is live. The runner verifies that the requested render mode actually ran. Services are overridden per story under Server and WebAssembly, and fake time can be advanced in the browser.
+* **Quality gates as data.** Visual tolerances, accessibility suppressions (justified and time-boxed), performance budgets and baselines, and manual review fingerprints are all versioned with the code. Story state coverage shows which component states no story renders.
+
+## Feature map
+
+| Opportunity | What BlazorTestPlatform ships |
+|---|---|
+| **Visual regression** | Browser-rendered snapshots across viewports × themes × component states (`AddVariants`) in Chromium, Firefox and WebKit, with Linux baselines rendered in the Playwright container on CI. Includes a dependency-free PNG codec and a perceptual YIQ diff with anti-aliasing detection, masks, tolerances, `initial` vs post-play baselines, named screenshots taken during play, regions ignored in markup (`data-btp-ignore`), `btp approve`, and a slider diff viewer. One baseline is shared by every render mode, so SSR, Server and WASM must render identically. |
+| **Driver capabilities** | Each driver states what it really does (real browser, layout, screenshots, native focus, JavaScript, CSS, network, fake time). Stories declare what they need with `Requires(...)` and are skipped, with the reason, where it is missing, never run against an approximation. `catalog.Supporting(capabilities)` keeps them out of test lists. |
+| **Combinatorial stories** | `AddVariants(...).Pairwise()` covers every pair of parameter values in a fraction of the stories, deterministically, with `.Where(...)` constraints; `Combinatorics` is public for data-driven tests. |
+| **Component interaction testing** | Reusable play scripts and component harnesses (`ComponentHarness`, `ctx.Harness<DialogHarness>()`) with keyboard (Tab order, chords, Enter/Space activation), pointer, focus (`ExpectTabOrderAsync`, roving tabindex, programmatic `FocusAsync`), async (auto-waiting assertions, `WaitForIdleAsync`) and fake time (`AdvanceTimeAsync`). One script runs through three drivers: bUnit, Playwright and an in-app driver behind the workbench's **Run interactions** button. Stylesheet-aware visibility with viewport-aware media queries (`bunit.stylesheets`, `bunit.viewport`) and JS-interop mocks (`MockJS`, optionally applied in browsers too, with `ExpectJSCall` in every driver) keep bUnit and the browser in step. Named screenshots of play states (`ExpectScreenshotAsync("menu-open")`), forced hover and focus (`ForceStateAsync(PseudoState.Hover)`), seeded state-machine exploration with invariants and shrinking (`ExploreAsync`), markup snapshots with scrubbers (`ExpectMarkupSnapshotAsync`, `btp snapshots accept`), accessibility scans in the middle of play (`ExpectAccessibleAsync`) or after every action (`CheckAccessibilityAfterActions()`), computed styles and viewport checks (`ToHaveCssAsync`, `ToBeInViewportAsync`), files attached to the run (`ctx.Attach`) and per-step timeouts. Soft assertions, retrying blocks (`ExpectEventuallyAsync`), polling (`ExpectPollAsync`) and conditions that must hold (`ExpectToRemainAsync`); role-state and regex locators and `Filter(has)`; HAR replay into `MockHttp` (`ReplayHar`), file uploads (`SetInputFilesAsync`), navigation assertions (`ExpectNavigation`) and JavaScript calling `[JSInvokable]` methods (`InvokeDotNetAsync`), in every driver. |
+| **Accessibility CI** | axe-core in browsers (bundled, offline). 37 axe-compatible markup rules in bUnit, with no browser needed. A policy with an impact threshold, WCAG tags, and justified, expiring suppressions, listed per run in the report as waived rules. A **manual review workflow**: a WCAG 2.2 checklist per component, committed as JSON and kept honest by an accessibility *fingerprint* that marks a review as stale when the component's structure changes. |
+| **Test-data framework** | Deterministic seeds (xoshiro256**, part of the API contract), seeded `FakeData`, reusable `StoryFixture`s, fake users (`AuthenticatedAs`, `Authenticating`), fake time (`UseFakeTime`) and time zones (`TimeZone("Asia/Tokyo")`), **story-scoped HTTP mocking** (`MockHttp` for `HttpClient` and named or typed `IHttpClientFactory` clients, with `ctx.ExpectRequest`), and per-story service overrides, including options, authorization handlers and multi-registered services. All of these also work under Server and WebAssembly. |
+| **Flaky-test diagnostics** | A step timeline for every run (actions, assertions, waits, timings), plus a Playwright trace, failure screenshot, DOM snapshot, console log, network log and WebSocket (circuit) activity. Retries classify a story as *flaky* rather than passed and keep the failed attempts' artifacts, and cross-run flake history ranks stories by flake rate. |
+| **Render regression tests** | Render counts (root and total, per component type), allocations and median time across iterations. Includes budgets (`MaxRootRenders`...), committed baselines with tolerances, and `btp perf approve`. Leak detection: a story fails when its disposed components are still referenced by an undisposed `DotNetObjectReference` or by a handler on an injected service's event. |
+| **Cross-hosting test matrix** | `TestMatrix.CrossHosting()` runs each story under SSR, Server, WebAssembly and Auto from a single workbench host. The runner checks hydration, the actual renderer, and console and circuit errors, and with `CheckPrerender()` that hydration keeps what the prerendered page showed; `PauseAndResumeCircuitAsync()` checks what survives a paused Server circuit. Culture and time-zone modes (`ThemeDefinition.Light.WithCulture("de-DE")`) extend the matrix. Story discovery is source-generated, and the packages that run in the browser (Core and Workbench) are trimming-safe; CI re-runs the matrix against a trimmed Release publish. |
+| **Story state coverage** | `StoryCoverage` lists, for every `bool` and enum parameter, the values no story renders, and the components of a library that have no stories. It appears in the report, the pull-request comment and the workbench, and `ThrowIfBelow` turns it into a gate. |
+| **Browser emulation and runtime metrics** | `Geolocation(...)`, `GrantPermissions(...)`, `NetworkLatency(...)` and `ctx.SetOfflineAsync()` in Chromium, Firefox and WebKit (skipped, with the reason, by in-memory drivers). Every browser run records layout shift, largest contentful paint, long tasks, DOM size and heap size; `BrowserBudget(...)` fails a run that exceeds a limit and says which limits a browser could not check. |
+| **Accessibility tree snapshots** | `ctx.ExpectAriaSnapshotAsync(...)` asserts roles, names and states as a tree, identically in bUnit, Playwright and the in-app driver; name patterns and partial trees (`AriaSnapshotMatch.Contains`) as in Playwright. |
+| **Workbench inspector and recorder** | Live actions, mocked requests, JS calls, console and accessibility tree of the selected story; **Record** turns interactions in the frame into a play function with unique, readable locators. |
+| **Any test framework** | xUnit v3, NUnit, MSTest and TUnit packages: stories as data rows with names, categories and skip reasons, and skipped runs reported as skipped. `btp init` scaffolds the test class, a first story and a GitHub, Azure Pipelines or GitLab pipeline. |
+| **CI integration** | Burn-in of new or changed stories (`BTP_REPEAT_EACH`), CTRF reports (`btp report --ctrf`), screenshots, diffs and traces attached to xUnit, NUnit, MSTest and TUnit results, SARIF 2.1.0 for code scanning, OpenTelemetry traces and metrics (`BtpTelemetry`), test impact analysis (`StoryImpact`, `BTP_CHANGED_SINCE`), sharding and duration-balanced shard plans (`ShardPlan`), JUnit, Markdown and pull-request comments, and a run archive (`btp report --archive`) with commit, branch and CI metadata. Story analyzers come with code fixes. |
+| **Run history and triage** | Stability per result over archived runs (`RunHistory`: healthy, failing, flaky, broken, fixed, with a flake rate and its 95% interval), smart tags (new failure, still failing, fixed, slower), unique errors grouped by a normalized signature with a deterministic category, likely cause and next step (`FailureAnalysis`), run comparisons, and accessibility baselines that tell new violations from known debt. |
+| **Run control** | Tag expressions (`BTP_TAGS="smoke && !visual"`, `catalog.WithTags(...)`), `BTP_GREP`/`BTP_GREP_INVERT`, rerun of the last failures (`BTP_LAST_FAILED`), `BTP_FAIL_ON_FLAKY`, `BTP_MAX_FAILURES`; stories left out are reported as skipped with the reason. Known bugs as expected failures (`ExpectFailure(reason, when)`: failures pass, a clean pass fails), `Fixme(...)` and `Slow()`; timeouts, retries and skips by tag (`tagOptions`). JUnit carries Surefire's `flakyFailure`/`rerunFailure` elements. |
+| **Quarantine** | A committed `quarantine.json` (`btp quarantine add/remove/list`, or the hub): quarantined stories keep running and reporting, but their failures stop failing the build until the entry expires. |
+
+## Packages
+
+| Package | Purpose | Depends on |
+|---|---|---|
+| `BlazorTestPlatform.Core` | Story model, unified interactions and assertions, matrix, test data (incl. HTTP mocking), quality-gate models, story coverage, results, telemetry, impact analysis. Ships the story-catalog source generator, the story analyzers (BTP001-BTP005) and their code fixes. | Components.Web, Components.Authorization, Extensions.Http, TimeProvider.Testing |
+| `BlazorTestPlatform.Bunit` | In-memory driver and runner, render metrics, review fingerprints | Core, bUnit, Accessibility |
+| `BlazorTestPlatform.Accessibility` | ARIA role/name engine, Testing-Library-style queries, markup rules, fingerprints | Core, AngleSharp |
+| `BlazorTestPlatform.Workbench` | Component workbench UI, story frames for every render mode, per-story service overrides, in-app play driver | Core, Components.Web |
+| `BlazorTestPlatform.Playwright` | Browser driver, matrix runner, axe-core, diagnostics, in-process/external/process hosts | Core, Workbench, Visual, Playwright, AxeCore, Mvc.Testing |
+| `BlazorTestPlatform.Visual` | PNG codec, perceptual diff, baseline store | Core |
+| `BlazorTestPlatform.Reporting` | HTML, JUnit, Markdown and SARIF reports, pull-request comments, flake history, the run archive, stability and failure analysis | Core |
+| `BlazorTestPlatform.Hub` | The self-hosted test hub (`/_btp`): history, triage, reviews, quality gates, live runs and a JSON API | Core, Reporting, Visual, Bunit, ASP.NET Core |
+| `BlazorTestPlatform.Xunit` / `.NUnit` / `.MSTest` / `.TUnit` | Stories and matrix cells as test-framework data rows; skipped runs reported as skips | Core and the framework |
+| `BlazorTestPlatform.Cli` (`btp`) | `init`, `report` (with `--pr-comment`, `--sarif`, `--archive`), `approve`, `perf approve`, `quarantine add/remove/list`, `a11y init/status`, `flaky`, `clean` | Core, Visual, Reporting |
+
+Target frameworks: **.NET 10 and .NET 11** (`net10.0`, `net11.0`). Building the repository needs the .NET 11 SDK (global.json) and the .NET 10 runtime for the `net10.0` tests and the demo.
+
+## Quick start
+
+**See it first.** The complete working version of these steps is in [`demo/`](demo): a design system of 14 components (`BlazorTestPlatform.Demo.UI`), 99 stories, a host (Server + WebAssembly) with the workbench and the test hub, and a test project. Run the host: its home page is a guided tour of the whole platform, and on first start it records ten real in-memory runs, including stories that fail on purpose, so the hub has history, flaky and broken results, and accessibility changes to show:
+
+```bash
+dotnet run --project demo/BlazorTestPlatform.Demo.Workbench    # http://localhost:5288
+```
+
+[demo/README.md](demo/README.md) maps every feature to its story, code and test. The test project runs the 99 stories in bUnit, every play script under Server, WebAssembly and Auto, visual and axe-core cases across themes and viewports, Firefox and WebKit cases and in-app play runs, plus driver-parity, theme-emulation, pairwise-coverage, impact-analysis, story-coverage, orphaned-baseline and manual-review gates.
+
+**1. Write stories** in a class library that references your components and `BlazorTestPlatform.Core` (see [docs/stories.md](docs/stories.md)).
+
+**2. Run every story in-memory** (xUnit shown; any framework works, because story ids are plain strings):
+
+```csharp
+public sealed class ComponentStoryTests
+{
+    public static readonly StoryCatalog Catalog = StoryCatalog.FromAssemblyOf<ButtonStories>();
+    public static TheoryData<string> Stories => new(Catalog.Ids);
+
+    [Theory, MemberData(nameof(Stories))]
+    public Task Story_passes(string id) => BunitStoryRunner.VerifyAsync(Catalog.Get(id));
+}
+```
+
+**3. Host the workbench.** In a Blazor Web App with Server and WebAssembly interactivity, register it in both `Program.cs` files, after your own services:
+
+```csharp
+builder.Services.AddBlazorTestWorkbench(o => o.AddStoriesFromAssemblyOf<ButtonStories>());
+// server only:
+app.MapRazorComponents<App>()
+   .AddInteractiveServerRenderMode()
+   .AddInteractiveWebAssemblyRenderMode()
+   .AddAdditionalAssemblies(typeof(WorkbenchOptions).Assembly);
+```
+
+Then open `/_workbench`. The workbench is off in the `Production` environment unless you set `Enabled = true` (and, ideally, an `AuthorizationPolicy`); see [getting started](docs/getting-started.md#4-workbench-host).
+
+**4. Run the cross-hosting matrix in real browsers:**
+
+```csharp
+public sealed class Workbench : IAsyncLifetime
+{
+    public WorkbenchTestEnvironment Environment { get; private set; } = default!;
+    public async ValueTask InitializeAsync() =>
+        Environment = await WorkbenchTestEnvironment.StartAsync(new WorkbenchApplicationFactory<Program>());
+    public ValueTask DisposeAsync() => Environment.DisposeAsync();
+}
+
+public sealed class CrossHostingTests(Workbench workbench)
+{
+    static readonly TestMatrix Matrix = TestMatrix.CrossHosting();
+    public static TheoryData<string> Cases => new(Matrix.Expand(ComponentStoryTests.Catalog).Select(c => c.Key));
+
+    [Theory, MemberData(nameof(Cases))]
+    public Task Story_passes_everywhere(string key) =>
+        workbench.Environment.VerifyAsync(Matrix.Resolve(ComponentStoryTests.Catalog, key));
+}
+```
+
+**5. Report and approve:**
+
+```bash
+dotnet tool install -g BlazorTestPlatform.Cli --prerelease
+btp report -p tests/MyDesignSystem.Tests --junit TestResults/junit.xml --github-summary --history .btp/history.json
+btp approve            # accept intended visual changes, then commit __snapshots__/
+btp perf approve       # accept intended render-performance changes
+btp mcp                # serve the results to coding agents (Model Context Protocol, read-only)
+```
+
+## Guides
+
+* [Getting started](docs/getting-started.md): packages, project layout and a first green run
+* [Writing stories](docs/stories.md): args, bindings, actions, decorators, variants, layouts and global defaults
+* [Interactions and assertions](docs/interactions.md): locators, keyboard, focus, pointer, async and capabilities
+* [Test data](docs/test-data.md): seeds, fake data, fixtures, fake users, fake time and service overrides
+* [Cross-hosting matrix](docs/cross-hosting.md): render modes, hydration, prerendering and hosts
+* [Quality gates](docs/quality-gates.md): visual regression, accessibility (automated and manual review), render performance and story state coverage
+* [Test frameworks](docs/test-frameworks.md): xUnit, NUnit, MSTest and TUnit integration, and `btp init`
+* [The test hub](docs/hub.md): hosting, the run archive, pages, stability, failure categories, quarantine and the JSON API
+* [Diagnostics, reports and CI](docs/ci.md): timelines, traces, flake history, the `btp` CLI, pull-request comments, SARIF, OpenTelemetry, impact analysis, GitHub Actions, Azure Pipelines, GitLab and mutation testing
+* [Configuration](docs/configuration.md): `btp.json` and `BTP_*` environment variables
+* [Architecture](docs/architecture.md): how the pieces fit, and how to write a new driver
+* [Improvement progress](docs/improvement-progress.md): the audit, what was fixed and verified, and what is deferred
+* [Testing solutions across stacks](reports/Testing%20solutions%20across%20stacks.md): what other ecosystems offer, and which of it BlazorTestPlatform now covers
+* [Gap analysis, fourth pass](reports/Gap%20analysis%2C%20fourth%20pass.md): .NET 11, run control, screenshots and checks in play, and what is still deferred
+* [Gap analysis, fifth pass](reports/Gap%20analysis%2C%20fifth%20pass.md): releases through November 2026 (Playwright 1.65, Vitest 5, Storybook 10.6) and what was adopted
+
+## How it relates to other tools
+
+| Tool | Relationship |
+|---|---|
+| **bUnit** | The in-memory engine. BlazorTestPlatform adds stories, browser-faithful interactions, a11y rules, render budgets and reporting on top. Plain bUnit tests keep working next to stories. |
+| **Playwright** | The browser engine. BlazorTestPlatform adds Blazor hydration awareness, the render-mode matrix, the story frame bridge (actions, fake time), axe-core, visual baselines and diagnostics. |
+| **Storybook** | The same story/workbench idea, native to Blazor and .NET. Stories are C#, and play scripts run in tests as well as in the UI. |
+| **Chromatic / Percy** | Self-hosted visual regression in Chromium, Firefox and WebKit: baselines live in git and are reviewed in the HTML report and the pull-request comment. No snapshot quota, and no component code leaves your network. |
+| **axe-core** | Bundled and run in every browser cell. The in-memory rules use axe rule ids, so findings line up across engines. |
+| **Testing Library** | The locator philosophy (role, label, text first), implemented for both drivers. |
+
+## Status and roadmap
+
+The latest preview is `0.1.0-preview.2`; [CHANGELOG.md](CHANGELOG.md) lists what has landed since. Planned next:
+
+* Layout-aware checks in bUnit (sizes, overflow, overlap). bUnit evaluates CSS visibility and media queries but does no layout, so stories that depend on geometry declare it and are skipped there.
+
+## Repository layout
+
+```
+src/        the packages
+tests/      unit and driver tests for every package (890 tests, run on net10.0 and net11.0)
+demo/       a design system, its stories, a host with the tour, workbench and test hub (Server + WASM), end-to-end tests
+docs/       guides
+```
+
+```bash
+dotnet build BlazorTestPlatform.slnx
+dotnet test --project tests/BlazorTestPlatform.Bunit.Tests       # or any test project
+dotnet test --project demo/BlazorTestPlatform.Demo.UI.Tests      # needs Playwright browsers
+scripts/visual-tests.sh                                          # browser suites in the CI container (Docker)
+```
+
+## License
+
+MIT

@@ -1,0 +1,77 @@
+using BlazorTestPlatform;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace BlazorTestPlatform.Demo.UI.Stories;
+
+/// <summary>
+/// An HTTP-backed component. Every story answers the component's requests from a story-scoped fake backend
+/// (<c>MockHttp</c>), so it renders the same in bUnit, under Interactive Server and in WebAssembly.
+/// </summary>
+public sealed class PeopleDirectoryStories : Stories<PeopleDirectory>
+{
+    private static readonly Person[] Everyone =
+    [
+        new("Ada Lovelace", "ada@example.com", "Engineering"),
+        new("Grace Hopper", "grace@example.com", "Engineering"),
+        new("Dieter Rams", "dieter@example.com", "Design"),
+    ];
+
+    public override string Title => "Data/People directory";
+
+    protected override void Define(StoryCollectionBuilder<PeopleDirectory> stories)
+    {
+        stories.Defaults(s => s
+            .Services(services => services.AddTransient<PeopleClient>())
+            .MockHttp(http =>
+            {
+                http.Get("api/people").RespondJson(Everyone, DemoJsonContext.Default.PersonArray);
+                http.Get("api/people?team=Design").RespondJson([.. Everyone.Where(p => p.Team == "Design")], DemoJsonContext.Default.PersonArray);
+                http.Get("api/people?team=Support").RespondJson([], DemoJsonContext.Default.PersonArray);
+            }));
+
+        stories.Add("Loaded", s => s.Description("The collection defaults answer GET api/people from MockHttp, a fake backend scoped to the story. The component's typed HttpClient never notices."));
+
+        stories.Add("Empty team", s => s.Description("A story adds its own rules; later rules win.").MockHttp(http => http.Get("api/people").RespondJson([], DemoJsonContext.Default.PersonArray)));
+
+        stories.Add("From a recording", s => s
+            .Description("ReplayHar answers from a HAR file recorded against the deployed API (an embedded resource, so it also works under WebAssembly). The host is ignored, so the story's client gets the recorded answers; later MockHttp rules would still win.")
+            .NoVisual()
+            .MockHttp(http => http.ReplayHar(typeof(PeopleDirectoryStories).Assembly.GetManifestResourceStream("Recordings.people.har")!))
+            .Play(async ctx =>
+            {
+                await ctx.Expect(ctx.GetByRole("listitem")).ToHaveCountAsync(2);
+                await ctx.Expect(ctx.GetByRole("listitem").First).ToContainTextAsync("Margaret Hamilton");
+                await ctx.ExpectRequest("GET", "api/people").ToHaveBeenMadeAsync(times: 1);
+            }));
+
+        stories.Add("Loading", s => s
+            .Description("Never() keeps the request pending, so the loading state is a stable story.")
+            .MockHttp(http => http.Get("api/people").Never())
+            .Prerender(false));
+
+        stories.Add("Server error with retry", s => s
+            .Description("Times(1) answers the first request with a 500, then falls back to the defaults: Retry succeeds. ExpectRequest counts both requests.")
+            .MockHttp(http => http.Get("api/people").RespondStatus(500).Times(1))
+            .Play(async ctx =>
+            {
+                await ctx.Expect(ctx.GetByRole("alert")).ToContainTextAsync("The server answered 500.");
+                await ctx.GetByRole("button", "Retry").ClickAsync();
+                await ctx.Expect(ctx.GetByRole("listitem")).ToHaveCountAsync(3);
+                await ctx.ExpectRequest("GET", "api/people").ToHaveBeenMadeAsync(times: 2);
+            }));
+
+        stories.Add("Filter by team", s => s.Description("Selecting a team sends the query string the mock expects.").Play(async ctx =>
+        {
+            await ctx.Expect(ctx.GetByRole("listitem")).ToHaveCountAsync(3);
+
+            await ctx.GetByLabel("Team", exact: true).SelectOptionAsync("Design");
+            await ctx.ExpectRequest("GET", "api/people?team=Design").ToHaveBeenMadeAsync(times: 1);
+            await ctx.Expect(ctx.GetByRole("listitem")).ToHaveCountAsync(1);
+            await ctx.Expect(ctx.GetByRole("listitem")).ToContainTextAsync("Dieter Rams");
+
+            await ctx.GetByLabel("Team", exact: true).SelectOptionAsync("Support");
+            await ctx.Expect(ctx.GetByText("No people in this team yet.")).ToBeVisibleAsync();
+            await ctx.ExpectRequest("POST", "api/*").NotToHaveBeenMadeAsync();
+        }));
+    }
+}

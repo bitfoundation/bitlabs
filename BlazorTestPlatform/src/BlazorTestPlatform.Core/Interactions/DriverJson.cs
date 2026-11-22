@@ -1,0 +1,284 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+namespace BlazorTestPlatform.Drivers;
+
+/// <summary>
+/// Reflection-free JSON for drivers that talk to JavaScript (locator chains, actions, element snapshots).
+/// Safe in trimmed WebAssembly apps.
+/// </summary>
+public static class DriverJson
+{
+    /// <summary>Serializes a locator chain for the in-browser locator engines.</summary>
+    public static string Steps(LocatorChain chain)
+    {
+        ArgumentNullException.ThrowIfNull(chain);
+        return Write(writer => WriteSteps(writer, chain));
+    }
+
+    /// <summary>The pseudo-class names (without the colon) of <paramref name="states"/>, for the in-browser engine.</summary>
+    public static string[] PseudoClassNames(PseudoState states) =>
+        [.. Enum.GetValues<PseudoState>().Where(s => s != PseudoState.None && states.HasFlag(s)).Select(s => StoryContext.PseudoClass(s)[1..])];
+
+    /// <summary>Parses the measurements the in-browser engine returns (<c>measureJson</c>).</summary>
+    public static IReadOnlyList<ElementMeasurement> Measurements(string? json)
+    {
+        if (string.IsNullOrEmpty(json))
+        {
+            return [];
+        }
+
+        using var document = JsonDocument.Parse(json);
+        var list = new List<ElementMeasurement>();
+        foreach (var item in document.RootElement.EnumerateArray())
+        {
+            list.Add(new ElementMeasurement
+            {
+                ComputedStyle = item.TryGetProperty("style", out var style) && style.ValueKind == JsonValueKind.String ? style.GetString() : null,
+                ViewportRatio = Number(item, "ratio"),
+                X = Number(item, "x"),
+                Y = Number(item, "y"),
+                Width = Number(item, "width"),
+                Height = Number(item, "height"),
+            });
+        }
+
+        return list;
+
+        static double Number(JsonElement item, string name) =>
+            item.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.Number ? value.GetDouble() : 0;
+    }
+
+    /// <summary>Serializes an element action.</summary>
+    public static string Action(ElementAction action)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        return Write(writer =>
+        {
+            writer.WriteStartObject();
+            writer.WriteString("kind", action.Kind switch
+            {
+                ElementActionKind.Click => "click",
+                ElementActionKind.DoubleClick => "dblclick",
+                ElementActionKind.Hover => "hover",
+                ElementActionKind.Focus => "focus",
+                ElementActionKind.Blur => "blur",
+                ElementActionKind.Fill => "fill",
+                ElementActionKind.Clear => "clear",
+                ElementActionKind.Type => "type",
+                ElementActionKind.Press => "press",
+                ElementActionKind.Check => "check",
+                ElementActionKind.Uncheck => "uncheck",
+                ElementActionKind.SelectOption => "select",
+                ElementActionKind.PointerDown => "pointerdown",
+                ElementActionKind.PointerUp => "pointerup",
+                ElementActionKind.DragTo => "drag",
+                ElementActionKind.ScrollIntoView => "scroll",
+                ElementActionKind.SetInputFiles => "files",
+                _ => throw new NotSupportedException(action.Kind.ToString()),
+            });
+            if (action.Text is not null)
+            {
+                writer.WriteString("text", action.Text);
+            }
+
+            writer.WriteStartArray("values");
+            foreach (var value in action.Values ?? [])
+            {
+                writer.WriteStringValue(value);
+            }
+
+            writer.WriteEndArray();
+            if (action.Files is { } files)
+            {
+                writer.WriteStartArray("files");
+                foreach (var file in files)
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("name", file.Name);
+                    writer.WriteString("type", file.ContentType);
+                    writer.WriteNumber("lastModified", file.LastModified.ToUnixTimeMilliseconds());
+                    writer.WriteBase64String("content", file.Content.Span);
+                    writer.WriteEndObject();
+                }
+
+                writer.WriteEndArray();
+            }
+
+            writer.WriteNumber("modifiers", (int)action.Modifiers);
+            writer.WriteNumber("button", action.Button switch { MouseButton.Middle => 1, MouseButton.Right => 2, _ => 0 });
+            writer.WriteBoolean("force", action.Force);
+            if (action.Target is not null)
+            {
+                writer.WritePropertyName("target");
+                WriteSteps(writer, action.Target);
+            }
+
+            writer.WriteEndObject();
+        });
+    }
+
+    /// <summary>Parses element snapshots produced by in-browser describe functions.</summary>
+    public static IReadOnlyList<ElementInfo> Elements(string? json) =>
+        string.IsNullOrWhiteSpace(json) ? [] : JsonSerializer.Deserialize(json, DriverJsonContext.Default.ListElementInfo) ?? [];
+
+    /// <summary>Parses one element snapshot (null for <c>null</c>).</summary>
+    public static ElementInfo? Element(string? json) =>
+        string.IsNullOrWhiteSpace(json) || json == "null" ? null : JsonSerializer.Deserialize(json, DriverJsonContext.Default.ElementInfo);
+
+    private static void WriteSteps(Utf8JsonWriter writer, LocatorChain chain)
+    {
+        writer.WriteStartArray();
+        foreach (var step in chain.Steps)
+        {
+            writer.WriteStartObject();
+            switch (step.Kind)
+            {
+                case LocatorStepKind.Find:
+                    writer.WriteString("kind", "find");
+                    writer.WritePropertyName("query");
+                    WriteQuery(writer, step.Query!);
+                    break;
+                case LocatorStepKind.Nth:
+                    writer.WriteString("kind", "nth");
+                    writer.WriteNumber("index", step.Index);
+                    break;
+                case LocatorStepKind.HasText:
+                    writer.WriteString("kind", "hasText");
+                    writer.WriteString("text", step.Text);
+                    WritePattern(writer, step.Pattern);
+                    break;
+                case LocatorStepKind.HasNotText:
+                    writer.WriteString("kind", "hasNotText");
+                    writer.WriteString("text", step.Text);
+                    WritePattern(writer, step.Pattern);
+                    break;
+                case LocatorStepKind.Has:
+                case LocatorStepKind.HasNot:
+                    writer.WriteString("kind", step.Kind == LocatorStepKind.Has ? "has" : "hasNot");
+                    writer.WritePropertyName("inner");
+                    WriteSteps(writer, step.Inner!);
+                    break;
+            }
+
+            writer.WriteEndObject();
+        }
+
+        writer.WriteEndArray();
+    }
+
+    private static void WriteQuery(Utf8JsonWriter writer, By query)
+    {
+        writer.WriteStartObject();
+        switch (query)
+        {
+            case CssQuery css:
+                writer.WriteString("type", "css");
+                writer.WriteString("selector", css.Selector);
+                break;
+            case RoleQuery role:
+                writer.WriteString("type", "role");
+                writer.WriteString("role", role.RoleName);
+                if (role.Name is null)
+                {
+                    writer.WriteNull("name");
+                }
+                else
+                {
+                    writer.WriteString("name", role.Name);
+                }
+
+                writer.WriteBoolean("exact", role.Exact);
+                WriteState(writer, "checked", role.Checked);
+                WriteState(writer, "pressed", role.Pressed);
+                WriteState(writer, "expanded", role.Expanded);
+                WriteState(writer, "selected", role.Selected);
+                WriteState(writer, "disabled", role.Disabled);
+                if (role.Level is { } level)
+                {
+                    writer.WriteNumber("level", level);
+                }
+
+                writer.WriteBoolean("includeHidden", role.IncludeHidden);
+                break;
+            case TextQuery text:
+                Text(writer, "text", text.Value, text.Exact);
+                break;
+            case LabelQuery label:
+                Text(writer, "label", label.Value, label.Exact);
+                break;
+            case PlaceholderQuery placeholder:
+                Text(writer, "placeholder", placeholder.Value, placeholder.Exact);
+                break;
+            case AltTextQuery alt:
+                Text(writer, "alt", alt.Value, alt.Exact);
+                break;
+            case TitleQuery title:
+                Text(writer, "title", title.Value, title.Exact);
+                break;
+            case TestIdQuery testId:
+                writer.WriteString("type", "testid");
+                writer.WriteString("value", testId.Value);
+                writer.WriteString("attribute", By.TestIdAttribute);
+                break;
+            default:
+                throw new NotSupportedException($"Query type '{query.GetType().Name}' is not supported.");
+        }
+
+        WritePattern(writer, query.Pattern);
+        writer.WriteEndObject();
+    }
+
+    private static void WriteState(Utf8JsonWriter writer, string name, bool? value)
+    {
+        if (value is { } set)
+        {
+            writer.WriteBoolean(name, set);
+        }
+    }
+
+    // A .NET pattern runs as a JavaScript RegExp in browsers: only options with a JavaScript flag are allowed.
+    private static void WritePattern(Utf8JsonWriter writer, System.Text.RegularExpressions.Regex? pattern)
+    {
+        if (pattern is null)
+        {
+            return;
+        }
+
+        const System.Text.RegularExpressions.RegexOptions Portable = System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            | System.Text.RegularExpressions.RegexOptions.Multiline | System.Text.RegularExpressions.RegexOptions.Singleline
+            | System.Text.RegularExpressions.RegexOptions.Compiled | System.Text.RegularExpressions.RegexOptions.CultureInvariant;
+        if ((pattern.Options & ~Portable) != 0)
+        {
+            throw new NotSupportedException(
+                $"Locator pattern /{pattern}/ uses {pattern.Options & ~Portable}, which browser drivers cannot run as a JavaScript RegExp. Use IgnoreCase, Multiline or Singleline only.");
+        }
+
+        writer.WriteString("pattern", pattern.ToString());
+        writer.WriteString("flags", TextMatch.Flags(pattern));
+    }
+
+    private static void Text(Utf8JsonWriter writer, string type, string value, bool exact)
+    {
+        writer.WriteString("type", type);
+        writer.WriteString("value", value);
+        writer.WriteBoolean("exact", exact);
+    }
+
+    private static string Write(Action<Utf8JsonWriter> write)
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer))
+        {
+            write(writer);
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+}
+
+[JsonSourceGenerationOptions(JsonSerializerDefaults.Web)]
+[JsonSerializable(typeof(List<ElementInfo>))]
+[JsonSerializable(typeof(ElementInfo))]
+internal sealed partial class DriverJsonContext : JsonSerializerContext;

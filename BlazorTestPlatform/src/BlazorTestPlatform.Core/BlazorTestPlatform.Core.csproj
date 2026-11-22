@@ -1,0 +1,59 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>BlazorTestPlatform</RootNamespace>
+    <AssemblyName>BlazorTestPlatform.Core</AssemblyName>
+    <Description>Core story, scenario, test-data, matrix, accessibility and performance model for BlazorTestPlatform. Driver-agnostic: the same stories run in bUnit, real browsers and the component workbench.</Description>
+    <IsTrimmable>true</IsTrimmable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Components.Web" />
+    <PackageReference Include="Microsoft.AspNetCore.Components.Authorization" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+    <PackageReference Include="Microsoft.Extensions.Http" />
+  </ItemGroup>
+
+  <!-- The story-catalog source generator ships inside this package (analyzers/), so every consumer gets
+       reflection-free, trimming-safe story discovery automatically. -->
+  <ItemGroup>
+    <ProjectReference Include="..\BlazorTestPlatform.Generators\BlazorTestPlatform.Generators.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="..\BlazorTestPlatform.CodeFixes\BlazorTestPlatform.CodeFixes.csproj" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!--
+    Packs the generator from wherever it was built (bin/, -output, -artifacts-path or UseArtifactsOutput). The analyzers/
+    folder is shared by every target framework, so it is added once, by the pack build itself (BeforePack), whether it
+    packs every framework or one (-p:TargetFramework=...).
+  -->
+  <PropertyGroup>
+    <BeforePack>$(BeforePack);_BtpPackStoryGenerator</BeforePack>
+  </PropertyGroup>
+
+  <Target Name="_BtpPackStoryGenerator">
+    <MSBuild Projects="..\BlazorTestPlatform.Generators\BlazorTestPlatform.Generators.csproj" Targets="GetTargetPath" Properties="Configuration=$(Configuration)" RemoveProperties="TargetFramework;RuntimeIdentifier">
+      <Output TaskParameter="TargetOutputs" ItemName="_BtpStoryGenerator" />
+    </MSBuild>
+    <MSBuild Projects="..\BlazorTestPlatform.CodeFixes\BlazorTestPlatform.CodeFixes.csproj" Targets="GetTargetPath" Properties="Configuration=$(Configuration)" RemoveProperties="TargetFramework;RuntimeIdentifier">
+      <Output TaskParameter="TargetOutputs" ItemName="_BtpStoryCodeFixes" />
+    </MSBuild>
+    <Error Condition="!Exists('@(_BtpStoryGenerator)')" Text="The story generator was not built: @(_BtpStoryGenerator). Build the solution (or the Generators project) before packing Core." />
+    <Error Condition="!Exists('@(_BtpStoryCodeFixes)')" Text="The story code fixes were not built: @(_BtpStoryCodeFixes). Build the solution (or the CodeFixes project) before packing Core." />
+    <ItemGroup>
+      <None Include="@(_BtpStoryGenerator)" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+      <None Include="@(_BtpStoryCodeFixes)" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="BlazorTestPlatform.Bunit" />
+    <InternalsVisibleTo Include="BlazorTestPlatform.Playwright" />
+    <InternalsVisibleTo Include="BlazorTestPlatform.Workbench" />
+    <InternalsVisibleTo Include="BlazorTestPlatform.Core.Tests" />
+  </ItemGroup>
+
+</Project>

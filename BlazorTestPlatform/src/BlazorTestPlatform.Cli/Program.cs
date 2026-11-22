@@ -1,0 +1,698 @@
+using System.CommandLine;
+using System.Globalization;
+using BlazorTestPlatform;
+using BlazorTestPlatform.Accessibility;
+using BlazorTestPlatform.Cli;
+using BlazorTestPlatform.Configuration;
+using BlazorTestPlatform.Coverage;
+using BlazorTestPlatform.Performance;
+using BlazorTestPlatform.Reporting;
+using BlazorTestPlatform.Results;
+using BlazorTestPlatform.Visual;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+
+Console.OutputEncoding = System.Text.Encoding.UTF8;
+
+var project = new Option<string>("--project", "-p")
+{
+    Description = "Test project directory (contains the .csproj and btp.json). Defaults to BTP_PROJECT_DIR, else the current directory.",
+    DefaultValueFactory = _ => Environment.GetEnvironmentVariable("BTP_PROJECT_DIR") is { Length: > 0 } projectDirectory ? projectDirectory : Environment.CurrentDirectory,
+    Recursive = true,
+};
+
+var results = new Option<string[]>("--results", "-r")
+{
+    Description = "Results directories to read (repeatable). Defaults to the project's results directory.",
+    AllowMultipleArgumentsPerToken = true,
+};
+
+var root = new RootCommand("BlazorTestPlatform: reports, baseline approval, accessibility reviews and flake analysis.") { project };
+
+// btp report
+var output = new Option<string?>("--output", "-o") { Description = "Directory for the HTML report (default: <results>/report)." };
+var junit = new Option<string?>("--junit") { Description = "Also write JUnit XML to this path." };
+var markdown = new Option<string?>("--markdown") { Description = "Also write a Markdown summary to this path." };
+var githubSummary = new Option<bool>("--github-summary") { Description = "Append the Markdown summary to $GITHUB_STEP_SUMMARY." };
+var history = new Option<string?>("--history") { Description = "Flake history file to update and analyse." };
+var runId = new Option<string?>("--run-id") { Description = "Identifier of this run in the history (default: CI run id or timestamp)." };
+var failOnFailures = new Option<bool>("--fail-on-failures") { Description = "Exit with code 1 when any story failed." };
+var prComment = new Option<bool>("--pr-comment") { Description = "Post the Markdown summary on the GitHub pull request, or update the comment an earlier run posted (needs GITHUB_TOKEN with pull-requests: write)." };
+var pullRequest = new Option<int?>("--pr") { Description = "Pull request number for --pr-comment (default: from the GitHub Actions event)." };
+var repository = new Option<string?>("--repository") { Description = "Repository (owner/name) for --pr-comment (default: GITHUB_REPOSITORY)." };
+var reportUrl = new Option<string?>("--report-url") { Description = "Link to the published HTML report, added to the Markdown summary (default: the GitHub Actions run)." };
+var sarif = new Option<string?>("--sarif") { Description = "Also write a SARIF 2.1.0 log (accessibility violations, failures, visual and performance regressions) for code scanning." };
+var ctrf = new Option<string?>("--ctrf") { Description = "Also write a CTRF report (Common Test Report Format JSON, keeps retries and flaky runs) to this path." };
+var sourceRoot = new Option<string?>("--source-root") { Description = "Repository root that SARIF locations are relative to (default: the current directory)." };
+var archive = new Option<string?>("--archive") { Description = "Run archive directory to add this run to (run history for trends, stability and the hub; persist it between CI runs). Typically <project>/.btp/runs." };
+var trigger = new Option<string?>("--trigger") { Description = "What started the run, recorded in the archive (default: ci on CI, else local)." };
+var onlyFailures = new Option<bool>("--only-failures") { Description = "The HTML report and JUnit XML show only failed and flaky results (summaries keep the whole run's counts)." };
+var codeCoverage = new Option<string[]>("--code-coverage")
+{
+    Description = "Cobertura code coverage reports (files or directories searched for *.cobertura.xml) merged into story coverage: each component's line and branch coverage next to its states. Default: the *.cobertura.xml files under the results directories.",
+    AllowMultipleArgumentsPerToken = true,
+};
+var report = new Command("report", "Aggregate results into an HTML report (plus optional JUnit, Markdown, flake history and a pull-request comment).")
+{
+    results, output, junit, ctrf, markdown, githubSummary, history, runId, failOnFailures, prComment, pullRequest, repository, reportUrl, sarif, sourceRoot, archive, trigger, codeCoverage, onlyFailures,
+};
+report.SetAction(async (parse, cancellationToken) =>
+{
+    var settings = Settings(parse);
+    var directories = ResultDirectories(parse, settings);
+    var summary = RunSummary.From(Read(directories, out var unreadable));
+    foreach (var problem in unreadable)
+    {
+        Console.Error.WriteLine($"warning: unreadable result {problem}");
+    }
+
+    if (summary.Total == 0)
+    {
+        Console.Error.WriteLine($"No results found in: {string.Join(", ", directories)}");
+        return 2;
+    }
+
+    FlakeReport? flakes = null;
+    if (parse.GetValue(history) is { } historyPath)
+    {
+        var flakeHistory = FlakeHistory.Load(historyPath, out var historyProblem);
+        if (historyProblem is not null)
+        {
+            Console.Error.WriteLine($"warning: {historyProblem}");
+        }
+
+        flakeHistory.Add(parse.GetValue(runId) ?? Environment.GetEnvironmentVariable("GITHUB_RUN_ID") ?? Environment.GetEnvironmentVariable("BUILD_BUILDID") ?? DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss", CultureInfo.InvariantCulture), summary.Results);
+        flakeHistory.Save(historyPath);
+        flakes = flakeHistory.Analyze();
+    }
+
+    if (parse.GetValue(archive) is { } archiveDirectory)
+    {
+        var info = RunInfo.Detect(parse.GetValue(runId), parse.GetValue(trigger), settings.ProjectDirectory);
+        var archived = new RunArchive(archiveDirectory).Save(RunRecord.Create(info, summary.Results));
+        Console.WriteLine($"Run archive: {archived}");
+    }
+
+    StoryCoverageReport? coverage = null;
+    try
+    {
+        coverage = directories.Select(StoryCoverageReport.Load).OfType<StoryCoverageReport>().FirstOrDefault();
+    }
+    catch (Exception ex) when (ex is System.Text.Json.JsonException or IOException or NotSupportedException)
+    {
+        Console.Error.WriteLine($"Story coverage not read ({ex.Message}); the report has no coverage section.");
+    }
+
+    if (coverage is null && parse.GetValue(codeCoverage) is { Length: > 0 })
+    {
+        Console.Error.WriteLine($"Code coverage not merged: no {StoryCoverageReport.FileName} in the results (save a StoryCoverage report from a test first).");
+    }
+
+    if (coverage is not null)
+    {
+        // Code coverage of the components, from Cobertura reports given or found next to the results.
+        var given = parse.GetValue(codeCoverage) ?? [];
+        var coberturaFiles = (given.Length > 0 ? given : directories)
+            .SelectMany(p => Directory.Exists(p) ? CoberturaCoverage.Find(p) : File.Exists(p) ? [p] : [])
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (given.Length > 0 && coberturaFiles.Length == 0)
+        {
+            Console.Error.WriteLine($"No Cobertura reports at {string.Join(", ", given)}.");
+        }
+
+        if (coberturaFiles.Length > 0)
+        {
+            try
+            {
+                coverage = coverage.WithCodeCoverage(CoberturaCoverage.Load(coberturaFiles));
+                coverage.Save(directories[0]);
+                Console.WriteLine($"Code coverage: {coberturaFiles.Length} report(s) merged into story coverage ({(coverage.Code?.LineRate ?? 0).ToString("P0", CultureInfo.InvariantCulture)} of component lines).");
+            }
+            catch (FormatException ex)
+            {
+                Console.Error.WriteLine($"Code coverage not merged: {ex.Message}");
+            }
+        }
+    }
+    var reportDirectory = parse.GetValue(output) ?? Path.Combine(directories[0], "report");
+    var path = HtmlReportWriter.Write(summary, reportDirectory, new HtmlReportOptions { Flakes = flakes, Coverage = coverage, OnlyFailures = parse.GetValue(onlyFailures) });
+    Console.WriteLine($"HTML report: {path}");
+
+    if (parse.GetValue(junit) is { } junitPath)
+    {
+        JUnitReportWriter.Write(summary, junitPath, new JUnitOptions { SourceRoot = parse.GetValue(sourceRoot) ?? RepositoryRoot(settings.ProjectDirectory), OnlyFailures = parse.GetValue(onlyFailures) });
+        Console.WriteLine($"JUnit XML:   {Path.GetFullPath(junitPath)}");
+    }
+
+    if (parse.GetValue(ctrf) is { } ctrfPath)
+    {
+        CtrfReportWriter.Write(summary, ctrfPath);
+        Console.WriteLine($"CTRF:        {Path.GetFullPath(ctrfPath)}");
+    }
+
+    if (parse.GetValue(sarif) is { } sarifPath)
+    {
+        SarifReportWriter.Write(summary, sarifPath, new SarifOptions { SourceRoot = parse.GetValue(sourceRoot) });
+        Console.WriteLine($"SARIF:       {Path.GetFullPath(sarifPath)}");
+    }
+
+    var link = parse.GetValue(reportUrl) ?? GitHubRunUrl();
+    var md = MarkdownSummaryWriter.Create(summary, flakes, link, coverage);
+    if (parse.GetValue(markdown) is { } markdownPath)
+    {
+        File.WriteAllText(markdownPath, md);
+        Console.WriteLine($"Markdown:    {Path.GetFullPath(markdownPath)}");
+    }
+
+    if (parse.GetValue(githubSummary) && Environment.GetEnvironmentVariable("GITHUB_STEP_SUMMARY") is { Length: > 0 } stepSummary)
+    {
+        File.AppendAllText(stepSummary, md + Environment.NewLine);
+    }
+
+    if (parse.GetValue(prComment))
+    {
+        // A missing token, a read-only one (pull requests from forks), a timeout or a malformed API URL must not fail
+        // the build: the report is still there.
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(60) };
+        try
+        {
+            var comment = GitHubPullRequestComment.FromEnvironment(http, out var problem, parse.GetValue(pullRequest), parse.GetValue(repository));
+            if (comment is null)
+            {
+                Console.WriteLine($"PR comment:  skipped. {problem}");
+            }
+            else
+            {
+                var posted = await comment.UpsertAsync(md, cancellationToken);
+                Console.WriteLine($"PR comment:  {(posted.Created ? "posted" : "updated")} {posted.Url}");
+            }
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UriFormatException or System.Text.Json.JsonException or InvalidOperationException && !cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"PR comment:  skipped. {ex.Message}");
+            if (Environment.GetEnvironmentVariable("GITHUB_ACTIONS") is { Length: > 0 })
+            {
+                Console.WriteLine($"::warning title=BlazorTestPlatform::Could not comment on the pull request. {ex.Message.ReplaceLineEndings(" ")}");
+            }
+        }
+    }
+
+    PrintSummary(summary);
+    if (unreadable.Count > 0)
+    {
+        Console.WriteLine($"  {unreadable.Count} result file(s) could not be read; they may hide failures.");
+    }
+
+    return parse.GetValue(failOnFailures) && (!summary.Success || unreadable.Count > 0) ? 1 : 0;
+});
+root.Add(report);
+
+// btp approve
+var filter = new Option<string?>("--filter", "-f") { Description = "Only approve snapshots/stories matching this glob (e.g. 'inputs-button--*')." };
+var dryRun = new Option<bool>("--dry-run") { Description = "List what would be approved without changing files." };
+var interactive = new Option<bool>("--interactive", "-i") { Description = "Ask about each snapshot, showing what changed: approve it, skip it, approve the rest or quit." };
+var approve = new Command("approve", "Accept changed or missing visual snapshots from the last run as the new baselines.") { results, filter, dryRun, interactive };
+approve.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var ask = parse.GetValue(interactive);
+    if (ask && parse.GetValue(dryRun))
+    {
+        Console.Error.WriteLine("--interactive and --dry-run cannot be combined: --dry-run lists the snapshots without asking.");
+        return 2;
+    }
+
+    var pattern = parse.GetValue(filter);
+    // The story snapshots and the named screenshots taken in play.
+    var candidates = ResultDirectories(parse, settings)
+        .SelectMany(directory => new ResultsStore(directory).ReadAll().SelectMany(result => result.VisualComparisons().Select(visual => (Result: result, Visual: visual, Directory: directory))))
+        .Where(c => c.Visual is { ActualPath: not null } v && v.Status is VisualStatus.Mismatched or VisualStatus.SizeMismatch or VisualStatus.MissingBaseline)
+        .Where(c => pattern is null || GlobMatch(c.Result.StoryId, pattern) || GlobMatch(c.Visual.SnapshotName, pattern))
+        .GroupBy(c => c.Visual.SnapshotName, StringComparer.Ordinal)
+        .Select(g => g.First())
+        .ToArray();
+
+    if (candidates.Length == 0)
+    {
+        Console.WriteLine("Nothing to approve.");
+        return 0;
+    }
+
+    // Baselines are written into this project's snapshot directory only, from images inside the results directory the
+    // result was read from: a results file (for example a downloaded CI artifact) cannot point the copy anywhere else.
+    var approved = 0;
+    var failed = 0;
+    var skipped = 0;
+    var position = 0;
+    var unanswered = false;
+    foreach (var (result, visual, directory) in candidates)
+    {
+        position++;
+        if (ask)
+        {
+            var choice = InteractiveApproval.Ask(Console.In, Console.Out, visual, result.StoryId, directory, position, candidates.Length);
+            if (choice is ApprovalChoice.Quit or ApprovalChoice.EndOfInput)
+            {
+                unanswered = choice == ApprovalChoice.EndOfInput;
+                skipped += candidates.Length - position + 1;
+                break;
+            }
+
+            if (choice == ApprovalChoice.Skip)
+            {
+                skipped++;
+                continue;
+            }
+
+            // Approve the rest without asking.
+            ask = choice != ApprovalChoice.ApproveRest;
+        }
+
+        if (parse.GetValue(dryRun))
+        {
+            Console.WriteLine($"would approve  {visual.SnapshotName}  ({visual.Status}, {visual.DiffPixels:N0} px)");
+            approved++;
+            continue;
+        }
+
+        try
+        {
+            SnapshotStore.Approve(visual, settings.SnapshotDirectoryPath, directory);
+            Console.WriteLine($"approved  {visual.SnapshotName}  ({visual.Status}, {visual.DiffPixels:N0} px)");
+            approved++;
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"skipped   {visual.SnapshotName}: {ex.Message}");
+            failed++;
+        }
+    }
+
+    Console.WriteLine(parse.GetValue(dryRun) ? $"{approved} snapshot(s) would be approved." : $"{approved} baseline(s) updated{(skipped > 0 ? $", {skipped} left as they were" : string.Empty)}. Review and commit them.");
+    if (unanswered)
+    {
+        // Nobody answered (no terminal, as on CI): that is not a review.
+        Console.Error.WriteLine("The input ended before every snapshot was answered; the rest were left as they were.");
+    }
+
+    return failed == 0 && !unanswered ? 0 : 1;
+});
+root.Add(approve);
+
+// btp quarantine
+var quarantinePattern = new Argument<string>("pattern") { Description = "Story id, result key or glob (data-people-*, *|webkit|*)." };
+var quarantineReason = new Option<string>("--reason") { Description = "Why the story is quarantined.", Required = true };
+var quarantineOwner = new Option<string?>("--owner") { Description = "Who owns the fix." };
+var quarantineIssue = new Option<string?>("--issue") { Description = "Issue that tracks the fix." };
+var quarantineExpires = new Option<string?>("--expires") { Description = "Last day the quarantine applies (yyyy-MM-dd)." };
+var quarantineAdd = new Command("add", "Quarantine a story: it keeps running and reporting, but its failures stop failing the build.") { quarantinePattern, quarantineReason, quarantineOwner, quarantineIssue, quarantineExpires };
+quarantineAdd.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    DateOnly? expires = null;
+    if (parse.GetValue(quarantineExpires) is { } text)
+    {
+        if (!DateOnly.TryParseExact(text, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var day))
+        {
+            Console.Error.WriteLine($"--expires must be yyyy-MM-dd, not '{text}'.");
+            return 2;
+        }
+
+        expires = day;
+    }
+
+    var entry = new QuarantineEntry
+    {
+        Pattern = parse.GetValue(quarantinePattern)!,
+        Reason = parse.GetValue(quarantineReason)!,
+        Owner = parse.GetValue(quarantineOwner),
+        Issue = parse.GetValue(quarantineIssue),
+        Expires = expires,
+        Added = DateTimeOffset.UtcNow,
+    };
+    settings.Quarantine.With(entry).Save(settings.QuarantineFilePath);
+    Console.WriteLine($"Quarantined {entry.Pattern} in {settings.QuarantineFilePath}. Commit the file.");
+    return 0;
+});
+var quarantineRemove = new Command("remove", "Release a story from quarantine.") { quarantinePattern };
+quarantineRemove.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var pattern = parse.GetValue(quarantinePattern)!;
+    if (!settings.Quarantine.Entries.Any(e => string.Equals(e.Pattern, pattern, StringComparison.OrdinalIgnoreCase)))
+    {
+        Console.Error.WriteLine($"'{pattern}' is not quarantined.");
+        return 1;
+    }
+
+    settings.Quarantine.Without(pattern).Save(settings.QuarantineFilePath);
+    Console.WriteLine($"Released {pattern}. Commit {settings.QuarantineFilePath}.");
+    return 0;
+});
+var quarantineList = new Command("list", "List quarantined stories.");
+quarantineList.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var today = DateOnly.FromDateTime(DateTime.UtcNow);
+    if (settings.Quarantine.Entries.Count == 0)
+    {
+        Console.WriteLine("Nothing is quarantined.");
+        return 0;
+    }
+
+    foreach (var entry in settings.Quarantine.Entries)
+    {
+        var state = entry.IsActive(today) ? "active " : "expired";
+        Console.WriteLine($"{state}  {entry.Pattern,-40} {entry.Reason}{(entry.Owner is null ? string.Empty : $"  owner: {entry.Owner}")}{(entry.Expires is { } e ? $"  until {e:yyyy-MM-dd}" : string.Empty)}");
+    }
+
+    return 0;
+});
+root.Add(new Command("quarantine", "Quarantined stories (quarantine.json): failures are reported but do not fail the build.") { quarantineAdd, quarantineRemove, quarantineList });
+
+// btp perf approve
+var baselineFile = new Option<string?>("--baseline") { Description = "Performance baseline file (default from settings)." };
+var perfApprove = new Command("approve", "Record the measured render metrics of the last run as the performance baseline.") { results, filter, baselineFile };
+perfApprove.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var store = new PerformanceBaselineStore(parse.GetValue(baselineFile) ?? settings.PerformanceBaselineFilePath);
+    var pattern = parse.GetValue(filter);
+    var measured = ReadResults(ResultDirectories(parse, settings))
+        .Where(r => r.Performance is not null && (pattern is null || GlobMatch(r.StoryId, pattern)))
+        .ToArray();
+    foreach (var result in measured)
+    {
+        var key = PerformanceBaselineStore.KeyFor(result);
+        store.Set(key, PerformanceBaselineEntry.From(result.Performance!));
+        Console.WriteLine($"recorded  {key}  {result.Performance}");
+    }
+
+    Console.WriteLine($"{measured.Length} baseline(s) written to {store.FilePath}");
+    return 0;
+});
+var perf = new Command("perf", "Render-performance baselines.") { perfApprove };
+root.Add(perf);
+
+// btp a11y status | init
+var a11yStatus = new Command("status", "Show the state of manual accessibility reviews (and the gate states of the last review gate run).") { results };
+a11yStatus.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var store = new ManualReviewStore(settings.ReviewsDirectoryPath);
+    var reviews = store.LoadAll().ToDictionary(r => r.Component, StringComparer.Ordinal);
+
+    // Fingerprints need the components rendered, so gate states come from the last run of the review gate test.
+    var gate = ResultDirectories(parse, settings).Select(ReviewGateReport.Load).OfType<ReviewGateReport>().MaxBy(g => g.EvaluatedAt);
+    var states = gate?.Entries.ToDictionary(e => e.Component, StringComparer.Ordinal) ?? [];
+    if (reviews.Count == 0 && states.Count == 0)
+    {
+        Console.WriteLine($"No reviews in {store.Directory}. Run the review gate test, then 'btp a11y init'.");
+        return 0;
+    }
+
+    foreach (var component in reviews.Keys.Union(states.Keys).Order(StringComparer.Ordinal))
+    {
+        var state = states.TryGetValue(component, out var entry) ? entry.State.ToString() : "?";
+        if (!reviews.TryGetValue(component, out var review))
+        {
+            Console.WriteLine($"{state,-10} {component,-40} no review file");
+            continue;
+        }
+
+        var counts = review.Items.GroupBy(i => i.Status).ToDictionary(g => g.Key, g => g.Count());
+        Console.WriteLine($"{state,-10} {review.Component,-40} pass {counts.GetValueOrDefault(ReviewStatus.Pass),2}  fail {counts.GetValueOrDefault(ReviewStatus.Fail),2}  n/a {counts.GetValueOrDefault(ReviewStatus.NotApplicable),2}  pending {counts.GetValueOrDefault(ReviewStatus.NotReviewed),2}  {review.Reviewer ?? "-"} {review.ReviewedAt:yyyy-MM-dd}");
+    }
+
+    Console.WriteLine(gate is null
+        ? "Gate states are unknown ('?'): run the review gate test (AccessibilityReviews.VerifyAsync) to compare fingerprints."
+        : $"Gate states from the review gate run at {gate.EvaluatedAt:yyyy-MM-dd HH:mm} UTC.");
+    return 0;
+});
+var force = new Option<bool>("--force") { Description = "Overwrite existing review files (stale reviews)." };
+var a11yInit = new Command("init", "Copy review templates produced by the review gate test into the reviews directory.") { results, force };
+a11yInit.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var target = new ManualReviewStore(settings.ReviewsDirectoryPath);
+    var copied = 0;
+    foreach (var directory in ResultDirectories(parse, settings))
+    {
+        var templates = new ManualReviewStore(Path.Combine(directory, "a11y-review-templates"));
+        foreach (var template in templates.LoadAll())
+        {
+            if (File.Exists(target.PathFor(template.Component)) && !parse.GetValue(force))
+            {
+                Console.WriteLine($"exists    {template.Component} (use --force to reset a stale review)");
+                continue;
+            }
+
+            Console.WriteLine($"created   {target.Save(template)}");
+            copied++;
+        }
+    }
+
+    Console.WriteLine(copied == 0 ? "No templates found. Run the manual review gate test first." : $"{copied} review file(s) ready to fill in and commit.");
+    return 0;
+});
+root.Add(new Command("a11y", "Manual accessibility review workflow.") { a11yStatus, a11yInit });
+
+// btp flaky
+var historyRequired = new Option<string>("--history") { Description = "Flake history file.", Required = true };
+var flaky = new Command("flaky", "List the flakiest stories from a flake history file.") { historyRequired };
+flaky.SetAction(parse =>
+{
+    var analysis = FlakeHistory.Load(parse.GetRequiredValue(historyRequired)).Analyze();
+    Console.WriteLine($"{analysis.Runs} runs analysed.");
+    foreach (var entry in analysis.Entries.Take(25))
+    {
+        Console.WriteLine($"{entry.FlakeRate,6:P0}  {entry.Unstable,3}/{entry.Runs,-3}  flips {entry.Flips,-3}  {entry.Key}");
+    }
+
+    return 0;
+});
+root.Add(flaky);
+
+// btp init
+var framework = new Option<TestFramework>("--framework", "-f") { Description = "Test framework of the project: xunit, nunit, mstest or tunit.", DefaultValueFactory = _ => TestFramework.Xunit };
+var ci = new Option<CiSystem>("--ci") { Description = "Also write a CI pipeline: github, azure, gitlab or none.", DefaultValueFactory = _ => CiSystem.None };
+var component = new Option<string?>("--component") { Description = "Write a first story for this component (type name, optionally namespace-qualified)." };
+var scaffoldNamespace = new Option<string?>("--namespace") { Description = "Namespace of the generated classes (default: from the project directory name)." };
+var overwrite = new Option<bool>("--force") { Description = "Overwrite files that already exist." };
+var init = new Command("init", "Scaffold btp.json, a story test class for xUnit, NUnit, MSTest or TUnit, a first story and a CI pipeline.")
+{
+    framework, ci, component, scaffoldNamespace, overwrite,
+};
+init.SetAction(parse =>
+{
+    var directory = Path.GetFullPath(parse.GetValue(project) ?? Environment.CurrentDirectory);
+    if (!Directory.Exists(directory))
+    {
+        Console.Error.WriteLine($"Project directory not found: {directory}");
+        return 1;
+    }
+
+    var chosen = parse.GetValue(framework);
+    var repositoryRoot = RepositoryRoot(directory);
+    var options = new ScaffoldOptions
+    {
+        ProjectDirectory = directory,
+        Namespace = parse.GetValue(scaffoldNamespace) is { Length: > 0 } explicitNamespace ? explicitNamespace : NamespaceFor(Path.GetFileName(directory)),
+        Framework = chosen,
+        Ci = parse.GetValue(ci),
+        Component = parse.GetValue(component),
+        RepositoryRoot = repositoryRoot,
+
+        // Pipelines run dotnet test from the repository root: the global.json there decides the runner mode.
+        TestingPlatform = Scaffolding.UsesTestingPlatform(repositoryRoot ?? directory),
+
+        // The SDK and runtimes the project's target frameworks and the repository's global.json need.
+        DotNetChannels = Scaffolding.DotNetChannels(directory, repositoryRoot),
+    };
+
+    foreach (var (path, content) in Scaffolding.Plan(options))
+    {
+        if (File.Exists(path) && !parse.GetValue(overwrite))
+        {
+            Console.WriteLine($"  kept     {Display(path)} (exists; --force overwrites)");
+            continue;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, content);
+        Console.WriteLine($"  created  {Display(path)}");
+    }
+
+    Console.WriteLine();
+    Console.WriteLine("Next: add the packages the generated code uses, then run the tests.");
+    Console.WriteLine($"  dotnet add \"{directory}\" package BlazorTestPlatform.Bunit --prerelease");
+    Console.WriteLine($"  dotnet add \"{directory}\" package {Scaffolding.AdapterPackage(chosen)} --prerelease");
+    return 0;
+});
+root.Add(init);
+
+// btp snapshots update-source
+var snapshotsSourceRoot = new Option<string?>("--source-root") { Description = "Repository root that deterministic source paths (/_/...) resolve against (default: the repository of the project)." };
+var updateSource = new Command("update-source", "Rewrite the expected accessibility trees of failed ExpectAriaSnapshotAsync calls in the story sources with what the last run saw.") { results, dryRun, snapshotsSourceRoot };
+updateSource.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var mismatches = ResultDirectories(parse, settings)
+        .SelectMany(directory => new ResultsStore(directory).ReadAll())
+        .SelectMany(result => result.AriaSnapshotMismatches)
+        .ToArray();
+    if (mismatches.Length == 0)
+    {
+        Console.WriteLine("No accessibility snapshot mismatches in the results.");
+        return 0;
+    }
+
+    var sourceRootPath = parse.GetValue(snapshotsSourceRoot) is { Length: > 0 } explicitRoot
+        ? Path.GetFullPath(explicitRoot)
+        : RepositoryRoot(settings.ProjectDirectory) ?? settings.ProjectDirectory;
+    var updates = SourceSnapshots.Update(mismatches, sourceRootPath, parse.GetValue(dryRun));
+    foreach (var update in updates)
+    {
+        Console.WriteLine($"{(update.Updated ? "updated " : "skipped ")} {Path.GetRelativePath(Environment.CurrentDirectory, update.SourceFile)}:{update.SourceLine}  {update.Message}");
+    }
+
+    var updated = updates.Count(u => u.Updated);
+    Console.WriteLine(parse.GetValue(dryRun) ? $"{updated} call site(s) would be updated." : $"{updated} call site(s) updated. Review the diff, rerun the stories and commit.");
+    return updates.All(u => u.Updated) ? 0 : 1;
+});
+// btp snapshots accept
+var accept = new Command("accept", "Make the markup snapshots the last runs received (*.markup.received.html) the committed ones.") { dryRun };
+accept.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    var accepted = MarkupSnapshots.Accept(settings.SnapshotDirectoryPath, parse.GetValue(dryRun));
+    foreach (var path in accepted)
+    {
+        Console.WriteLine($"{(parse.GetValue(dryRun) ? "would accept" : "accepted")}  {Path.GetRelativePath(Environment.CurrentDirectory, path)}");
+    }
+
+    Console.WriteLine(accepted.Count == 0
+        ? $"No received markup snapshots under {settings.SnapshotDirectoryPath}."
+        : parse.GetValue(dryRun) ? $"{accepted.Count} markup snapshot(s) would be accepted." : $"{accepted.Count} markup snapshot(s) accepted. Review the diff and commit.");
+    return 0;
+});
+var snapshots = new Command("snapshots", "Snapshots: markup snapshot files and those written in story sources.") { updateSource, accept };
+root.Add(snapshots);
+
+// btp mcp
+var mcp = new Command("mcp", "Serve the last run's results to coding agents over the Model Context Protocol (stdio): run summary, results, failure details, failures by cause, pending reviews and story coverage. Read-only.") { results };
+mcp.SetAction(async (parse, cancellationToken) =>
+{
+    var settings = Settings(parse);
+    var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder(new Microsoft.Extensions.Hosting.HostApplicationBuilderSettings { ContentRootPath = settings.ProjectDirectory });
+
+    // stdout carries the protocol: logs go to stderr.
+    builder.Logging.ClearProviders();
+    builder.Logging.AddConsole(o => o.LogToStandardErrorThreshold = Microsoft.Extensions.Logging.LogLevel.Trace);
+    builder.Logging.SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Warning);
+    builder.Services.AddSingleton(new McpResults(ResultDirectories(parse, settings), settings));
+    builder.Services.AddMcpServer(options => options.ServerInfo = new ModelContextProtocol.Protocol.Implementation
+        {
+            Name = "btp",
+            Version = typeof(McpResults).Assembly.GetName().Version?.ToString() ?? "1.0",
+        })
+        .WithStdioServerTransport()
+        .WithTools<BtpMcpTools>();
+    await builder.Build().RunAsync(cancellationToken);
+    return 0;
+});
+root.Add(mcp);
+
+// btp clean
+var clean = new Command("clean", "Delete the results directory (baselines are kept).");
+clean.SetAction(parse =>
+{
+    var settings = Settings(parse);
+    try
+    {
+        settings.CreateResultsStore().Clear();
+    }
+    catch (InvalidOperationException ex)
+    {
+        Console.Error.WriteLine(ex.Message);
+        return 1;
+    }
+
+    Console.WriteLine($"Deleted {settings.ResultsDirectoryPath}");
+    return 0;
+});
+root.Add(clean);
+
+return await root.Parse(args).InvokeAsync();
+
+BtpSettings Settings(ParseResult parse) => BtpSettings.Load(Path.GetFullPath(parse.GetValue(project) ?? Environment.CurrentDirectory));
+
+string[] ResultDirectories(ParseResult parse, BtpSettings settings) =>
+    parse.GetValue(results) is { Length: > 0 } explicitDirectories ? explicitDirectories.Select(Path.GetFullPath).ToArray() : [settings.ResultsDirectoryPath];
+
+// Relative to the current directory when inside it, else the full path.
+string Display(string path) => Path.GetRelativePath(Environment.CurrentDirectory, path) is var relative && !relative.StartsWith("..", StringComparison.Ordinal) && !Path.IsPathRooted(relative) ? relative : path;
+
+// A valid C# namespace from a directory name: "My App.Tests" -> "My_App.Tests".
+string NamespaceFor(string name)
+{
+    var parts = name.Split('.', StringSplitOptions.RemoveEmptyEntries).Select(part =>
+    {
+        var identifier = new string(part.Select(c => char.IsLetterOrDigit(c) || c == '_' ? c : '_').ToArray());
+        return identifier.Length == 0 || char.IsDigit(identifier[0]) ? "_" + identifier : identifier;
+    }).ToArray();
+    return parts.Length == 0 ? "Stories" : string.Join('.', parts);
+}
+
+string? RepositoryRoot(string directory)
+{
+    for (var current = new DirectoryInfo(directory); current is not null; current = current.Parent)
+    {
+        if (Directory.Exists(Path.Combine(current.FullName, ".git")) || File.Exists(Path.Combine(current.FullName, ".git")))
+        {
+            return current.FullName;
+        }
+    }
+
+    return null;
+}
+
+string? GitHubRunUrl() =>
+    Environment.GetEnvironmentVariable("GITHUB_SERVER_URL") is { Length: > 0 } server
+    && Environment.GetEnvironmentVariable("GITHUB_REPOSITORY") is { Length: > 0 } repo
+    && Environment.GetEnvironmentVariable("GITHUB_RUN_ID") is { Length: > 0 } run
+        ? $"{server}/{repo}/actions/runs/{run}"
+        : null;
+
+IReadOnlyList<StoryResult> Read(IEnumerable<string> directories, out IReadOnlyList<string> unreadable)
+{
+    var all = new List<StoryResult>();
+    var problems = new List<string>();
+    foreach (var directory in directories)
+    {
+        all.AddRange(new ResultsStore(directory).ReadAll(out var skipped));
+        problems.AddRange(skipped);
+    }
+
+    unreadable = problems;
+    return all;
+}
+
+IReadOnlyList<StoryResult> ReadResults(IEnumerable<string> directories) => Read(directories, out _);
+
+bool GlobMatch(string input, string pattern) =>
+    System.Text.RegularExpressions.Regex.IsMatch(input, "^" + System.Text.RegularExpressions.Regex.Escape(pattern).Replace("\\*", ".*", StringComparison.Ordinal).Replace("\\?", ".", StringComparison.Ordinal) + "$", System.Text.RegularExpressions.RegexOptions.IgnoreCase, TimeSpan.FromSeconds(1));
+
+void PrintSummary(RunSummary summary)
+{
+    Console.WriteLine();
+    Console.WriteLine($"  passed {summary.Passed}   failed {summary.Failed}   flaky {summary.Flaky}   skipped {summary.Skipped}   visual changes {summary.VisualChanges}   a11y {summary.AccessibilityFailures}   perf {summary.PerformanceRegressions}");
+    foreach (var failed in summary.Results.Where(r => r.IsBlockingFailure).Take(20))
+    {
+        var message = failed.Error ?? string.Empty;
+        var newline = message.IndexOf('\n', StringComparison.Ordinal);
+        Console.WriteLine($"  ✗ {failed.Key}: {(newline < 0 ? message : message[..newline].TrimEnd())}");
+    }
+}

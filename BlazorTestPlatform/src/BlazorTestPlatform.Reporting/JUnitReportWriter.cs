@@ -1,0 +1,191 @@
+using System.Globalization;
+using System.Xml;
+using System.Xml.Linq;
+using BlazorTestPlatform.Results;
+
+namespace BlazorTestPlatform.Reporting;
+
+/// <summary>Options for <see cref="JUnitReportWriter"/>.</summary>
+public sealed class JUnitOptions
+{
+    /// <summary>The repository root: test cases get <c>file</c> (relative to it) and <c>line</c> attributes. Null leaves them out.</summary>
+    public string? SourceRoot { get; set; }
+
+    /// <summary>Write only failed and flaky results, to keep large runs' reports small (Playwright's <c>onlyFailures</c>).</summary>
+    public bool OnlyFailures { get; set; }
+}
+
+/// <summary>Writes JUnit XML (understood by GitHub Actions, Azure DevOps, GitLab, Jenkins, TeamCity).</summary>
+public static class JUnitReportWriter
+{
+    /// <summary>Builds the XML document.</summary>
+    public static XDocument Create(RunSummary summary) => Create(summary, options: null);
+
+    /// <summary>
+    /// Builds the XML document. With <see cref="JUnitOptions.SourceRoot"/>, each test case names its story's source file
+    /// (relative to that root) and line in <c>file</c> and <c>line</c> attributes, which CI systems use to annotate the code;
+    /// with <see cref="JUnitOptions.OnlyFailures"/>, only failed and flaky results are written (counts follow them).
+    /// </summary>
+    public static XDocument Create(RunSummary summary, JUnitOptions? options)
+    {
+        ArgumentNullException.ThrowIfNull(summary);
+        options ??= new JUnitOptions();
+        if (options.OnlyFailures)
+        {
+            summary = RunSummary.From([.. summary.Results.Where(IsFailureOrFlaky)]);
+        }
+
+        var root = options.SourceRoot is { } sourceRoot ? Path.GetFullPath(sourceRoot) : null;
+        var suites = new XElement("testsuites",
+            new XAttribute("name", "BlazorTestPlatform"),
+            new XAttribute("tests", summary.Total),
+            new XAttribute("failures", summary.Failed),
+            new XAttribute("skipped", summary.Skipped),
+            new XAttribute("time", Seconds(summary.TotalDurationMilliseconds)));
+
+        foreach (var group in summary.Results.GroupBy(r => r.Title, StringComparer.Ordinal))
+        {
+            var suite = new XElement("testsuite",
+                new XAttribute("name", Text(group.Key)),
+                new XAttribute("tests", group.Count()),
+                new XAttribute("failures", group.Count(r => r.IsBlockingFailure)),
+                new XAttribute("skipped", group.Count(r => r.Outcome == StoryOutcome.Skipped || (r.Outcome == StoryOutcome.Failed && r.Quarantine is not null))),
+                new XAttribute("time", Seconds(group.Sum(r => r.DurationMilliseconds))));
+
+            foreach (var result in group)
+            {
+                var testCase = new XElement("testcase",
+                    new XAttribute("classname", Text(group.Key.Replace('/', '.'))),
+                    new XAttribute("name", Text($"{result.Name} [{Cell(result)}]")),
+                    new XAttribute("time", Seconds(result.DurationMilliseconds)));
+                if (root is not null && result.SourceFile is { Length: > 0 } source)
+                {
+                    testCase.Add(new XAttribute("file", Text(RelativeTo(root, source))));
+                    if (result.SourceLine is { } line)
+                    {
+                        testCase.Add(new XAttribute("line", line));
+                    }
+                }
+
+                switch (result.Outcome)
+                {
+                    // Quarantined: reported as skipped (it must not fail the CI job), with the failure kept in the output.
+                    case StoryOutcome.Failed when result.Quarantine is { } quarantine:
+                        testCase.Add(new XElement("skipped", new XAttribute("message", Text($"quarantined: {quarantine.Reason}"))));
+                        testCase.Add(new XElement("system-out", new XCData(Text($"QUARANTINED ({quarantine.Pattern}): {result.Error}"))));
+                        break;
+                    case StoryOutcome.Failed:
+                        testCase.Add(new XElement("failure",
+                            new XAttribute("message", Text(FirstLine(result.Error ?? "failed"))),
+                            new XAttribute("type", Text(result.ErrorType ?? "StoryFailure")),
+                            new XCData(Text(string.Join(Environment.NewLine, new[] { result.Error, result.StackTrace }.Where(s => s is not null))))));
+
+                        // Maven Surefire's rerun elements (read by Jenkins, GitLab and others): the earlier attempts' failures.
+                        foreach (var error in result.AttemptErrors)
+                        {
+                            testCase.Add(new XElement("rerunFailure", new XAttribute("message", Text(FirstLine(error))), new XAttribute("type", "StoryFailure"), new XElement("stackTrace", new XCData(Text(error)))));
+                        }
+
+                        break;
+                    case StoryOutcome.Skipped:
+                        testCase.Add(new XElement("skipped", new XAttribute("message", Text(result.SkipReason ?? "skipped"))));
+                        break;
+                    case StoryOutcome.Flaky:
+                        // Surefire's flaky elements: CI systems that read them show the test as flaky, not plainly passed.
+                        foreach (var error in result.AttemptErrors)
+                        {
+                            testCase.Add(new XElement("flakyFailure", new XAttribute("message", Text(FirstLine(error))), new XAttribute("type", "StoryFailure"), new XElement("stackTrace", new XCData(Text(error)))));
+                        }
+
+                        testCase.Add(new XElement("system-out", new XCData(Text($"FLAKY: passed after {result.Attempts} attempts.{Environment.NewLine}{string.Join(Environment.NewLine, result.AttemptErrors)}"))));
+                        break;
+                    case StoryOutcome.Passed when result.ExpectedFailure is { } expected:
+                        testCase.Add(new XElement("system-out", new XCData(Text($"EXPECTED FAILURE ({expected}): {result.Error}"))));
+                        break;
+                }
+
+                foreach (var artifact in result.Artifacts)
+                {
+                    testCase.Add(new XElement("system-out", new XCData(Text($"[[ATTACHMENT|{artifact.Path}]]"))));
+                }
+
+                suite.Add(testCase);
+            }
+
+            suites.Add(suite);
+        }
+
+        return new XDocument(new XDeclaration("1.0", "utf-8", null), suites);
+    }
+
+    /// <summary>Writes the XML to a file.</summary>
+    public static void Write(RunSummary summary, string path) => Write(summary, path, options: null);
+
+    /// <summary>Writes the XML to a file (see <see cref="Create(RunSummary, JUnitOptions?)"/>).</summary>
+    public static void Write(RunSummary summary, string path, JUnitOptions? options)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+        Create(summary, options).Save(path);
+    }
+
+    /// <summary>Failed (blocking or quarantined) and flaky results: what a failures-only report keeps.</summary>
+    internal static bool IsFailureOrFlaky(StoryResult result) => result.Outcome is StoryOutcome.Failed or StoryOutcome.Flaky;
+
+    // Paths under the root become relative with forward slashes (as SARIF and CI annotations expect); others stay as they are.
+    private static string RelativeTo(string root, string path)
+    {
+        var full = Path.GetFullPath(path);
+        var relative = Path.GetRelativePath(root, full);
+        return relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative) ? path : relative.Replace('\\', '/');
+    }
+
+    internal static string Cell(StoryResult result) =>
+        string.Join(", ", new[] { result.Driver, result.HostingModel, result.Viewport, result.Theme, ArgsLabel(result) }.Where(p => !string.IsNullOrEmpty(p)));
+
+    /// <summary><c>name=value&amp;...</c> of the args a run set, or null.</summary>
+    internal static string? ArgsLabel(StoryResult result) =>
+        result.Args is { Count: > 0 } args ? string.Join('&', args.Select(a => $"{a.Key}={a.Value}")) : null;
+
+    private static string Seconds(double milliseconds) => (milliseconds / 1000).ToString("0.###", CultureInfo.InvariantCulture);
+
+    private static readonly System.Text.RegularExpressions.Regex AnsiEscape = new(@"\x1B\[[0-?]*[ -/]*[@-~]", System.Text.RegularExpressions.RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
+
+    /// <summary>
+    /// Text XML 1.0 can carry: ANSI colour sequences (common in error output) are removed, and other characters XML
+    /// forbids (control characters, unpaired surrogates) become U+FFFD, so one odd message never breaks the report.
+    /// </summary>
+    internal static string Text(string value)
+    {
+        var text = value.Contains('\x1B', StringComparison.Ordinal) ? AnsiEscape.Replace(value, string.Empty) : value;
+        System.Text.StringBuilder? builder = null;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            var valid = XmlConvert.IsXmlChar(ch) || (char.IsHighSurrogate(ch) && i + 1 < text.Length && XmlConvert.IsXmlSurrogatePair(text[i + 1], ch));
+            if (valid && char.IsHighSurrogate(ch))
+            {
+                builder?.Append(ch).Append(text[i + 1]);
+                i++;
+                continue;
+            }
+
+            if (!valid)
+            {
+                builder ??= new System.Text.StringBuilder(text, 0, i, text.Length);
+                builder.Append('\uFFFD');
+            }
+            else
+            {
+                builder?.Append(ch);
+            }
+        }
+
+        return builder?.ToString() ?? text;
+    }
+
+    private static string FirstLine(string value)
+    {
+        var index = value.IndexOf('\n', StringComparison.Ordinal);
+        return index < 0 ? value : value[..index].TrimEnd('\r');
+    }
+}

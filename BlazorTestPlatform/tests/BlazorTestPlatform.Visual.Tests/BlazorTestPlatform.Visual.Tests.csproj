@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <!-- Real screenshot pairs that calibrate VisualChangeClassifier (see VisualChangeClassifierTests). -->
+    <None Include="Fixtures\*.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BlazorTestPlatform.Visual\BlazorTestPlatform.Visual.csproj" />
+  </ItemGroup>
+
+</Project>

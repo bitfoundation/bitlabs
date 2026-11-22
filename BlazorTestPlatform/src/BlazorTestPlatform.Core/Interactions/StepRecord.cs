@@ -1,0 +1,215 @@
+using System.Diagnostics;
+
+namespace BlazorTestPlatform.Results;
+
+/// <summary>Category of a timeline step.</summary>
+public enum StepKind
+{
+    /// <summary>A user-defined step (<c>ctx.StepAsync</c>).</summary>
+    Step,
+
+    /// <summary>An element interaction.</summary>
+    Action,
+
+    /// <summary>A keyboard interaction.</summary>
+    Keyboard,
+
+    /// <summary>An auto-waiting assertion.</summary>
+    Assertion,
+
+    /// <summary>Waiting (idle, time advance).</summary>
+    Wait,
+
+    /// <summary>Navigation / rendering.</summary>
+    Render,
+
+    /// <summary>Snapshot, accessibility scan or measurement.</summary>
+    Check,
+
+    /// <summary>A log message.</summary>
+    Log,
+}
+
+/// <summary>One entry of a story's execution timeline. Timelines make flaky failures explainable.</summary>
+public sealed class StepRecord
+{
+    /// <summary>Description, e.g. <c>click role=button[name="Save"]</c>.</summary>
+    public required string Title { get; init; }
+
+    /// <summary>Category.</summary>
+    public StepKind Kind { get; init; }
+
+    /// <summary>Start offset from the beginning of the story, in milliseconds.</summary>
+    public double StartMilliseconds { get; init; }
+
+    /// <summary>Duration in milliseconds.</summary>
+    public double DurationMilliseconds { get; set; }
+
+    /// <summary>Error message when the step failed.</summary>
+    public string? Error { get; set; }
+
+    /// <summary>Nested steps.</summary>
+    public List<StepRecord> Children { get; init; } = [];
+
+    /// <summary>
+    /// The rendered markup right after the step (bUnit), kept for failed runs only: the step-by-step DOM of a trace
+    /// viewer, to see where the page first went wrong. Null when not recorded.
+    /// </summary>
+    public string? Markup { get; set; }
+
+    /// <summary>True when the step failed.</summary>
+    public bool Failed => Error is not null;
+}
+
+/// <summary>Records a nested timeline of steps.</summary>
+public sealed class StepRecorder
+{
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
+    private readonly List<StepRecord> _roots = [];
+    private readonly AsyncLocal<StepRecord?> _current = new();
+    private readonly Lock _gate = new();
+
+    /// <summary>Top-level steps.</summary>
+    public IReadOnlyList<StepRecord> Steps
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _roots.ToArray();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Captures the rendered markup after each action, keyboard, assertion and wait step (<see cref="StepRecord.Markup"/>),
+    /// or null to record none. Set by drivers that can read the DOM cheaply (bUnit); failures to capture are ignored.
+    /// </summary>
+    public Func<string?>? CaptureMarkup { get; set; }
+
+    /// <summary>Elapsed time since the recorder started.</summary>
+    public TimeSpan Elapsed => _clock.Elapsed;
+
+    /// <summary>Records an instantaneous entry.</summary>
+    public void Log(string title, StepKind kind = StepKind.Log)
+    {
+        lock (_gate)
+        {
+            Add(new StepRecord { Title = title, Kind = kind, StartMilliseconds = _clock.Elapsed.TotalMilliseconds });
+        }
+    }
+
+    /// <summary>Runs <paramref name="body"/> as a timed step; failures are recorded and rethrown.</summary>
+    public async Task<T> RunAsync<T>(string title, StepKind kind, Func<Task<T>> body)
+    {
+        var parent = _current.Value;
+        StepRecord step;
+        lock (_gate)
+        {
+            step = new StepRecord { Title = title, Kind = kind, StartMilliseconds = _clock.Elapsed.TotalMilliseconds };
+            Add(step);
+        }
+
+        _current.Value = step;
+
+        // Every timeline step is also a tracing span (when an OpenTelemetry listener subscribes to BtpTelemetry.Source).
+        using var activity = BtpTelemetry.Source.StartActivity("btp.step");
+        if (activity is not null)
+        {
+            activity.DisplayName = title;
+            activity.SetTag("btp.step.kind", kind.ToString().ToLowerInvariant());
+        }
+
+        try
+        {
+            return await body().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            step.Error = FirstLine(ex.Message);
+            activity?.SetStatus(System.Diagnostics.ActivityStatusCode.Error, step.Error);
+            throw;
+        }
+        finally
+        {
+            step.DurationMilliseconds = _clock.Elapsed.TotalMilliseconds - step.StartMilliseconds;
+            if (kind is StepKind.Action or StepKind.Keyboard or StepKind.Assertion or StepKind.Wait && CaptureMarkup is { } capture)
+            {
+                step.Markup = TryCapture(capture);
+            }
+
+            _current.Value = parent;
+        }
+    }
+
+    /// <summary>Runs <paramref name="body"/> as a timed step.</summary>
+    public Task RunAsync(string title, StepKind kind, Func<Task> body) =>
+        RunAsync<bool>(title, kind, async () =>
+        {
+            await body().ConfigureAwait(false);
+            return true;
+        });
+
+    /// <summary>Drops the nested steps of the current step (retrying blocks keep only their last attempt).</summary>
+    internal void ClearCurrentChildren()
+    {
+        if (_current.Value is { } step)
+        {
+            lock (_gate)
+            {
+                step.Children.Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Keeps the markup of the last <paramref name="keep"/> steps that have it, each cut to <paramref name="maxLength"/>
+    /// characters, and drops the rest (all of it with <paramref name="keep"/> 0, as passed runs do).
+    /// </summary>
+    public static void LimitMarkup(IReadOnlyList<StepRecord> steps, int keep, int maxLength = 20_000)
+    {
+        ArgumentNullException.ThrowIfNull(steps);
+        ArgumentOutOfRangeException.ThrowIfNegative(keep);
+        var withMarkup = Flatten(steps).Where(s => s.Markup is not null).OrderBy(s => s.StartMilliseconds + s.DurationMilliseconds).ToList();
+        for (var i = 0; i < withMarkup.Count; i++)
+        {
+            var step = withMarkup[i];
+            step.Markup = i < withMarkup.Count - keep ? null
+                : step.Markup!.Length <= maxLength ? step.Markup
+                : step.Markup[..maxLength] + $"\n<!-- cut: {step.Markup.Length - maxLength} more characters -->";
+        }
+    }
+
+    private static IEnumerable<StepRecord> Flatten(IEnumerable<StepRecord> steps) => steps.SelectMany(s => Flatten(s.Children).Prepend(s));
+
+    private static string? TryCapture(Func<string?> capture)
+    {
+        try
+        {
+            return capture();
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            // The renderer was disposed or is mid-render: the step simply has no markup.
+            return null;
+        }
+    }
+
+    private void Add(StepRecord step)
+    {
+        if (_current.Value is { } parent)
+        {
+            parent.Children.Add(step);
+        }
+        else
+        {
+            _roots.Add(step);
+        }
+    }
+
+    private static string FirstLine(string message)
+    {
+        var index = message.IndexOf('\n', StringComparison.Ordinal);
+        return index < 0 ? message : message[..index].TrimEnd('\r');
+    }
+}

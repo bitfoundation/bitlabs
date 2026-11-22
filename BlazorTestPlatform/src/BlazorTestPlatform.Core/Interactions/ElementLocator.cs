@@ -1,0 +1,211 @@
+using System.Text.RegularExpressions;
+using BlazorTestPlatform.Drivers;
+
+namespace BlazorTestPlatform;
+
+/// <summary>
+/// A lazy, immutable reference to elements. Actions auto-wait for a single, visible, enabled element;
+/// queries (<see cref="CountAsync"/>...) read the current state without waiting.
+/// </summary>
+public sealed class ElementLocator
+{
+    private readonly StoryContext _context;
+
+    internal ElementLocator(StoryContext context, LocatorChain chain)
+    {
+        _context = context;
+        Chain = chain;
+    }
+
+    /// <summary>The underlying chain.</summary>
+    public LocatorChain Chain { get; }
+
+    /// <summary>Finds descendants matching a query.</summary>
+    public ElementLocator Locate(By query) => new(_context, Chain.Append(new LocatorStep(LocatorStepKind.Find, query)));
+
+    /// <summary>Finds descendants by CSS selector.</summary>
+    public ElementLocator Locate(string cssSelector) => Locate(By.Css(cssSelector));
+
+    /// <summary>Finds descendants by role.</summary>
+    public ElementLocator GetByRole(string role, string? name = null, bool exact = false, System.Text.RegularExpressions.Regex? namePattern = null, bool? isChecked = null, bool? pressed = null, bool? expanded = null, bool? selected = null, bool? disabled = null, int? level = null, bool includeHidden = false) =>
+        Locate(By.Role(role, name, exact, namePattern, isChecked, pressed, expanded, selected, disabled, level, includeHidden));
+
+    /// <summary>Finds descendants whose text matches <paramref name="pattern"/>.</summary>
+    public ElementLocator GetByText(Regex pattern) => Locate(By.Text(pattern));
+
+    /// <summary>Finds descendants whose label matches <paramref name="pattern"/>.</summary>
+    public ElementLocator GetByLabel(Regex pattern) => Locate(By.Label(pattern));
+
+    /// <summary>Finds descendants by text.</summary>
+    public ElementLocator GetByText(string text, bool exact = false) => Locate(By.Text(text, exact));
+
+    /// <summary>Finds descendants by label.</summary>
+    public ElementLocator GetByLabel(string text, bool exact = false) => Locate(By.Label(text, exact));
+
+    /// <summary>Finds descendants by placeholder.</summary>
+    public ElementLocator GetByPlaceholder(string text, bool exact = false) => Locate(By.Placeholder(text, exact));
+
+    /// <summary>Finds descendants by alternative text.</summary>
+    public ElementLocator GetByAltText(string text, bool exact = false) => Locate(By.AltText(text, exact));
+
+    /// <summary>Finds descendants by title.</summary>
+    public ElementLocator GetByTitle(string text, bool exact = false) => Locate(By.Title(text, exact));
+
+    /// <summary>Finds descendants by test id.</summary>
+    public ElementLocator GetByTestId(string testId) => Locate(By.TestId(testId));
+
+    /// <summary>The n-th match (0-based; negative counts from the end).</summary>
+    public ElementLocator Nth(int index) => new(_context, Chain.Append(new LocatorStep(LocatorStepKind.Nth, Index: index)));
+
+    /// <summary>The first match.</summary>
+    public ElementLocator First => Nth(0);
+
+    /// <summary>The last match.</summary>
+    public ElementLocator Last => Nth(-1);
+
+    /// <summary>Keeps matches whose text matches <paramref name="hasText"/>.</summary>
+    public ElementLocator Filter(Regex hasText) =>
+        new(_context, Chain.Append(new LocatorStep(LocatorStepKind.HasText, Text: (hasText ?? throw new ArgumentNullException(nameof(hasText))).ToString()) { Pattern = hasText }));
+
+    /// <summary>Keeps matches whose text does not match <paramref name="hasNotText"/>.</summary>
+    public ElementLocator FilterNot(Regex hasNotText) =>
+        new(_context, Chain.Append(new LocatorStep(LocatorStepKind.HasNotText, Text: (hasNotText ?? throw new ArgumentNullException(nameof(hasNotText))).ToString()) { Pattern = hasNotText }));
+
+    /// <summary>
+    /// Keeps matches that contain a descendant <paramref name="has"/> finds, resolved inside each match (Playwright's
+    /// <c>filter({ has })</c>): <c>ctx.GetByRole("listitem").Filter(ctx.GetByRole("button", "Delete"))</c>.
+    /// </summary>
+    public ElementLocator Filter(ElementLocator has) =>
+        new(_context, Chain.Append(new LocatorStep(LocatorStepKind.Has) { Inner = (has ?? throw new ArgumentNullException(nameof(has))).Chain }));
+
+    /// <summary>Keeps matches that contain no descendant <paramref name="hasNot"/> finds (Playwright's <c>filter({ hasNot })</c>).</summary>
+    public ElementLocator FilterNot(ElementLocator hasNot) =>
+        new(_context, Chain.Append(new LocatorStep(LocatorStepKind.HasNot) { Inner = (hasNot ?? throw new ArgumentNullException(nameof(hasNot))).Chain }));
+
+    /// <summary>
+    /// Chooses <paramref name="files"/> in the single matching <c>&lt;input type="file"&gt;</c> (Blazor's <c>InputFile</c>), as
+    /// a person would in the file picker: the input's <c>change</c> event fires and the component reads the files. The
+    /// input may be visually hidden (styled drop zones), but must be enabled; more than one file needs <c>multiple</c>.
+    /// No files clears the selection. bUnit supports <c>InputFile</c> components; browsers support any file input.
+    /// </summary>
+    public Task SetInputFilesAsync(params StoryFile[] files) =>
+        _context.PerformAsync(this, new ElementAction(ElementActionKind.SetInputFiles) { Files = files ?? throw new ArgumentNullException(nameof(files)) }, null);
+
+    /// <summary>Keeps matches containing the text.</summary>
+    public ElementLocator Filter(string hasText) => new(_context, Chain.Append(new LocatorStep(LocatorStepKind.HasText, Text: hasText)));
+
+    /// <summary>Keeps matches not containing the text.</summary>
+    public ElementLocator FilterNot(string hasNotText) => new(_context, Chain.Append(new LocatorStep(LocatorStepKind.HasNotText, Text: hasNotText)));
+
+    /// <summary>Clicks the element. <paramref name="force"/> skips actionability checks (e.g. to prove a disabled control ignores clicks).</summary>
+    public Task ClickAsync(KeyModifiers modifiers = KeyModifiers.None, MouseButton button = MouseButton.Left, TimeSpan? timeout = null, bool force = false) =>
+        _context.PerformAsync(this, new ElementAction(ElementActionKind.Click) { Modifiers = modifiers, Button = button, Force = force }, timeout);
+
+    /// <summary>Double-clicks the element.</summary>
+    public Task DoubleClickAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.DoubleClick), timeout);
+
+    /// <summary>Hovers the element.</summary>
+    public Task HoverAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Hover), timeout);
+
+    /// <summary>Focuses the element.</summary>
+    public Task FocusAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Focus) { Force = true }, timeout);
+
+    /// <summary>Removes focus from the element.</summary>
+    public Task BlurAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Blur) { Force = true }, timeout);
+
+    /// <summary>Replaces the value of an input/textarea/contenteditable and fires <c>input</c>.</summary>
+    public Task FillAsync(string value, TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Fill) { Text = value }, timeout);
+
+    /// <summary>Clears the value.</summary>
+    public Task ClearAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Clear), timeout);
+
+    /// <summary>Focuses and types text key by key.</summary>
+    public Task TypeAsync(string text, TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Type) { Text = text }, timeout);
+
+    /// <summary>Focuses and presses a key or chord.</summary>
+    public Task PressAsync(string key, TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Press) { Text = key }, timeout);
+
+    /// <summary>Checks a checkbox, radio or switch.</summary>
+    public Task CheckAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Check), timeout);
+
+    /// <summary>Unchecks a checkbox or switch.</summary>
+    public Task UncheckAsync(TimeSpan? timeout = null) => _context.PerformAsync(this, new ElementAction(ElementActionKind.Uncheck), timeout);
+
+    /// <summary>Selects options of a <c>select</c> by value or label.</summary>
+    public Task SelectOptionAsync(params string[] values) => _context.PerformAsync(this, new ElementAction(ElementActionKind.SelectOption) { Values = values }, null);
+
+    /// <summary>Pointer down on the element.</summary>
+    public Task PointerDownAsync(MouseButton button = MouseButton.Left) => _context.PerformAsync(this, new ElementAction(ElementActionKind.PointerDown) { Button = button }, null);
+
+    /// <summary>Pointer up on the element.</summary>
+    public Task PointerUpAsync(MouseButton button = MouseButton.Left) => _context.PerformAsync(this, new ElementAction(ElementActionKind.PointerUp) { Button = button }, null);
+
+    /// <summary>Drags the element onto another.</summary>
+    public Task DragToAsync(ElementLocator target) =>
+        _context.PerformAsync(this, new ElementAction(ElementActionKind.DragTo) { Target = (target ?? throw new ArgumentNullException(nameof(target))).Chain }, null);
+
+    /// <summary>
+    /// Makes the element match CSS user-action pseudo-classes (<c>:hover</c>, <c>:focus-visible</c>...) without a pointer or
+    /// keyboard, as storybook-addon-pseudo-states does: hover and focus styles can be screenshotted
+    /// (<c>ExpectScreenshotAsync</c>) and checked (<c>ToHaveCssAsync</c>) deterministically. Replaces the states forced
+    /// earlier in the story; <see cref="PseudoState.None"/> clears them. Rules in the page's stylesheets apply; inline
+    /// styles and cross-origin stylesheets do not. Needs a driver that applies CSS: bUnit skips the story, with the reason.
+    /// </summary>
+    public Task ForceStateAsync(PseudoState states) => _context.ForcePseudoStatesAsync(this, states);
+
+    /// <summary>Scrolls the element into view.</summary>
+    public Task ScrollIntoViewAsync() => _context.PerformAsync(this, new ElementAction(ElementActionKind.ScrollIntoView) { Force = true }, null);
+
+    /// <summary>Current number of matches (no waiting).</summary>
+    public async Task<int> CountAsync() => (await AllAsync().ConfigureAwait(false)).Count;
+
+    /// <summary>Snapshots of all current matches (no waiting).</summary>
+    public Task<IReadOnlyList<ElementInfo>> AllAsync() => _context.Driver.QueryAsync(Chain, _context.CancellationToken);
+
+    /// <summary>Waits for exactly one match and returns its snapshot.</summary>
+    public async Task<ElementInfo> InfoAsync(TimeSpan? timeout = null)
+    {
+        var (success, matches) = await Poll.UntilAsync(
+            async ct =>
+            {
+                var all = await _context.Driver.QueryAsync(Chain, ct).ConfigureAwait(false);
+                return (all.Count == 1, all);
+            },
+            timeout ?? _context.DefaultTimeout,
+            _context.CancellationToken).ConfigureAwait(false);
+
+        return success
+            ? matches[0]
+            : throw new ElementNotActionableException(matches.Count == 0
+                ? $"No element matches {this} (waited {(timeout ?? _context.DefaultTimeout).TotalMilliseconds:0} ms)."
+                : $"Strict mode violation: {this} resolved to {matches.Count} elements:{Environment.NewLine}{string.Join(Environment.NewLine, matches.Take(5).Select(m => "  " + m.Html))}");
+    }
+
+    /// <summary>Waits for one match and returns its normalized text.</summary>
+    public async Task<string> TextAsync() => (await InfoAsync().ConfigureAwait(false)).Text;
+
+    /// <summary>Waits for one match and returns an attribute.</summary>
+    public async Task<string?> GetAttributeAsync(string name) => (await InfoAsync().ConfigureAwait(false)).GetAttribute(name);
+
+    /// <summary>Waits for one match and returns its value.</summary>
+    public async Task<string?> InputValueAsync() => (await InfoAsync().ConfigureAwait(false)).Value;
+
+    /// <summary>True when exactly one element matches now and it is visible (no waiting).</summary>
+    public async Task<bool> IsVisibleAsync()
+    {
+        var all = await AllAsync().ConfigureAwait(false);
+        return all.Count == 1 && all[0].IsVisible;
+    }
+
+    /// <summary>True when the single match is enabled.</summary>
+    public async Task<bool> IsEnabledAsync() => (await InfoAsync().ConfigureAwait(false)).IsEnabled;
+
+    /// <summary>True when the single match is checked.</summary>
+    public async Task<bool> IsCheckedAsync() => (await InfoAsync().ConfigureAwait(false)).IsChecked == true;
+
+    /// <summary>True when the single match has focus.</summary>
+    public async Task<bool> IsFocusedAsync() => (await InfoAsync().ConfigureAwait(false)).IsFocused;
+
+    /// <inheritdoc />
+    public override string ToString() => Chain.ToString();
+}

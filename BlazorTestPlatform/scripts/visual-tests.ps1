@@ -1,0 +1,45 @@
+# Windows wrapper for scripts/visual-tests.sh (runs the browser suites in the Playwright Linux image that matches the
+# pinned Microsoft.Playwright package).
+#   pwsh scripts/visual-tests.ps1                    # compare against committed Linux baselines
+#   pwsh scripts/visual-tests.ps1 -Update            # write missing baselines, then review and commit them
+#   pwsh scripts/visual-tests.ps1 -Update -Mode changed   # after a Playwright upgrade
+#   pwsh scripts/visual-tests.ps1 -PrintImage        # print the image tag and exit
+# The image tag comes from Directory.Packages.props; $env:BTP_PLAYWRIGHT_IMAGE overrides it.
+param([switch] $Update, [ValidateSet('missing', 'changed', 'all')] [string] $Mode = 'missing', [switch] $PrintImage)
+
+$ErrorActionPreference = 'Stop'
+$root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$packages = Get-Content (Join-Path $root 'Directory.Packages.props') -Raw
+if ($packages -notmatch 'Include="Microsoft\.Playwright"\s+Version="([^"]+)"') {
+  throw 'Could not read the Microsoft.Playwright version from Directory.Packages.props'
+}
+$version = $Matches[1]
+$image = if ($env:BTP_PLAYWRIGHT_IMAGE) { $env:BTP_PLAYWRIGHT_IMAGE } else { "mcr.microsoft.com/playwright/dotnet:v$version-noble" }
+if ($PrintImage) { Write-Output $image; exit 0 }
+$snapshots = if ($Update) { $Mode } else { 'none' }
+Write-Output "Playwright $version, image $image, BTP_UPDATE_SNAPSHOTS=$snapshots"
+
+$script = @'
+set -e
+# Install into the cached volume on first use, and again when global.json needs an SDK the cached one lacks:
+# the SDK global.json pins builds every target framework, and the demo runs on the .NET 10 runtime.
+if ! /opt/dotnet10/dotnet --list-sdks 2>/dev/null | grep -q '^11\.'; then
+  curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 11.0 --install-dir /opt/dotnet10
+fi
+if ! /opt/dotnet10/dotnet --list-runtimes 2>/dev/null | grep -q '^Microsoft.AspNetCore.App 10\.'; then
+  curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --channel 10.0 --runtime aspnetcore --install-dir /opt/dotnet10
+fi
+export PATH=/opt/dotnet10:$PATH DOTNET_ROOT=/opt/dotnet10
+dotnet test --project demo/BlazorTestPlatform.Demo.UI.Tests --artifacts-path /tmp/btp-artifacts -- --filter-class '*CrossHostingTests' --filter-class '*VisualTests' --filter-class '*CrossBrowserTests' --filter-class '*InAppPlayTests' --filter-class '*BaselineProvenanceTests'
+'@
+
+docker run --rm --init --ipc=host `
+  -v "${root}:/repo" -w /repo `
+  -v btp-nuget:/root/.nuget/packages `
+  -v btp-dotnet:/opt/dotnet10 `
+  -e "BTP_UPDATE_SNAPSHOTS=$snapshots" `
+  -e BTP_PROJECT_DIR=/repo/demo/BlazorTestPlatform.Demo.UI.Tests `
+  -e DOTNET_CLI_TELEMETRY_OPTOUT=1 -e DOTNET_NOLOGO=1 `
+  -e BTP_GREP -e BTP_GREP_INVERT -e BTP_TAGS -e BTP_SHARD `
+  $image bash -lc $script
+exit $LASTEXITCODE

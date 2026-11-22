@@ -1,0 +1,31 @@
+## Build output
+bin/
+obj/
+artifacts/
+*.nupkg
+*.snupkg
+
+## IDE
+.vs/
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.user
+*.suo
+
+## Test output
+TestResults/
+coverage*/
+# ...but not source folders (git matches case-insensitively on Windows).
+!src/**/Coverage/
+*.trx
+
+## BlazorTestPlatform (__baselines__ and __snapshots__/baselines.json ARE committed; run output goes to TestResults/btp)
+.btp/
+# Only the Linux visual baselines are committed: CI gates on them, and scripts/visual-tests.sh renders the same ones.
+# Windows and macOS baselines are written by local runs (BTP_UPDATE_SNAPSHOTS=missing) and stay on that machine.
+**/__snapshots__/**/*.png
+!**/__snapshots__/**/*-linux.png
+!**/__snapshots__/**/*-linux.*.png
+# Markup snapshots (*.markup.html) are committed; what a mismatched run rendered is not (btp snapshots accept moves it).
+**/__snapshots__/**/*.markup.received.html

@@ -1,0 +1,503 @@
+using System.Diagnostics.CodeAnalysis;
+using BlazorTestPlatform.Drivers;
+using BlazorTestPlatform.Performance;
+using Microsoft.AspNetCore.Components;
+using Microsoft.AspNetCore.Components.Rendering;
+using Microsoft.Extensions.DependencyInjection;
+
+namespace BlazorTestPlatform;
+
+/// <summary>
+/// One named state of a component: its arguments, decorators, test data, interaction script (<see cref="Play"/>)
+/// and quality gates (visual, accessibility, performance). A story is the single source of truth that the
+/// workbench, bUnit, real-browser runs and the cross-hosting matrix all execute.
+/// </summary>
+public sealed class Story
+{
+    internal Story(StoryData data)
+    {
+        Title = data.Title;
+        Name = data.Name;
+        Id = StoryId.Create(data.Title, data.Name);
+        ComponentType = data.ComponentType;
+        Description = data.Description;
+        Args = data.Args;
+        Decorators = data.Decorators;
+        Play = data.Play;
+        Tags = data.Tags;
+        Seed = data.Seed;
+        User = data.User;
+        ServiceConfigurations = data.ServiceConfigurations;
+        Fixtures = data.Fixtures;
+        HttpMocks = data.HttpMocks;
+        JSInterop = data.JSInterop;
+        FakeTimeStart = data.FakeTimeStart;
+        Visual = data.Visual;
+        Accessibility = data.Accessibility;
+        Performance = data.Performance;
+
+        // Built stories are shared through cached catalogs: their options must not change under other tests.
+        Visual.Freeze();
+        Accessibility.Freeze();
+        Performance?.Freeze();
+        Matrix = data.Matrix;
+        Timeout = data.Timeout;
+        Culture = data.Culture;
+        TimeZone = data.TimeZone;
+        SkipReason = data.SkipReason;
+        Metadata = data.Metadata;
+        Requirements = data.Requirements;
+        RequiredCapabilities = data.Requirements.Aggregate(DriverCapabilities.None, (all, r) => all | r.Capabilities);
+        Emulation = data.Emulation;
+        BrowserBudget = data.BrowserBudget;
+        BrowserBudget?.Freeze();
+        CollectionType = data.CollectionType;
+        SourceFile = data.SourceFile;
+        SourceLine = data.SourceLine;
+        Order = data.Order;
+        ExpectedFailure = data.ExpectedFailure;
+        IsSlow = data.IsSlow;
+    }
+
+    /// <summary>A known failure (<c>ExpectFailure(...)</c>): failures pass and a clean pass fails; null when none.</summary>
+    public Results.ExpectedFailure? ExpectedFailure { get; }
+
+    /// <summary>
+    /// Marked slow (<c>Slow()</c>, Playwright's <c>test.slow()</c>): runners triple its timeout (<see cref="TimeoutOr"/>).
+    /// </summary>
+    public bool IsSlow { get; }
+
+    /// <summary>The story's run timeout: <see cref="Timeout"/>, else <paramref name="runnerDefault"/>, tripled for <see cref="IsSlow"/> stories.</summary>
+    public TimeSpan TimeoutOr(TimeSpan runnerDefault) => (Timeout ?? runnerDefault) * (IsSlow ? 3 : 1);
+
+    /// <summary>Stable identifier, e.g. <c>inputs-button--primary</c>.</summary>
+    public string Id { get; }
+
+    /// <summary>Hierarchical title, e.g. <c>Inputs/Button</c>.</summary>
+    public string Title { get; }
+
+    /// <summary>Story name within its title, e.g. <c>Primary</c>.</summary>
+    public string Name { get; }
+
+    /// <summary>The component rendered by the story.</summary>
+    [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)]
+    public Type ComponentType { get; }
+
+    /// <summary>Optional documentation shown in the workbench.</summary>
+    public string? Description { get; }
+
+    /// <summary>Component parameters.</summary>
+    public IReadOnlyList<StoryArg> Args { get; }
+
+    /// <summary>Decorators, innermost first.</summary>
+    public IReadOnlyList<StoryDecorator> Decorators { get; }
+
+    /// <summary>Interaction script executed after the first render by any driver.</summary>
+    public Func<StoryContext, Task>? Play { get; }
+
+    /// <summary>Tags used for filtering (e.g. <c>visual</c>, <c>a11y</c>, <c>smoke</c>, <c>!visual</c>).</summary>
+    public IReadOnlySet<string> Tags { get; }
+
+    /// <summary>Seed for every random source of the story. Defaults to a hash of <see cref="Id"/>.</summary>
+    public int Seed { get; }
+
+    /// <summary>Fake signed-in user, or null for no authentication state.</summary>
+    public TestUser? User { get; }
+
+    /// <summary>Service registrations that override the host's services.</summary>
+    public IReadOnlyList<Action<IServiceCollection, FixtureContext>> ServiceConfigurations { get; }
+
+    /// <summary>Data fixtures.</summary>
+    public IReadOnlyList<StoryFixture> Fixtures { get; }
+
+    /// <summary>JavaScript-interop mocks (null when none); see <see cref="JSInteropMocks"/>.</summary>
+    public JSInteropMocks? JSInterop { get; }
+
+    /// <summary>Configurations of the story's fake HTTP backend (see <see cref="HttpMock"/>).</summary>
+    public IReadOnlyList<Action<HttpMock, FixtureContext>> HttpMocks { get; }
+
+    /// <summary>When set, a <c>FakeTimeProvider</c> frozen at this instant replaces <see cref="TimeProvider"/>.</summary>
+    public DateTimeOffset? FakeTimeStart { get; }
+
+    /// <summary>Visual-regression options.</summary>
+    public VisualOptions Visual { get; }
+
+    /// <summary>Accessibility options.</summary>
+    public StoryAccessibilityOptions Accessibility { get; }
+
+    /// <summary>Render-performance budget, or null when not measured.</summary>
+    public PerformanceBudget? Performance { get; }
+
+    /// <summary>Matrix restrictions.</summary>
+    public MatrixFilter Matrix { get; }
+
+    /// <summary>Overall timeout for render + play.</summary>
+    public TimeSpan? Timeout { get; }
+
+    /// <summary>
+    /// Culture the story renders in (<c>de-DE</c>), or null for the runner's. bUnit runs the story under it
+    /// (<c>CultureInfo.CurrentCulture</c> and <c>CurrentUICulture</c>); browser runs use it as the browser locale.
+    /// </summary>
+    public string? Culture { get; }
+
+    /// <summary>
+    /// The IANA time zone the story renders in (<c>Europe/Berlin</c>), or null for the runner's (UTC in browsers). See
+    /// <c>TimeZone(...)</c> on the story builder.
+    /// </summary>
+    public string? TimeZone { get; }
+
+    /// <summary>The culture the story renders in under <paramref name="theme"/>: its own, else the theme's (a culture mode).</summary>
+    public string? CultureUnder(ThemeDefinition? theme) => Culture ?? theme?.Culture;
+
+    /// <summary>The time zone the story renders in under <paramref name="theme"/>: its own, else the theme's.</summary>
+    public string? TimeZoneUnder(ThemeDefinition? theme) => TimeZone ?? theme?.TimeZone;
+
+    /// <summary>When set, the story is skipped by test runners.</summary>
+    public string? SkipReason { get; }
+
+    /// <summary>Free-form metadata for extensions.</summary>
+    public IReadOnlyDictionary<string, object?> Metadata { get; }
+
+    /// <summary>Driver capabilities the story declared with <c>Requires(...)</c>, each with its reason.</summary>
+    public IReadOnlyList<CapabilityRequirement> Requirements { get; }
+
+    /// <summary>Union of the capabilities in <see cref="Requirements"/>.</summary>
+    public DriverCapabilities RequiredCapabilities { get; }
+
+    /// <summary>Browser APIs and network conditions the story emulates (<see cref="BrowserEmulation.None"/> by default).</summary>
+    public BrowserEmulation Emulation { get; }
+
+    /// <summary>Limits on the runtime metrics real browsers report, or null.</summary>
+    public BrowserBudget? BrowserBudget { get; }
+
+    /// <summary>The collection type that declared the story.</summary>
+    public Type? CollectionType { get; }
+
+    /// <summary>The source file of the collection that declares the story (see <see cref="StoryCollection.SourceFile"/>).</summary>
+    public string? SourceFile { get; }
+
+    /// <summary>The line of the collection's declaration in <see cref="SourceFile"/> (0 when unknown).</summary>
+    public int SourceLine { get; }
+
+    /// <summary>Declaration order within the collection.</summary>
+    public int Order { get; }
+
+    /// <summary>Workbench layout (from <c>Layout(...)</c>; default <see cref="StoryLayout.Padded"/>).</summary>
+    public StoryLayout Layout => Metadata.TryGetValue(StoryBuilderMetadata.Layout, out var layout) && layout is StoryLayout value ? value : StoryLayout.Padded;
+
+    /// <summary>
+    /// Whether browser runs prerender interactive modes (default true, like production). Stories whose initial work never
+    /// completes (pending loads, authorizing users) must disable it: Blazor only hydrates after prerendering finishes.
+    /// </summary>
+    public bool Prerender => !Metadata.TryGetValue(StoryBuilderMetadata.Prerender, out var value) || value is not false;
+
+    /// <summary>
+    /// Whether browser runs check that hydration keeps the prerendered accessibility tree (<c>CheckPrerender()</c>): every
+    /// tree the story shows from the moment Blazor starts until it settles must equal the prerendered one.
+    /// </summary>
+    public bool ChecksPrerenderParity => Metadata.TryGetValue(StoryBuilderMetadata.PrerenderParity, out var value) && value is true;
+
+    /// <summary>Whether runners run the story alone in their process (<c>Exclusive()</c>).</summary>
+    public bool IsExclusive => Metadata.TryGetValue(StoryBuilderMetadata.Exclusive, out var value) && value is true;
+
+    /// <summary>
+    /// The story's own markup scrubbers (<c>ScrubMarkup(...)</c>), applied after <see cref="Results.MarkupSnapshots.DefaultScrubbers"/>.
+    /// </summary>
+    public IReadOnlyList<Results.MarkupScrubber> MarkupScrubbers =>
+        Metadata.TryGetValue(StoryBuilderMetadata.MarkupScrubbers, out var value) && value is IReadOnlyList<Results.MarkupScrubber> scrubbers ? scrubbers : [];
+
+    /// <summary>
+    /// Whether play checks accessibility after every element action and key press (<c>CheckAccessibilityAfterActions()</c>).
+    /// </summary>
+    public bool ChecksAccessibilityAfterActions => Metadata.TryGetValue(StoryBuilderMetadata.AccessibilityAfterActions, out var value) && value is true;
+
+    /// <summary>
+    /// Why the story may leave references behind when its components are disposed (<c>AllowLeaks(reason)</c>), or null
+    /// when the bUnit runner checks for leaks.
+    /// </summary>
+    public string? LeaksAllowedReason => Metadata.TryGetValue(StoryBuilderMetadata.AllowLeaks, out var value) ? value as string : null;
+
+    /// <summary><c>Title/Name</c>.</summary>
+    public string Path => $"{Title}/{Name}";
+
+    /// <summary>True when the story has a play function.</summary>
+    public bool HasPlay => Play is not null;
+
+    /// <summary>True when the story carries the tag.</summary>
+    public bool HasTag(string tag) => Tags.Contains(tag);
+
+    /// <summary>True when a driver with <paramref name="capabilities"/> has everything the story <c>Requires(...)</c>.</summary>
+    public bool CanRunOn(DriverCapabilities capabilities) => (RequiredCapabilities & ~capabilities) == DriverCapabilities.None;
+
+    /// <summary>
+    /// Why a driver with <paramref name="capabilities"/> cannot run the story (missing capabilities and the story's
+    /// reasons), or null when it can.
+    /// </summary>
+    /// <param name="capabilities">The driver's capabilities.</param>
+    /// <param name="driverName">Driver name for the message (e.g. <c>bunit</c>).</param>
+    public string? UnsupportedReason(DriverCapabilities capabilities, string driverName)
+    {
+        if (CanRunOn(capabilities))
+        {
+            return null;
+        }
+
+        var missing = Requirements
+            .Where(r => (r.Capabilities & ~capabilities) != DriverCapabilities.None)
+            .Select(r => $"{r.Capabilities & ~capabilities} ({r.Reason})");
+        return $"Driver '{driverName}' lacks capabilities the story requires: {string.Join("; ", missing)}.";
+    }
+
+    /// <summary>True when the story registers services or fixtures that must override the host's services.</summary>
+    public bool HasServiceOverrides => ServiceConfigurations.Count > 0 || Fixtures.Count > 0 || FakeTimeStart is not null || HttpMocks.Count > 0 || TimeZone is not null;
+
+    /// <summary>Builds the render fragment for the story (decorators + theme decorator + component).</summary>
+    public RenderFragment Render(StoryRenderContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        RenderFragment fragment = builder => BuildComponent(builder, context);
+        foreach (var decorator in Decorators)
+        {
+            fragment = decorator(fragment, context);
+        }
+
+        if (context.Theme?.Decorator is { } themeDecorator)
+        {
+            fragment = themeDecorator(fragment, context);
+        }
+
+        if (context.Theme?.Direction == TextDirection.RightToLeft)
+        {
+            var inner = fragment;
+            fragment = builder =>
+            {
+                builder.OpenElement(0, "div");
+                builder.AddAttribute(1, "dir", "rtl");
+                builder.AddContent(2, inner);
+                builder.CloseElement();
+            };
+        }
+
+        return fragment;
+    }
+
+    /// <summary>Applies the story's service overrides, fixtures and fake time to a service collection.</summary>
+    public void ConfigureServices(IServiceCollection services, FixtureContext context) => ConfigureServices(services, context, TimeZone);
+
+    /// <summary>
+    /// Applies the story's service overrides with <paramref name="timeZone"/> as the zone of its <see cref="TimeProvider"/>
+    /// (a theme's zone, see <see cref="TimeZoneUnder"/>); null keeps the system clock's.
+    /// </summary>
+    public void ConfigureServices(IServiceCollection services, FixtureContext context, string? timeZone)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+        ArgumentNullException.ThrowIfNull(context);
+
+        var zone = timeZone is { } id ? TimeZoneInfo.FindSystemTimeZoneById(id) : null;
+        if (FakeTimeStart is { } start)
+        {
+            var fakeTime = new Microsoft.Extensions.Time.Testing.FakeTimeProvider(start);
+            if (zone is not null)
+            {
+                fakeTime.SetLocalTimeZone(zone);
+            }
+
+            // Components get the story clock: the fake time, plus wall-clock jumps (ctx.SetSystemTimeAsync).
+            var clock = new StoryClock(fakeTime);
+            services.AddSingleton(fakeTime);
+            services.AddSingleton(clock);
+            services.AddSingleton<TimeProvider>(clock);
+        }
+        else if (zone is not null)
+        {
+            services.AddSingleton<TimeProvider>(new StoryTimeZone.ZonedTimeProvider(zone));
+        }
+
+        foreach (var fixture in Fixtures)
+        {
+            fixture.ConfigureServices(services, context);
+        }
+
+        if (HttpMocks.Count > 0)
+        {
+            var mock = new HttpMock();
+            foreach (var configure in HttpMocks)
+            {
+                configure(mock, context);
+            }
+
+            HttpMock Bound(IServiceProvider provider)
+            {
+                mock.Time = provider.GetService<TimeProvider>() ?? TimeProvider.System;
+                return mock;
+            }
+
+            services.AddSingleton(Bound);
+            services.AddSingleton<IHttpClientFactory>(provider => new HttpMockClientFactory(Bound(provider), provider));
+            services.AddSingleton(provider => Bound(provider).CreateClient());
+        }
+
+        foreach (var configure in ServiceConfigurations)
+        {
+            configure(services, context);
+        }
+    }
+
+    /// <summary>Runs fixture initialization (data seeding) against the built provider.</summary>
+    public async Task InitializeFixturesAsync(IServiceProvider services, FixtureContext context)
+    {
+        foreach (var fixture in Fixtures)
+        {
+            await fixture.InitializeAsync(services, context).ConfigureAwait(false);
+        }
+    }
+
+    /// <inheritdoc />
+    public override string ToString() => Id;
+
+    private void BuildComponent(RenderTreeBuilder builder, StoryRenderContext context)
+    {
+        builder.OpenComponent(0, ComponentType);
+        builder.SetKey(context.ComponentKey);
+        var overrides = context.ArgOverrides;
+        foreach (var arg in Args)
+        {
+            // Bindings read their holder, which applies overrides itself so user edits through the component survive renders.
+            object? value;
+            if (arg.Kind == StoryArgKind.Binding)
+            {
+                value = arg.CreateValue(context);
+            }
+            else if (arg.Kind == StoryArgKind.Value && overrides.TryGetValue(arg.Name, out var overridden))
+            {
+                value = overridden;
+            }
+            else
+            {
+                value = context.GetOrCreate("arg:" + arg.Name, () => arg.CreateValue(context));
+            }
+
+            builder.AddComponentParameter(1, arg.Name, value);
+        }
+
+        // Overrides of parameters the story leaves at the component's default, and defaults of removed overrides.
+        foreach (var (name, value) in overrides)
+        {
+            if (!Args.Any(a => string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase)))
+            {
+                builder.AddComponentParameter(2, name, value);
+            }
+        }
+
+        foreach (var (name, value) in context.ArgResets)
+        {
+            if (!overrides.ContainsKey(name))
+            {
+                builder.AddComponentParameter(3, name, value);
+            }
+        }
+
+        builder.CloseComponent();
+    }
+}
+
+/// <summary>Well-known metadata keys.</summary>
+public static class StoryBuilderMetadata
+{
+    /// <summary>Key of the <see cref="StoryLayout"/> metadata.</summary>
+    public const string Layout = "btp:layout";
+
+    /// <summary>Key of the prerender flag metadata.</summary>
+    public const string Prerender = "btp:prerender";
+
+    /// <summary>Key of the prerender parity check metadata (<c>CheckPrerender()</c>).</summary>
+    public const string PrerenderParity = "btp:prerender-parity";
+
+    /// <summary>Key of the run-alone metadata (<c>Exclusive()</c>).</summary>
+    public const string Exclusive = "btp:exclusive";
+
+    /// <summary>Key of the markup scrubbers metadata (<c>ScrubMarkup(...)</c>).</summary>
+    public const string MarkupScrubbers = "btp:markup-scrubbers";
+
+    /// <summary>Key of the leak-check opt-out metadata (<c>AllowLeaks(reason)</c>).</summary>
+    public const string AllowLeaks = "btp:allow-leaks";
+
+    /// <summary>Key of the accessibility-after-every-action metadata (<c>CheckAccessibilityAfterActions()</c>).</summary>
+    public const string AccessibilityAfterActions = "btp:a11y-after-actions";
+}
+
+/// <summary>Mutable data collected by builders.</summary>
+internal sealed class StoryData
+{
+    public required string Title { get; init; }
+
+    public required string Name { get; init; }
+
+    [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.All)]
+    public required Type ComponentType { get; init; }
+
+    public string? Description { get; init; }
+
+    public IReadOnlyList<StoryArg> Args { get; init; } = [];
+
+    public IReadOnlyList<StoryDecorator> Decorators { get; init; } = [];
+
+    public Func<StoryContext, Task>? Play { get; init; }
+
+    public IReadOnlySet<string> Tags { get; init; } = new HashSet<string>();
+
+    public int Seed { get; init; }
+
+    public TestUser? User { get; init; }
+
+    public IReadOnlyList<Action<IServiceCollection, FixtureContext>> ServiceConfigurations { get; init; } = [];
+
+    public IReadOnlyList<StoryFixture> Fixtures { get; init; } = [];
+
+    public IReadOnlyList<Action<HttpMock, FixtureContext>> HttpMocks { get; init; } = [];
+
+    public JSInteropMocks? JSInterop { get; init; }
+
+    public DateTimeOffset? FakeTimeStart { get; init; }
+
+    public VisualOptions Visual { get; init; } = new();
+
+    public StoryAccessibilityOptions Accessibility { get; init; } = new();
+
+    public PerformanceBudget? Performance { get; init; }
+
+    public MatrixFilter Matrix { get; init; } = new();
+
+    public TimeSpan? Timeout { get; init; }
+
+    public string? Culture { get; init; }
+
+    public string? TimeZone { get; init; }
+
+    public string? SkipReason { get; init; }
+
+    public IReadOnlyDictionary<string, object?> Metadata { get; init; } = new Dictionary<string, object?>();
+
+    public IReadOnlyList<CapabilityRequirement> Requirements { get; init; } = [];
+
+    public BrowserEmulation Emulation { get; init; } = BrowserEmulation.None;
+
+    public BrowserBudget? BrowserBudget { get; init; }
+
+    public Type? CollectionType { get; init; }
+
+    public string? SourceFile { get; init; }
+
+    public int SourceLine { get; init; }
+
+    public int Order { get; init; }
+
+    public Results.ExpectedFailure? ExpectedFailure { get; init; }
+
+    public bool IsSlow { get; init; }
+}
+
+/// <summary>A driver capability a story needs, and why (see <see cref="StoryBuilder{TComponent}.Requires"/>).</summary>
+/// <param name="Capabilities">The capabilities.</param>
+/// <param name="Reason">Why the story needs them; shown when a runner skips the story.</param>
+public sealed record CapabilityRequirement(DriverCapabilities Capabilities, string Reason);
