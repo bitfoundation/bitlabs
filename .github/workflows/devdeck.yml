@@ -1,0 +1,50 @@
+name: DevDeck
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'DevDeck/**'
+      - '.github/workflows/devdeck.yml'
+  pull_request:
+    paths:
+      - 'DevDeck/**'
+      - '.github/workflows/devdeck.yml'
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: DevDeck
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    # DevDeck is a Win32 application, and the build script embeds the manifest and resources through link.exe (MSVC).
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            DevDeck/target
+          key: devdeck-${{ runner.os }}-${{ hashFiles('DevDeck/Cargo.lock') }}
+          restore-keys: devdeck-${{ runner.os }}-
+      - name: Tests
+        # Integration tests run git.exe against temporary repositories.
+        run: cargo test --locked
+      - name: Build with the guard-alloc feature
+        run: cargo build --locked --features guard-alloc
+      - name: Release build
+        run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: devdeck-win-64
+          path: DevDeck/target/release/devdeck.exe
