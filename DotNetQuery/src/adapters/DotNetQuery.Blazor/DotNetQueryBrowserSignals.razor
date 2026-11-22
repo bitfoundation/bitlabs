@@ -1,0 +1,14 @@
+@inject BrowserSignalService Signals
+
+@* Invisible component: place once in an interactive layout to enable focus/online/resume refetching.
+   The service is scoped and owned by DI, so this component starts it but never disposes it. *@
+
+@code {
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            await Signals.InitializeAsync();
+        }
+    }
+}

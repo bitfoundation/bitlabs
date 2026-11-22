@@ -1,0 +1,380 @@
+// NativeAOT / trimming verification harness.
+//
+// This is not a functional sample - it exists so `dotnet publish -p:PublishAot=true` compiles a
+// program that instantiates the generic-heavy hot paths of DotNetQuery (cache, observers,
+// mutations, infinite queries) and reports zero IL2xxx/IL3xxx trim/AOT warnings. Any warning fails
+// the build (TreatWarningsAsErrors) and thus CI.
+
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using DotNetQuery;
+using DotNetQuery.Persistence;
+using Microsoft.AspNetCore.SignalR.Client;
+using Microsoft.Extensions.DependencyInjection;
+
+int failures = 0;
+void Check(bool ok, string what)
+{
+    Console.WriteLine($"{(ok ? "ok  " : "FAIL")}  {what}");
+    if (!ok)
+    {
+        failures++;
+    }
+}
+
+using var client = new QueryClient();
+
+// --- Keys ---------------------------------------------------------------------------------------
+var key = QueryKey.Create<User>("profile", 42);
+Check(key.Count == 3 && key[0] as string == "User", "query key construction");
+
+// --- Basic fetch + cache hit --------------------------------------------------------------------
+var fetchCount = 0;
+Task<User> Fetch(CancellationToken _)
+{
+    Interlocked.Increment(ref fetchCount);
+    return Task.FromResult(new User(42, "Ada"));
+}
+
+var options = new QueryOptions { StaleTime = TimeSpan.FromMinutes(5) };
+var first = await client.FetchAsync(key, Fetch, options);
+Check(first.IsSuccess && first.Data!.Name == "Ada", "cold fetch");
+
+var second = await client.FetchAsync(key, Fetch, options);
+Check(second.IsSuccess && fetchCount == 1, "cached hit skips fetcher");
+
+var forced = await client.FetchAsync(key, Fetch, options, forceRefetch: true);
+Check(forced.IsSuccess && fetchCount == 2, "forced refetch runs fetcher");
+
+// --- Observers ----------------------------------------------------------------------------------
+var notifications = 0;
+using (var observer = client.Watch<User>(key))
+{
+    observer.StateChanged += _ => Interlocked.Increment(ref notifications);
+    client.SetQueryData(key, new User(42, "Grace"));
+}
+
+Check(notifications >= 1, "observer notified on SetQueryData");
+Check(client.GetQueryData<User>(key).Data!.Name == "Grace", "imperative cache write");
+
+// --- Invalidation -------------------------------------------------------------------------------
+await client.InvalidateQueriesAsync(QueryKey.Create<User>());
+Check(true, "prefix invalidation");
+
+// --- Mutations ----------------------------------------------------------------------------------
+var mutation = await client.MutateAsync<string, int>(
+    (name, _) => Task.FromResult(name.Length),
+    "Turing",
+    new MutationOptions<string, int>
+    {
+        OnMutate = (_, _) => new ValueTask<object?>((object?)null),
+        OnSuccess = (_, _, _, _) => ValueTask.CompletedTask,
+        OnSettled = (_, _, _, _, _) => ValueTask.CompletedTask,
+    });
+Check(mutation.IsSuccess && mutation.Data == 6, "mutation lifecycle");
+
+// --- Infinite query -----------------------------------------------------------------------------
+using (var infinite = client.CreateInfiniteQuery<int, Page>(
+    QueryKey.Create("feed"),
+    (pageParam, _) => Task.FromResult(new Page(pageParam, Enumerable.Range(pageParam * 10, 10).ToArray())),
+    new InfiniteQueryOptions<int, Page>
+    {
+        InitialPageParam = 0,
+        GetNextPageParam = (last, _, _) => last.Index < 2 ? NextPageParam.Of(last.Index + 1) : NextPageParam.None<int>(),
+    }))
+{
+    var page0 = await infinite.FetchAsync();
+    Check(page0.Data.Pages.Count == 1, "infinite first page");
+    var page1 = await infinite.FetchNextPageAsync();
+    Check(page1.Data.Pages.Count == 2, "infinite next page");
+}
+
+// --- Query definitions, cache writes, hydration, cancellation ----------------------------------
+var userQuery = new QueryDefinition<User>(QueryKey.Create<User>("by-id", 7), _ => Task.FromResult(new User(7, "Hopper")));
+var hopper = await client.EnsureQueryDataAsync(userQuery);
+Check(hopper.Name == "Hopper", "query definition + EnsureQueryData");
+
+var renamed = client.SetQueryData(userQuery, u => u! with { Name = "Grace Hopper" });
+Check(renamed.Name == "Grace Hopper", "atomic SetQueryData updater");
+
+Check(client.HydrateQueryData(QueryKey.Create("hydrated"), 42, DateTimeOffset.UtcNow), "hydration");
+await client.CancelQueriesAsync(QueryKey.Create("hydrated"));
+Check(client.GetQueryData<int>(QueryKey.Create("hydrated")).Data == 42, "cancel without in-flight fetch");
+
+// --- Declarative optimistic update + invalidation ----------------------------------------------
+var listKey = QueryKey.Create("names");
+client.SetQueryData(listKey, new List<string> { "Ada" });
+var failed = await client.MutateAsync<string, string>(
+    (_, _) => Task.FromException<string>(new InvalidOperationException("rejected")),
+    "Linus",
+    new MutationOptions<string, string>
+    {
+        ThrowOnError = false,
+        OptimisticUpdates = [OptimisticUpdate.Create<string, List<string>>(listKey, (names, name) => [.. names ?? [], name])],
+        Invalidates = [listKey],
+    });
+Check(failed.IsError && client.GetQueryData<List<string>>(listKey).Data!.Count == 1, "optimistic update rollback");
+
+// --- Persistence with source-generated JSON (trim/AOT-safe path) -------------------------------
+var store = new InMemoryQueryPersister();
+using (var manager = new QueryPersistenceManager(client, store).Register(userQuery, HarnessJson.Default.User))
+{
+    await manager.PersistAllAsync();
+}
+
+using (var restoredClient = new QueryClient())
+{
+    var manager = new QueryPersistenceManager(restoredClient, store).Register(userQuery, HarnessJson.Default.User);
+    Check(await manager.RestoreAllAsync() == 1 && restoredClient.GetQueryData(userQuery).Data!.Name == "Grace Hopper", "persist + restore");
+}
+
+var envelope = PersistedQueryJson.Serialize(new PersistedQuery("k", "\"payload\"", DateTimeOffset.UnixEpoch));
+Check(PersistedQueryJson.Deserialize(envelope) is { Payload: "\"payload\"" }, "persisted envelope round-trip");
+
+// --- Durable offline mutation queue ------------------------------------------------------------
+var connectivity = new ConnectivityProvider();
+connectivity.SetOnline(false);
+var replayed = 0;
+using (var queue = new PersistentMutationQueue(new InMemoryQueryPersister(), connectivity))
+{
+    queue.RegisterHandler<User>("users/save", (_, _) => { Interlocked.Increment(ref replayed); return Task.CompletedTask; }, HarnessJson.Default.User);
+    await queue.EnqueueAsync("users/save", new User(1, "Offline"));
+    connectivity.SetOnline(true);
+    await queue.FlushAsync();
+    Check(replayed == 1 && queue.PendingCount == 0, "persistent mutation queue replay");
+}
+
+// --- HTTP transport with source-generated JSON -------------------------------------------------
+using var http = new HttpClient(new StubHandler()) { BaseAddress = new Uri("https://example.test/") };
+var remote = await client.FetchAsync(http.JsonQuery(QueryKey.Create("remote-user"), "users/5", HarnessJson.Default.User));
+Check(remote.IsSuccess && remote.Data!.Name == "Remote", "HTTP JSON query (source-generated)");
+
+// --- Retry classification -----------------------------------------------------------------------
+var notFoundCalls = 0;
+var notFound = await client.FetchAsync<User>(
+    QueryKey.Create("missing-user"),
+    _ => { notFoundCalls++; throw new HttpRequestException("gone", null, System.Net.HttpStatusCode.NotFound); },
+    new QueryOptions { RetryCount = 3, RetryDelay = RetryPolicy.Constant(TimeSpan.Zero), ShouldRetry = HttpRetryPolicy.ShouldRetry });
+Check(notFound.IsError && notFoundCalls == 1, "HTTP-aware retry predicate");
+
+// --- Structural sharing and selectors -----------------------------------------------------------
+var listKey2 = QueryKey.Create("shared-users");
+var sharing = new QueryOptions { StructuralSharing = true };
+var firstList = (await client.FetchAsync(listKey2, _ => Task.FromResult(new List<User> { new(1, "Ada"), new(2, "Grace") }), sharing)).Data;
+var secondList = (await client.FetchAsync(listKey2, _ => Task.FromResult(new List<User> { new(1, "Ada"), new(2, "Grace") }), sharing, forceRefetch: true)).Data;
+Check(ReferenceEquals(firstList, secondList), "structural sharing keeps equal data");
+using (var names = client.Watch(listKey2, (List<User> users) => users.Select(u => u.Name).ToList(), QueryStateProperties.Data))
+{
+    Check(names.CurrentState.Data is ["Ada", "Grace"], "selector observer");
+}
+
+// --- Filters, transactions, mutation cache ------------------------------------------------------
+Check(client.Cache.FindAll(new QueryFilter { Key = listKey2, Stale = true }).Count == 1, "query filter");
+var commit = client.SetQueriesData(tx => tx.Set(QueryKey.Create("tx", 1), 1).Update<int>(QueryKey.Create("tx", 2), n => n + 2));
+Check(client.GetQueryData<int>(QueryKey.Create("tx", 2)).Data == 2, "atomic multi-query write");
+Check(commit.Rollback().Count == 0 && !client.GetQueryData<int>(QueryKey.Create("tx", 1)).HasData, "transaction rollback");
+await client.CreateMutation<int, int>((v, _) => Task.FromResult(v), new MutationOptions<int, int> { Scope = "harness" }).MutateAsync(1);
+Check(client.Cache.Mutations.FindAll(new MutationFilter { Scope = "harness" }) is [{ Status: MutationStatus.Success }], "mutation cache + scope");
+var withInitial = new QueryDefinition<int>(QueryKey.Create("initial"), _ => Task.FromResult(2)).WithInitialData(1);
+Check((await client.EnsureQueryDataAsync(withInitial)) == 1, "initial data");
+
+// --- Cross-cache synchronization ----------------------------------------------------------------
+var hub = new DotNetQuery.Synchronization.InMemoryQuerySyncHub();
+using (var tabA = new QueryClient())
+using (var tabB = new QueryClient())
+using (new DotNetQuery.Synchronization.QuerySynchronizer(tabA, hub.CreateChannel()).Register(key, HarnessJson.Default.User).Start())
+using (new DotNetQuery.Synchronization.QuerySynchronizer(tabB, hub.CreateChannel()).Register(key, HarnessJson.Default.User).Start())
+{
+    tabA.SetQueryData(key, new User(42, "Synced"));
+    Check(tabB.GetQueryData<User>(key).Data?.Name == "Synced", "query synchronization (source-generated envelope)");
+}
+
+// --- Generated queries, GraphQL mutations, MVVM and lifecycle --------------------------------------
+var users = new UserApi();
+var generated = await client.FetchAsync(UserApiQueries.GetUser(users, 9));
+var rename = await UserApiQueries.Rename(client, users).MutateAsync(new UserApiQueries.RenameVariables(9, "Renamed"));
+Check(generated.Data!.Name == "User 9" && rename.Data!.Name == "Renamed", "source-generated query definitions and mutations");
+
+using (var graphQLHttp = new HttpClient(new StubHandler("{\"data\":{\"id\":3,\"name\":\"GraphQL\"}}")) { BaseAddress = new Uri("https://api.test/") })
+{
+    var graphQLMutation = client.CreateGraphQLMutation(graphQLHttp, "graphql", "mutation($id:Int!){ user(id:$id){ id name } }", HarnessJson.Default.User, HarnessJson.Default.User);
+    Check((await graphQLMutation.MutateAsync(new User(3, "x"))).Data?.Name == "GraphQL", "GraphQL mutation (source-generated)");
+}
+
+using (var feed = new DotNetQuery.Mvvm.ObservableInfiniteQuery<int, Page>(
+    client,
+    QueryKey.Create("feed"),
+    (index, _) => Task.FromResult(new Page(index, [index])),
+    new InfiniteQueryOptions<int, Page>
+    {
+        InitialPageParam = 0,
+        GetNextPageParam = (last, _, _) => last.Index < 1 ? NextPageParam.Of(last.Index + 1) : NextPageParam.None<int>(),
+    }))
+{
+    for (var i = 0; i < 100 && feed.PageCount == 0; i++)
+    {
+        await Task.Delay(10);
+    }
+
+    feed.FetchNextPageCommand.Execute(null);
+    for (var i = 0; i < 100 && feed.PageCount < 2; i++)
+    {
+        await Task.Delay(10);
+    }
+
+    Check(feed.PageCount == 2 && !feed.HasNextPage, "observable infinite query + command");
+}
+
+var focusManager = new FocusManager();
+var focusSignals = 0;
+focusManager.Raised += () => focusSignals++;
+var lifecycle = new AppLifecycleSignals(focusManager);
+lifecycle.NotifyDeactivated();
+lifecycle.NotifyActivated();
+Check(focusSignals == 1, "lifecycle signals");
+
+// --- Meta, retry opt-out, logging, generated infinite/generic queries, shared queue lock -------------------------
+var metaEvents = new List<DotNetQueryEvent>();
+client.DiagnosticEvent += metaEvents.Add;
+await client.FetchAsync(QueryKey.Create("meta"), _ => Task.FromResult(1), new QueryOptions { Meta = new Dictionary<string, object?> { ["silent"] = true } });
+Check(metaEvents.OfType<QueryCompletedEvent>().Any(e => e.Meta?["silent"] is true), "query meta in diagnostic events");
+client.DiagnosticEvent -= metaEvents.Add;
+
+var retryCalls = 0;
+await client.CreateMutation<int, int>((_, _) => { retryCalls++; throw new InvalidOperationException(); },
+    new MutationOptions<int, int> { RetryCount = 0, ThrowOnError = false }).MutateAsync(1);
+Check(retryCalls == 1, "mutation retry count opt-out");
+
+var logger = new CountingLogger();
+using (client.LogDiagnostics(logger))
+{
+    await client.FetchAsync(QueryKey.Create("logged"), _ => Task.FromResult(1));
+}
+
+Check(logger.Count >= 2, "diagnostic logging (source-generated LoggerMessage)");
+
+using (var pages = FeedApiQueries.GetFeed(client, new FeedApi(), new InfiniteQueryOptions<int, Page>
+{
+    InitialPageParam = 0,
+    GetNextPageParam = (last, _, _) => last.Index < 1 ? NextPageParam.Of(last.Index + 1) : NextPageParam.None<int>(),
+}, "news"))
+{
+    await pages.FetchAsync();
+    await pages.FetchNextPageAsync();
+    var single = await client.FetchAsync(FeedApiQueries.GetItem<User>(new FeedApi(), 4));
+    Check(pages.CurrentState.PageCount == 2 && single.Data?.Id == 4, "generated infinite and generic queries");
+}
+
+var lockPath = Path.Combine(Path.GetTempPath(), $"dnq-aot-{Environment.ProcessId}.lock");
+var sharedStore = new InMemoryQueryPersister();
+var sent = 0;
+using (var queueA = new PersistentMutationQueue(sharedStore, new ConnectivityProvider(), new PersistentMutationQueueOptions { ReplayLock = new FileMutationQueueLock(lockPath) })
+    .RegisterHandler<User>("save", (_, _) => { Interlocked.Increment(ref sent); return Task.CompletedTask; }, HarnessJson.Default.User))
+using (var queueB = new PersistentMutationQueue(sharedStore, new ConnectivityProvider(), new PersistentMutationQueueOptions { ReplayLock = new FileMutationQueueLock(lockPath) })
+    .RegisterHandler<User>("save", (_, _) => { Interlocked.Increment(ref sent); return Task.CompletedTask; }, HarnessJson.Default.User))
+{
+    await queueA.EnqueueAsync("save", new User(1, "a"));
+    await Task.WhenAll(queueA.FlushAsync(), queueB.FlushAsync());
+    Check(sent == 1 && queueB.PendingCount == 0, "shared durable queue with a file lock");
+}
+
+File.Delete(lockPath);
+
+// --- Real-time event synchronization: mappings, entity upserts, dedup, recovery, relay, SignalR source ----------
+var entity = DotNetQuery.Synchronization.QueryEntity.Create<User, int>(QueryKey.Create("rt"), u => u.Id, detailKey: id => QueryKey.Create("rt", id));
+client.SetQueryData(QueryKey.Create("rt", "list"), new List<User> { new(1, "a") });
+client.SetQueryData(QueryKey.Create("rt", 1), new User(1, "a"));
+var eventSource = new DotNetQuery.Synchronization.InMemoryQueryEventSource();
+await using (var events = new DotNetQuery.Synchronization.QueryEventSynchronizer(client, eventSource))
+using (var relayed = new DotNetQuery.Synchronization.QueryEventRelay(events, hub.CreateChannel()).Start())
+{
+    events.Map<DotNetQuery.Synchronization.QueryEventEnvelope<User>>("UserChanged", m => m
+        .Upsert(entity, e => e.Payload, DotNetQuery.Synchronization.EntityMissingBehavior.Append)
+        .Invalidate(QueryKey.Create("rt", "stats")));
+    await events.StartAsync();
+    await eventSource.PublishAsync("UserChanged", new DotNetQuery.Synchronization.QueryEventEnvelope<User> { EventId = "e1", Sequence = 1, Payload = new User(1, "b") });
+    var duplicate = await events.ProcessAsync("UserChanged", new DotNetQuery.Synchronization.QueryEventEnvelope<User> { EventId = "e1", Sequence = 1, Payload = new User(1, "c") });
+    await events.ResynchronizeAsync();
+    Check(client.GetQueryData<User>(QueryKey.Create("rt", 1)).Data?.Name == "b"
+          && duplicate == DotNetQuery.Synchronization.QueryEventOutcome.Duplicate
+          && relayed.MessagesSent >= 1, "real-time event synchronization (mappings, dedup, recovery, relay)");
+}
+
+var hubConnection = new Microsoft.AspNetCore.SignalR.Client.HubConnectionBuilder()
+    .WithUrl("http://127.0.0.1:1/hub")
+    .AddJsonProtocol(o => o.PayloadSerializerOptions.TypeInfoResolverChain.Insert(0, HarnessJson.Default))
+    .Build();
+await using (var signalRSource = new DotNetQuery.SignalR.HubConnectionQueryEventSource(hubConnection, new() { OwnsConnection = true }))
+{
+    using var subscription = signalRSource.Subscribe<User>("UserChanged", _ => default);
+    Check(signalRSource.State == DotNetQuery.Synchronization.QueryEventSourceState.Disconnected, "SignalR event source (typed handler registration)");
+}
+
+Console.WriteLine(failures == 0
+    ? "\nAOT harness: all checks passed."
+    : $"\nAOT harness: {failures} check(s) FAILED.");
+return failures;
+
+internal sealed record User(int Id, string Name);
+internal sealed record Page(int Index, int[] Items);
+
+[JsonSourceGenerationOptions(JsonSerializerDefaults.Web)]
+[JsonSerializable(typeof(User))]
+internal sealed partial class HarnessJson : JsonSerializerContext;
+
+[GenerateQueries]
+internal interface IUserApi
+{
+    Task<User> GetUserAsync(int id, CancellationToken cancellationToken);
+
+    Task<User> RenameAsync(int id, string name, CancellationToken cancellationToken);
+}
+
+internal sealed class UserApi : IUserApi
+{
+    public Task<User> GetUserAsync(int id, CancellationToken cancellationToken) => Task.FromResult(new User(id, $"User {id}"));
+
+    public Task<User> RenameAsync(int id, string name, CancellationToken cancellationToken) => Task.FromResult(new User(id, name));
+}
+
+[GenerateQueries]
+internal interface IFeedApi
+{
+    [InfiniteQueryMethod("index")]
+    Task<Page> GetFeedAsync(string topic, int index, CancellationToken cancellationToken);
+
+    Task<T> GetItemAsync<T>(int id, CancellationToken cancellationToken)
+        where T : class;
+}
+
+internal sealed class FeedApi : IFeedApi
+{
+    public Task<Page> GetFeedAsync(string topic, int index, CancellationToken cancellationToken) => Task.FromResult(new Page(index, [index]));
+
+    public Task<T> GetItemAsync<T>(int id, CancellationToken cancellationToken)
+        where T : class => Task.FromResult((T)(object)new User(id, "item"));
+}
+
+internal sealed class CountingLogger : Microsoft.Extensions.Logging.ILogger
+{
+    public int Count;
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+    public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        _ = formatter(state, exception);
+        Interlocked.Increment(ref Count);
+    }
+}
+
+internal sealed class StubHandler(string body = "{\"id\":5,\"name\":\"Remote\"}") : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json"),
+        });
+}

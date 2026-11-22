@@ -1,0 +1,23 @@
+@typeparam TData
+@implements IDisposable
+
+@if (_observer is not null)
+{
+    var result = CurrentResult;
+    if (Loading is not null && result.IsPending)
+    {
+        @Loading
+    }
+    else if (Error is not null && result.IsLoadingError)
+    {
+        @Error(result.Error!)
+    }
+    else if (Empty is not null && result.HasData && !result.IsPlaceholderData && IsEmptyData(result.Data))
+    {
+        @Empty
+    }
+    else if (ChildContent is not null)
+    {
+        @ChildContent(result)
+    }
+}

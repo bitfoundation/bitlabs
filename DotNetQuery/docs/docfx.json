@@ -1,0 +1,53 @@
+{
+  "$schema": "https://raw.githubusercontent.com/dotnet/docfx/main/schemas/docfx.schema.json",
+  "metadata": [
+    {
+      "src": [
+        {
+          "src": "../artifacts/docs-bin",
+          "files": [
+            "DotNetQuery.dll",
+            "DotNetQuery.Blazor.dll",
+            "DotNetQuery.Blazor.Server.dll",
+            "DotNetQuery.Avalonia.dll",
+            "DotNetQuery.Persistence.Sqlite.dll",
+            "DotNetQuery.Persistence.Redis.dll",
+            "DotNetQuery.SignalR.dll"
+          ]
+        }
+      ],
+      "dest": "api"
+    }
+  ],
+  "build": {
+    "content": [
+      {
+        "files": [
+          "*.md",
+          "toc.yml"
+        ],
+        "exclude": [
+          "README.md",
+          "_site/**"
+        ]
+      },
+      {
+        "files": [
+          "api/**.yml",
+          "api/index.md"
+        ]
+      }
+    ],
+    "output": "_site",
+    "template": [
+      "default",
+      "modern"
+    ],
+    "globalMetadata": {
+      "_appName": "DotNetQuery",
+      "_appTitle": "DotNetQuery",
+      "_appFooter": "DotNetQuery - server-state management for .NET. MIT licensed.",
+      "_enableSearch": true
+    }
+  }
+}

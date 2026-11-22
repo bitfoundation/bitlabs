@@ -1,0 +1,62 @@
+# DotNetQuery Documentation
+
+Server-state management for .NET - fetching, caching, synchronizing, and mutating remote data with a framework-agnostic core.
+
+## Guides
+
+The same guides can be built into a website with an API reference (by DocFX from `docs/docfx.json`, see
+[Documentation site](../CONTRIBUTING.md#documentation-site)).
+
+1. [Getting Started](getting-started.md) - install, register, first query, query definitions
+2. [Tutorials](tutorials.md) - step-by-step paths: CRUD, render modes, auth and tenants, infinite scrolling, offline-first, desktop and mobile, DevTools
+3. [Blazor](blazor.md) - `<Query>`, hooks, prerender hydration, render modes, scoped clients, DevTools panel
+4. [Caching](caching.md) - stale time, cache time, invalidation, cancellation, hydration
+5. [Mutations](mutations.md) - lifecycle, invalidation, retries, guarantees
+6. [Optimistic Updates](optimistic-updates.md) - instant UI with automatic rollback
+7. [Infinite Queries](infinite-queries.md) - pagination (offset, cursor, bidirectional)
+8. [Offline Mode](offline-mode.md) - pausing, resuming, in-memory and durable mutation queues
+9. [Real-time synchronization](realtime-sync.md) - SignalR events to cache operations: mappings, ordering, deduplication, reconnect recovery, cross-tab relay
+10. [Diagnostics](diagnostics.md) - event stream, logging, meta, OpenTelemetry traces & metrics, DevTools (panel, live endpoint, CLI)
+11. [Performance Tips](performance.md) - deduplication, threading, trimming & NativeAOT
+12. [Advanced Scenarios](advanced-scenarios.md) - persistence, transports, streaming, synchronization, testing
+13. [Generated queries (Refit, OpenAPI, Kiota)](source-generation.md) - `[GenerateQueries]`: keys, definitions, mutations and infinite queries from an API interface or class
+14. [Desktop and mobile](desktop-and-mobile.md) - WPF, WinUI, Avalonia, MAUI, Uno: MVVM bindings, commands, lifecycle refetch
+15. [Architecture and lifecycle](architecture.md) - how a fetch, a mutation and a notification flow through the engine
+16. [Troubleshooting](troubleshooting.md) - symptoms, causes, fixes
+17. [Coming from TanStack Query](tanstack-migration.md) - concept and API mapping
+18. [Migrating between releases](migration.md) - package IDs, behavior changes
+19. [Versioning and releases](releasing.md) - semantic versioning, what counts as breaking, release checklist
+
+## Core concepts at a glance
+
+| Concept | Type | Purpose |
+| --- | --- | --- |
+| Query key | `QueryKey` | Immutable, hierarchical identity for a query |
+| Query definition | `QueryDefinition<T>` | Reusable key + fetcher + options, type-safe everywhere |
+| Client | `IQueryClient` / `QueryClient` | Orchestrates fetching, caching, invalidation |
+| State | `QueryState<T>` / `QueryResult<T>` | Immutable snapshot of a query |
+| Options | `QueryOptions` / `QueryClientOptions` | Per-query and global configuration |
+| Mutation | `Mutation<TVars, TData>` | Writes with optimistic updates, rollback, invalidation |
+| Optimistic update | `OptimisticUpdate` | Declarative cache write rolled back automatically on failure |
+| Infinite query | `InfiniteQuery<TParam, TPage>` | Paginated reads |
+| Observer | `QueryObserver<T>` | Live subscription to a query's state |
+| Offline queues | `OfflineMutationQueue` / `PersistentMutationQueue` | Ordered replay of writes after reconnect |
+| Query filter | `QueryFilter` | Select queries by key, activity, staleness, status for bulk operations |
+| Transaction | `SetQueriesData` / `QueryDataCommit` | Atomic multi-query writes with rollback |
+| Mutation cache | `client.Cache.Mutations` | Inspect, filter and count mutation runs; global hooks |
+| Synchronizer | `QuerySynchronizer` / `IQuerySyncChannel` | Keep caches consistent across tabs, windows, processes |
+
+## Packages
+
+Package IDs match the assembly and namespace names (for example `DotNetQuery.Blazor`).
+
+- **DotNetQuery** - the portable engine (zero UI dependencies) plus `AddDotNetQuery`, cache persistence
+  (in-memory + file system) and the durable mutation queue, HTTP/JSON and GraphQL fetchers, MVVM bindings,
+  and the DevTools model (inspection, event log, export)
+- **DotNetQuery.Blazor** - Blazor components, browser localStorage/IndexedDB persisters, cross-tab sync, the Web Locks
+  queue lock, and the DevTools panel
+- **DotNetQuery.Blazor.Server** - refetch on Blazor Server circuit reconnection (server-only)
+- **DotNetQuery.Persistence.Sqlite** / **.Redis** - SQLite and Redis persistence providers (Redis also synchronizes
+  caches across server instances)
+- **DotNetQuery.Wpf** / **DotNetQuery.WinUI** / **DotNetQuery.Avalonia** / **DotNetQuery.Maui** / **DotNetQuery.Uno** -
+  XAML adapters (see [Desktop and mobile](desktop-and-mobile.md)) over the MVVM bindings
