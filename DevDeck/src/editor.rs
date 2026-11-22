@@ -9,6 +9,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetMessageTime;
 
 use crate::app::*;
 use crate::theme::blend_colorref;
+use crate::app::Cmd;
 use crate::ui::Menu;
 use crate::win::{self, rect, rh, rw, Gfx, MenuItem, DT_LINE};
 
@@ -18,7 +19,7 @@ use windows_sys::Win32::Graphics::Gdi::DT_RIGHT;
 pub type Pos = (usize, usize);
 
 /// Tab stops in the editor, like the viewer's tab expansion.
-const TAB: usize = 4;
+pub const TAB: usize = 4;
 /// Undo steps kept per file.
 const MAX_UNDO: usize = 5000;
 
@@ -61,6 +62,18 @@ struct Edit {
     kind: EditKind,
 }
 
+/// Identifies a file view's text for as long as the view lives (the find widget's matches
+/// belong to one); every view, editable or not, gets a new one.
+#[derive(Debug)]
+pub struct Uid(pub u64);
+
+impl Default for Uid {
+    fn default() -> Uid {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Uid(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// Editing state of a text file view. `editable` is false for conflict views, files
 /// opened from a change, and files that would not survive a save (invalid UTF-8 / UTF-16).
 #[derive(Default)]
@@ -86,6 +99,9 @@ pub struct EditState {
     /// (message time, line) of the last double click: a third click on that line soon after
     /// selects the line.
     dbl_at: Option<(u32, usize)>,
+    pub uid: Uid,
+    /// Changes with every edit, undo and redo.
+    pub version: u64,
 }
 
 impl EditState {
@@ -331,6 +347,7 @@ impl FileView {
         let before = (self.ed.cur, self.ed.anchor);
         let end = replace(&mut self.lines, a, b, text);
         let ed = &mut self.ed;
+        ed.version += 1;
         if ed.saved_at.is_some_and(|s| s > ed.undo.len()) {
             ed.saved_at = None;
         }
@@ -372,6 +389,7 @@ impl FileView {
         let Some(e) = self.ed.undo.pop() else { return false };
         let end = end_of(e.at, &e.new);
         replace(&mut self.lines, e.at, end, &e.old);
+        self.ed.version += 1;
         self.ed.cur = e.before.0;
         self.ed.anchor = e.before.1;
         self.ed.cur = self.clamp(self.ed.cur);
@@ -386,12 +404,18 @@ impl FileView {
         let Some(e) = self.ed.redo.pop() else { return false };
         let end = end_of(e.at, &e.old);
         let to = replace(&mut self.lines, e.at, end, &e.new);
+        self.ed.version += 1;
         self.ed.cur = to;
         self.ed.anchor = to;
         self.ed.undo.push(e);
         self.ed.seal = true;
         self.ed.want_vcol = None;
         true
+    }
+
+    /// Replaces the text between `a` and `b` with `text` as one undo step (Replace / Replace All).
+    pub fn edit_range(&mut self, a: Pos, b: Pos, text: &str) {
+        self.apply(a, b, text, EditKind::Other);
     }
 
     pub fn mark_clean(&mut self) {
@@ -454,6 +478,45 @@ impl FileView {
             }
         }
         (p.0, i)
+    }
+
+    /// Up / Down (`delta` rows, a page for Page Up / Down): the position `delta` visual rows
+    /// away (lines without word wrap, `cols` with it), at the column the caret had when it
+    /// started moving up or down. One row past the first / last line goes to its start / end.
+    pub fn vmove(&mut self, cols: Option<usize>, delta: isize) -> Pos {
+        let cur = self.ed.cur;
+        let last = self.lines.len() - 1;
+        let mut segs = crate::wrap::segments(&self.lines[cur.0], cols);
+        let mut k = crate::wrap::seg_of(&segs, cur.1);
+        let lines = &self.lines;
+        let want = *self.ed.want_vcol.get_or_insert_with(|| vcol(&lines[cur.0], cur.1) - segs[k].vs);
+        let mut line = cur.0;
+        for _ in 0..delta.unsigned_abs() {
+            if delta < 0 {
+                if k > 0 {
+                    k -= 1;
+                } else if line > 0 {
+                    line -= 1;
+                    segs = crate::wrap::segments(&self.lines[line], cols);
+                    k = segs.len() - 1;
+                } else if delta == -1 {
+                    return (0, 0);
+                } else {
+                    break;
+                }
+            } else if k + 1 < segs.len() {
+                k += 1;
+            } else if line < last {
+                line += 1;
+                segs = crate::wrap::segments(&self.lines[line], cols);
+                k = 0;
+            } else if delta == 1 {
+                return (last, char_len(&self.lines[last]));
+            } else {
+                break;
+            }
+        }
+        (line, crate::wrap::col_in_seg(&self.lines[line], &segs, k, want * 2))
     }
 
     /// Selects the word (or run of spaces / punctuation) at `p`.
@@ -719,6 +782,15 @@ impl App {
             _ => return,
         };
         self.clamp_scroll(Area::Main);
+        // wrapped: the caret's visual row, and nothing to scroll sideways
+        if let Some(cols) = self.wrap_cols().filter(|_| self.wrap_map().is_some()) {
+            let MainView::File(f) = &self.view else { return };
+            let segs = crate::wrap::segments(&f.lines[line], Some(cols));
+            let v = crate::wrap::vrow(self.wrap_map(), line) + crate::wrap::seg_of(&segs, f.ed.cur.1);
+            self.reveal_vrow(v);
+            self.hscroll = 0;
+            return;
+        }
         self.reveal_row(Area::Main, line);
         let body = self.l.main_body;
         let mw = self.fonts.mono_w;
@@ -753,10 +825,16 @@ impl App {
         let body = self.l.main_body;
         let lh = self.line_h();
         let top = body.top + self.s(4);
-        let line = ((y - top + self.scroll[Area::Main as usize]).max(0) / lh) as usize;
+        let v = ((y - top + self.scroll[Area::Main as usize]).max(0) / lh) as usize;
+        let m = self.wrap_map();
+        let (line, sub) = crate::wrap::row_at(m, v);
         let line = line.min(f.lines.len() - 1);
         let rel = x - self.text_x0(f.lines.len());
         let half = ((rel.max(0) * 2) / self.fonts.mono_w.max(1)) as usize;
+        if let Some(cols) = self.wrap_cols().filter(|_| m.is_some()) {
+            let segs = crate::wrap::segments(&f.lines[line], Some(cols));
+            return Some((line, crate::wrap::col_in_seg(&f.lines[line], &segs, sub.min(segs.len() - 1), half)));
+        }
         Some((line, col_at_vcol(&f.lines[line], half)))
     }
 
@@ -834,14 +912,11 @@ impl App {
     /// doesn't use fall through to the global ones.
     pub fn editor_key(&mut self, vk: u16, ctrl: bool, shift: bool) -> bool {
         let page = (rh(&self.l.main_body) / self.line_h()).max(2) as usize - 1;
+        let cols = self.wrap_cols().filter(|_| self.wrap_map().is_some());
         let Some(f) = self.fv() else { return false };
         let cur = f.ed.cur;
         let last = f.lines.len() - 1;
         let line_len = |f: &FileView, l: usize| char_len(&f.lines[l]);
-        let vertical = |f: &mut FileView, line: usize| -> Pos {
-            let want = *f.ed.want_vcol.get_or_insert_with(|| vcol(&f.lines[cur.0], cur.1));
-            (line, col_at_vcol(&f.lines[line], want * 2))
-        };
         let mut edited = false;
         let mut page_scroll = 0;
         match (vk, ctrl) {
@@ -869,21 +944,21 @@ impl App {
                 f.ed.want_vcol = None;
             }
             (0x26, false) => {
-                let p = if cur.0 == 0 { (0, 0) } else { vertical(f, cur.0 - 1) };
+                let p = f.vmove(cols, -1);
                 f.move_to(p, shift);
             }
             (0x28, false) => {
-                let p = if cur.0 == last { (last, line_len(f, last)) } else { vertical(f, cur.0 + 1) };
+                let p = f.vmove(cols, 1);
                 f.move_to(p, shift);
             }
             // Page Up / Down scroll the view by a page along with the caret
             (0x21, false) => {
-                let p = vertical(f, cur.0.saturating_sub(page));
+                let p = f.vmove(cols, -(page as isize));
                 f.move_to(p, shift);
                 page_scroll = -1;
             }
             (0x22, false) => {
-                let p = vertical(f, (cur.0 + page).min(last));
+                let p = f.vmove(cols, page as isize);
                 f.move_to(p, shift);
                 page_scroll = 1;
             }
@@ -1000,6 +1075,11 @@ impl App {
     /// Context menu of the editor.
     pub fn editor_menu(&mut self, m: &mut Menu) -> Vec<MenuItem> {
         let MainView::File(f) = &self.view else { return Vec::new() };
+        let wrap = m.check_cmd("Word Wrap", self.st.word_wrap, Cmd::ToggleWordWrap);
+        // a read-only file: finding and wrapping only
+        if !f.ed.editable {
+            return vec![m.cmd("Find", Cmd::Find), MenuItem::Sep, wrap];
+        }
         let (has_sel, can_undo, can_redo, dirty) = (f.sel().is_some(), !f.ed.undo.is_empty(), !f.ed.redo.is_empty(), f.ed.dirty());
         vec![
             m.it_if("Undo\tCtrl+Z", can_undo, |a| {
@@ -1026,6 +1106,10 @@ impl App {
                 a.editor_key(0x41, true, false);
             }),
             MenuItem::Sep,
+            m.cmd("Find", Cmd::Find),
+            m.cmd("Replace", Cmd::Replace),
+            wrap,
+            MenuItem::Sep,
             m.it_if("Save\tCtrl+S", dirty, |a| a.save_active()),
             m.it_if("Revert File", dirty, |a| a.revert_file()),
         ]
@@ -1040,7 +1124,7 @@ impl App {
         }
     }
 
-    fn tab_file_mut(&mut self, i: usize) -> Option<&mut FileView> {
+    pub fn tab_file_mut(&mut self, i: usize) -> Option<&mut FileView> {
         if i >= self.tabs.len() {
             return None;
         }
@@ -1178,8 +1262,6 @@ impl App {
         let count = f.lines.len();
         let num_w = self.gutter_w(count);
         let x0 = self.text_x0(count);
-        let first = (scroll / lh).max(0) as usize;
-        let n = (rh(&body) / lh + 2) as usize;
         let top = body.top + self.s(4);
         let clip = rect(body.left + num_w, body.top, body.right - self.s(12), body.bottom);
         let sel = f.sel();
@@ -1189,33 +1271,64 @@ impl App {
         // chars scrolled out on the left are skipped
         let skip = (self.hscroll / mw).max(0) as usize;
         let visible = (rw(&clip) / mw + 2).max(0) as usize;
-        for li in first..(first + n).min(count) {
-            let y = top + li as i32 * lh - scroll;
-            let line = &f.lines[li];
-            if sel.is_none() && li == cur.0 {
-                g.fill(&rect(body.left, y, body.right - self.s(12), y + lh), line_bg);
+        // word wrap: each line paints as its visual rows, each row's text starting at the left
+        let m = self.wrap_map();
+        let cols = if m.is_some() { self.wrap_cols() } else { None };
+        let text_left = x0 + self.hscroll;
+        let first = crate::wrap::row_at(m, (scroll / lh).max(0) as usize).0;
+        let mut caret = None;
+        for li in first..count {
+            let y0 = top + crate::wrap::vrow(m, li) as i32 * lh - scroll;
+            if y0 >= body.bottom {
+                break;
             }
-            if let Some((a, b)) = sel.filter(|(a, b)| li >= a.0 && li <= b.0) {
-                let c0 = if li == a.0 { vcol(line, a.1) } else { 0 } as i32;
-                // the line break of a selected line shows as one extra cell
-                let c1 = if li == b.0 { vcol(line, b.1) as i32 } else { vcol(line, char_len(line)) as i32 + 1 };
-                let r = rect((x0 + c0 * mw).max(clip.left), y, (x0 + c1 * mw).min(clip.right), y + lh);
-                if r.right > r.left {
-                    g.fill(&r, sel_bg);
-                }
+            let line = &f.lines[li];
+            let segs = crate::wrap::segments(line, cols);
+            let nseg = segs.len();
+            if sel.is_none() && li == cur.0 {
+                g.fill(&rect(body.left, y0, body.right - self.s(12), y0 + nseg as i32 * lh), line_bg);
             }
             let no_color = if li == cur.0 { self.t.fg } else { self.t.line_no };
-            g.text_in(&rect(body.left, y, body.left + num_w - self.s(8), y + lh), &(li + 1).to_string(), self.fonts.mono, no_color, DT_LINE | DT_RIGHT);
-            let chars = display_chars(line, skip + visible);
-            if skip < chars.len() {
-                let end = (skip + visible).min(chars.len());
-                g.text_cells(x0 + skip as i32 * mw, y + self.s(1), &chars[skip..end], mw, self.fonts.mono, self.t.fg, &clip);
+            g.text_in(&rect(body.left, y0, body.left + num_w - self.s(8), y0 + lh), &(li + 1).to_string(), self.fonts.mono, no_color, DT_LINE | DT_RIGHT);
+            // the cells up to the last row in view
+            let last_vis = (((body.bottom - y0) / lh).max(0) as usize).min(nseg - 1);
+            let cells = display_chars(line, if cols.is_some() { segs[last_vis].ve } else { skip + visible });
+            let caret_seg = (li == cur.0).then(|| crate::wrap::seg_of(&segs, cur.1));
+            for (k, sg) in segs.iter().enumerate().take(last_vis + 1) {
+                let y = y0 + k as i32 * lh;
+                if y + lh <= body.top {
+                    continue;
+                }
+                // a row's own x origin and clip, so ranges past its ends are cut off
+                let (x0, clip) = if cols.is_some() {
+                    let right = if k + 1 == nseg { clip.right } else { (text_left + (sg.ve - sg.vs) as i32 * mw).min(clip.right) };
+                    (text_left - sg.vs as i32 * mw, rect(text_left, y, right, y + lh))
+                } else {
+                    (x0, rect(clip.left, y, clip.right, y + lh))
+                };
+                self.paint_find_line(g, li, line, y, x0, &clip, false);
+                if let Some((a, b)) = sel.filter(|(a, b)| li >= a.0 && li <= b.0) {
+                    let c0 = if li == a.0 { vcol(line, a.1) } else { 0 } as i32;
+                    // the line break of a selected line shows as one extra cell
+                    let c1 = if li == b.0 { vcol(line, b.1) as i32 } else { vcol(line, char_len(line)) as i32 + 1 };
+                    let r = rect((x0 + c0 * mw).max(clip.left), y, (x0 + c1 * mw).min(clip.right), y + lh);
+                    if r.right > r.left {
+                        g.fill(&r, sel_bg);
+                    }
+                }
+                self.paint_find_line(g, li, line, y, x0, &clip, true);
+                let (from, to) = if cols.is_some() { (sg.vs, sg.ve) } else { (skip, skip + visible) };
+                let to = to.min(cells.len());
+                if from < to {
+                    g.text_cells(x0 + from as i32 * mw, y + self.s(1), &cells[from..to], mw, self.fonts.mono, self.t.fg, &clip);
+                }
+                if focused && caret_seg == Some(k) {
+                    caret = Some((x0 + vcol(line, cur.1) as i32 * mw, y, clip));
+                }
             }
         }
-        if focused && cur.0 >= first && cur.0 < first + n {
-            let x = x0 + vcol(&f.lines[cur.0], cur.1) as i32 * mw;
-            let y = top + cur.0 as i32 * lh - scroll;
-            if x >= clip.left && x < clip.right {
+        if let Some((x, y, c)) = caret {
+            if x >= c.left - 1 && x < c.right.max(c.left + 1) {
                 g.fill(&rect(x, y, x + self.s(2).max(2), y + lh), self.t.fg_strong);
             }
         }
@@ -1224,13 +1337,13 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn view(text: &str) -> FileView {
+    pub(crate) fn view(text: &str) -> FileView {
         let lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
         let ed = EditState::new(&lines, Enc::Utf8, false, true);
-        FileView { title: "t".into(), path: "t".into(), lines, conflicts: Vec::new(), change: None, mtime: None, ed }
+        FileView { title: "t".into(), path: "t".into(), lines, conflicts: Vec::new(), change: None, mtime: None, ed, nav: None }
     }
 
     fn text(f: &FileView) -> String {

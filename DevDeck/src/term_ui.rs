@@ -1,6 +1,7 @@
 //! Integrated terminal: session lifecycle, input, selection and painting. A terminal lives
 //! either in the bottom panel or in an editor tab (VS Code's "Terminal in Editor Area").
 
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 
@@ -29,6 +30,9 @@ pub struct TermSession {
     /// History scroll offset in lines (0 = following the output).
     pub scroll: usize,
     pub sel: TermSel,
+    /// Working directory it was started in when not the open folder ("Open in Integrated
+    /// Terminal"); a restart after the shell exits starts there again.
+    pub cwd: Option<PathBuf>,
 }
 
 impl TermSession {
@@ -163,28 +167,34 @@ impl App {
         shells.iter().find(|s| s.name == self.st.terminal_shell).or_else(|| shells.first()).cloned().unwrap_or(Shell { name: "Command Prompt".into(), cmd: "cmd.exe".into() })
     }
 
-    /// Starts `shell` on a new pseudo console sized to the area it will be shown in.
-    fn spawn_session(&mut self, shell: Shell, editor: bool) -> TermSession {
-        let cwd = self.folder().or_else(|| std::env::var_os("USERPROFILE").map(Into::into)).unwrap_or_else(|| ".".into());
+    /// Starts `shell` on a new pseudo console sized to the area it will be shown in, in `dir`
+    /// (None: the open folder).
+    fn spawn_session(&mut self, shell: Shell, editor: bool, dir: Option<PathBuf>) -> TermSession {
+        let cwd = dir.clone().or_else(|| self.folder()).or_else(|| std::env::var_os("USERPROFILE").map(Into::into)).unwrap_or_else(|| ".".into());
         let (cols, rows) = self.grid_size_of(editor).unwrap_or((80, 24));
         let id = self.term_next_id;
         self.term_next_id += 1;
         match Pty::spawn(&shell.cmd, &cwd, cols as u16, rows as u16, self.hwnd, WM_TERM, self.term_pending.clone()) {
-            Ok((pty, rx)) => TermSession { id, pty: Some(pty), rx, screen: Screen::new(cols, rows), shell, exited: None, custom_name: None, editor, scroll: 0, sel: None },
+            Ok((pty, rx)) => TermSession { id, pty: Some(pty), rx, screen: Screen::new(cols, rows), shell, exited: None, custom_name: None, editor, scroll: 0, sel: None, cwd: dir },
             Err(e) => {
                 let mut screen = Screen::new(cols, rows);
                 screen.feed(format!("\x1b[31m{e}\x1b[0m\r\n").as_bytes());
                 let (_, rx) = std::sync::mpsc::channel();
                 self.error(e.clone());
-                TermSession { id, pty: None, rx, screen, shell, exited: Some(e), custom_name: None, editor, scroll: 0, sel: None }
+                TermSession { id, pty: None, rx, screen, shell, exited: Some(e), custom_name: None, editor, scroll: 0, sel: None, cwd: dir }
             }
         }
     }
 
     /// Opens a new panel terminal (the default profile when `shell` is None) and makes it active.
     pub fn start_terminal(&mut self, shell: Option<Shell>) {
+        self.start_terminal_in(shell, None);
+    }
+
+    /// `start_terminal` in `dir` (None: the open folder).
+    fn start_terminal_in(&mut self, shell: Option<Shell>, dir: Option<PathBuf>) {
         let shell = shell.unwrap_or_else(|| self.default_shell());
-        let s = self.spawn_session(shell, false);
+        let s = self.spawn_session(shell, false, dir);
         self.terms.push(s);
         self.activate_terminal(self.terms.len() - 1);
         // the tab list appears with the second terminal, which narrows every grid
@@ -198,10 +208,17 @@ impl App {
         self.start_terminal(shell);
     }
 
+    /// Explorer's "Open in Integrated Terminal": shows the panel and opens a new terminal
+    /// (default profile) in `dir`.
+    pub fn new_terminal_in(&mut self, dir: PathBuf) {
+        self.reveal_terminal_panel(true);
+        self.start_terminal_in(None, Some(dir));
+    }
+
     /// Opens a new terminal in an editor tab ("Terminal: Create New Terminal in Editor Area").
     pub fn new_editor_terminal(&mut self, shell: Option<Shell>) {
         let shell = shell.unwrap_or_else(|| self.default_shell());
-        let s = self.spawn_session(shell, true);
+        let s = self.spawn_session(shell, true, None);
         let id = s.id;
         self.terms.push(s);
         self.show_editor_terminal(id);
@@ -300,8 +317,8 @@ impl App {
     /// Restarts the terminal at `i` with the same profile (after its shell exited).
     fn restart_terminal(&mut self, i: usize) {
         let Some(old) = self.terms.get(i) else { return };
-        let (shell, name, id, editor) = (old.shell.clone(), old.custom_name.clone(), old.id, old.editor);
-        let mut s = self.spawn_session(shell, editor);
+        let (shell, name, id, editor, dir) = (old.shell.clone(), old.custom_name.clone(), old.id, old.editor, old.cwd.clone());
+        let mut s = self.spawn_session(shell, editor, dir);
         s.custom_name = name;
         s.id = id;
         self.terms[i] = s; // drops (closes) the old pseudo console
@@ -678,6 +695,8 @@ impl App {
             (0x47, true, true) => Some(Cmd::FocusCommit),
             (0x42, true, false) if !alt => Some(Cmd::ToggleSidebar),
             (0x45, true, true) => Some(Cmd::ShowExplorer),
+            (0x46, true, true) => Some(Cmd::FindInFiles),
+            (0x48, true, true) => Some(Cmd::ReplaceInFiles),
             (0x41, true, true) => Some(Cmd::ClaudeNew),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),

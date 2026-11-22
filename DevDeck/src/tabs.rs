@@ -394,7 +394,11 @@ impl App {
         if let (Some(p), Some(root)) = (path.filter(|p| !p.is_empty()), self.folder()) {
             // a Windows path (the relative path is '/' separated)
             let abs = root.join(&p).display().to_string().replace('/', "\\");
+            // a deleted file is not in the Explorer
+            let on_disk = self.tab_reveal_path(i).is_some();
+            let rel = p.clone();
             v.push(MenuItem::Sep);
+            v.push(m.it_if("Reveal in Explorer\tAlt+Shift+R", on_disk, move |a| a.reveal_in_explorer(&rel)));
             v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &abs)));
             v.push(m.it("Copy Relative Path", move |a| win::set_clipboard(a.hwnd, &p)));
         }

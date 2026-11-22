@@ -70,6 +70,12 @@ pub struct Theme {
     pub button2: u32,
     pub button2_hover: u32,
     pub toolbar_hover: u32,
+    /// Find widget: other matches, the current match, the find-in-selection range and the
+    /// marks on the scroll bar.
+    pub find_match: u32,
+    pub find_current: u32,
+    pub find_range: u32,
+    pub find_mark: u32,
 }
 
 impl Theme {
@@ -129,6 +135,10 @@ impl Theme {
             button2: hex(0x313131),
             button2_hover: hex(0x3C3C3C),
             toolbar_hover: blend(0x181818, 0x5A5D5E, 0.31),
+            find_match: blend(editor, 0xEA5C00, 0.33),
+            find_current: hex(0x9E6A03),
+            find_range: blend(editor, 0x3A3D41, 0.4),
+            find_mark: hex(0xD18616),
         }
     }
 
@@ -188,6 +198,10 @@ impl Theme {
             button2: hex(0xE5E5E5),
             button2_hover: hex(0xCCCCCC),
             toolbar_hover: blend(0xF8F8F8, 0xB8B8B8, 0.31),
+            find_match: blend(editor, 0xEA5C00, 0.33),
+            find_current: hex(0xA8AC94),
+            find_range: blend(editor, 0xB4B4B4, 0.3),
+            find_mark: hex(0xD18616),
         }
     }
 

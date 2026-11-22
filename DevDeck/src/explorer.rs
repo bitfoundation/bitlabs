@@ -165,7 +165,7 @@ pub fn load_text(root: &Path, rel: &str) -> MainView {
     let (lines, crlf) = split_lines(&text);
     // a file with invalid UTF-8 / UTF-16 is shown read-only: saving would change those bytes
     let ed = EditState::new(&lines, enc, crlf, lossless);
-    MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok(), ed })
+    MainView::File(FileView { title: name, path: rel.to_string(), lines, conflicts: Vec::new(), change: None, mtime: meta.modified().ok(), ed, nav: None })
 }
 
 impl App {
@@ -173,11 +173,16 @@ impl App {
         self.st.sidebar_visible && self.st.side_view == 1
     }
 
-    /// Activity bar click: switches the side bar to `view` (0 Source Control, 1 Explorer);
+    /// Activity bar click: switches the side bar to `view` (0 Source Control, 1 Explorer, 2 Search);
     /// clicking the view that is already shown hides the side bar, like VS Code.
     pub fn set_side_view(&mut self, view: u8) {
         if self.st.sidebar_visible && self.st.side_view == view {
             self.set_sidebar_visible(false);
+            return;
+        }
+        if view == 2 {
+            // the keyboard goes to the search box
+            self.open_search(false, false);
             return;
         }
         self.st.side_view = view;
@@ -321,6 +326,9 @@ impl App {
             let abs = root.join(&r.path).display().to_string().replace('/', "\\");
             let (a1, a2, a3) = (abs.clone(), abs.clone(), abs);
             let rel = r.path.clone();
+            // a folder opens the terminal in itself, a file in the folder that holds it
+            let full = root.join(&r.path);
+            let term_dir = if r.dir { full } else { full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| root.clone()) };
             if r.dir {
                 let open = self.ex.open.contains(&r.path);
                 v.push(m.it(if open { "Collapse" } else { "Expand" }, move |a| a.toggle_explorer_dir(i, Some(!open))));
@@ -339,6 +347,7 @@ impl App {
             }
             v.push(MenuItem::Sep);
             v.push(m.it("Reveal in File Explorer", move |_| win::reveal(&a2)));
+            v.push(m.it("Open in Integrated Terminal", move |a| a.new_terminal_in(term_dir)));
             v.push(MenuItem::Sep);
             v.push(m.it("Copy Path", move |a| win::set_clipboard(a.hwnd, &a3)));
             v.push(m.it("Copy Relative Path", move |a| win::set_clipboard(a.hwnd, &rel)));
@@ -423,6 +432,34 @@ impl App {
         if let Some(i) = self.ex.sel_index() {
             self.reveal_row(Area::Explorer, i);
         }
+    }
+
+    /// "Reveal in Explorer" of an editor tab (Alt+Shift+R for the active one): shows the
+    /// Explorer, selects file `rel` in it and gives it the keyboard.
+    pub fn reveal_in_explorer(&mut self, rel: &str) {
+        if rel.is_empty() || self.folder().is_none() {
+            return;
+        }
+        if !self.explorer_active() {
+            self.set_side_view(1);
+        }
+        self.explorer_reveal(rel);
+        self.focus = Focus::Explorer;
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.hwnd);
+        }
+        self.invalidate();
+    }
+
+    /// The file of editor tab `i` (a file or diff view), when it is on disk: what
+    /// "Reveal in Explorer" can show.
+    pub fn tab_reveal_path(&self, i: usize) -> Option<String> {
+        let p = match self.tabs.get(i).map(|_| self.tab_view(i)) {
+            Some(MainView::Diff(d)) => d.path.clone(),
+            Some(MainView::File(f)) => f.path.clone(),
+            _ => return None,
+        };
+        (!p.is_empty() && self.folder()?.join(&p).is_file()).then_some(p)
     }
 
     /// "New File..." / "New Folder..." in the folder of row `i`. Like VS Code, a name with
