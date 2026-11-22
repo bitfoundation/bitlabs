@@ -15,6 +15,7 @@ mod fuzzy;
 mod git;
 mod graph;
 mod quickopen;
+mod search;
 mod settings;
 mod tabs;
 mod term;
@@ -391,6 +392,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 },
                 app::TIMER_TOAST => a.tick_toasts(),
                 app::TIMER_TIP => a.show_tip(),
+                app::TIMER_SEARCH => a.search_timer(),
                 app::TIMER_SPIN => {
                     a.spin = a.spin.wrapping_add(1);
                     a.invalidate();
@@ -414,7 +416,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 // the keyboard (DefWindowProc would focus the main window)
                 if !activating {
                     let f = unsafe { GetFocus() };
-                    let edit = f == a.commit_edit || f == a.overlay_edit || f == a.find.find_edit || f == a.find.repl_edit;
+                    let edit = f == a.commit_edit || f == a.overlay_edit || f == a.find.find_edit || f == a.find.repl_edit || f == a.srch.find_edit || f == a.srch.repl_edit;
                     a.saved_focus = if edit && !f.is_null() { f } else { std::ptr::null_mut() };
                     false
                 } else if !minimized && !a.saved_focus.is_null() && unsafe { IsWindowVisible(a.saved_focus) } != 0 {
@@ -566,6 +568,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         a.filter_pick();
                     } else if ctl == a.find.find_edit {
                         a.find_query_changed();
+                    } else if ctl == a.srch.find_edit {
+                        a.search_query_changed();
+                    } else if ctl == a.srch.repl_edit {
+                        a.search_replace_changed();
                     }
                 });
             } else if code == EN_SETFOCUS || code == EN_KILLFOCUS {
@@ -773,7 +779,7 @@ fn set_edit_fonts(a: &App) {
     unsafe {
         SendMessageW(a.commit_edit, WM_SETFONT, a.fonts.ui as WPARAM, 1);
         SendMessageW(a.overlay_edit, WM_SETFONT, a.fonts.ui as WPARAM, 1);
-        for h in [a.find.find_edit, a.find.repl_edit] {
+        for h in [a.find.find_edit, a.find.repl_edit, a.srch.find_edit, a.srch.repl_edit] {
             if !h.is_null() {
                 SendMessageW(h, WM_SETFONT, a.fonts.ui as WPARAM, 1);
             }

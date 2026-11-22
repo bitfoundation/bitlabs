@@ -1124,7 +1124,7 @@ impl App {
         }
     }
 
-    fn tab_file_mut(&mut self, i: usize) -> Option<&mut FileView> {
+    pub fn tab_file_mut(&mut self, i: usize) -> Option<&mut FileView> {
         if i >= self.tabs.len() {
             return None;
         }

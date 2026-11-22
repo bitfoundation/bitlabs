@@ -26,6 +26,8 @@ pub const TIMER_TOAST: usize = 2;
 pub const TIMER_SPIN: usize = 3;
 /// Hover delay before a tooltip shows.
 pub const TIMER_TIP: usize = 4;
+/// Typing pause before the Search view searches.
+pub const TIMER_SEARCH: usize = 5;
 
 pub type Then = Box<dyn FnOnce(&mut App) + Send>;
 pub type OnErr = Box<dyn FnOnce(&mut App, &GitError) -> bool + Send>;
@@ -39,6 +41,8 @@ pub enum JobResult {
     /// `root`: the repository the op ran in; its callbacks are dropped when another one is open
     /// by the time it finishes (None = always run them).
     Op { title: String, root: Option<PathBuf>, result: GitResult<String>, then: Option<Then>, on_err: Option<OnErr> },
+    /// Matches of the Search view (see `search.rs`).
+    Search { gen: u64, query: crate::search::SQuery, files: Vec<crate::search::SFile>, capped: bool },
 }
 
 pub struct Repo {
@@ -229,6 +233,7 @@ pub enum Area {
     Pick = 4,
     Branches = 5,
     Explorer = 6,
+    Search = 7,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -239,6 +244,8 @@ pub enum Focus {
     Graph,
     Main,
     Terminal,
+    /// The Search view's results (its boxes are edit controls with their own focus).
+    Search,
 }
 
 pub struct PickItem {
@@ -333,6 +340,11 @@ pub enum Hit {
     TabClose(usize),
     ExplorerRow(usize),
     ExplorerHeader,
+    /// A button or input box of the Search view (`search::S_*`).
+    Search(u8),
+    SearchRow(usize),
+    /// An action button of a Search result row (`search::A_*`).
+    SearchAct(usize, u8),
     ActivityView(u8),
     DiffRow(usize),
     DiffBlock(usize, u8),
@@ -397,6 +409,8 @@ pub struct Layout {
     pub changes_header: RECT,
     pub explorer_header: RECT,
     pub explorer: RECT,
+    /// The Search view's results list.
+    pub search: RECT,
     pub edit: RECT,
     pub button: RECT,
     pub changes: RECT,
@@ -415,7 +429,7 @@ pub struct Layout {
 impl Default for Layout {
     fn default() -> Self {
         let z = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-        Layout { titlebar: z, captions: z, activity: z, sidebar: z, title: z, changes_header: z, explorer_header: z, explorer: z, edit: z, button: z, changes: z, branches_header: z, branches: z, graph_header: z, graph: z, main: z, main_header: z, main_body: z, output: z, output_body: z, status: z }
+        Layout { titlebar: z, captions: z, activity: z, sidebar: z, title: z, changes_header: z, explorer_header: z, explorer: z, search: z, edit: z, button: z, changes: z, branches_header: z, branches: z, graph_header: z, graph: z, main: z, main_header: z, main_body: z, output: z, output_body: z, status: z }
     }
 }
 
@@ -519,6 +533,9 @@ cmds! {
     ToggleSidebar => "View: Toggle Primary Side Bar Visibility", "Ctrl+B";
     ShowExplorer => "View: Show Explorer", "Ctrl+Shift+E";
     ShowScm => "View: Show Source Control", "";
+    FindInFiles => "Search: Find in Files", "Ctrl+Shift+F";
+    ReplaceInFiles => "Search: Replace in Files", "Ctrl+Shift+H";
+    ClearSearch => "Search: Clear Search Results", "";
     GotoFile => "Go to File...", "Ctrl+P";
     GotoLine => "Go to Line/Column...", "Ctrl+G";
     Find => "Find", "Ctrl+F";
@@ -589,7 +606,7 @@ pub struct App {
     pub collapsed_bgroups: HashSet<String>,
     pub focus_row: Option<usize>,
     pub anchor_row: Option<usize>,
-    pub scroll: [i32; 7],
+    pub scroll: [i32; 8],
     pub hscroll: i32,
     pub view: MainView,
     /// Editor tabs; `view` holds the active tab's view.
@@ -625,9 +642,11 @@ pub struct App {
     pub overlay_bounds: Option<RECT>,
     /// Edit control and overlay rectangles the window region of the commit box, the find box
     /// and the replace box was last cut for (None = unclipped).
-    pub edit_clip: [Option<[i32; 8]>; 3],
+    pub edit_clip: [Option<[i32; 8]>; 5],
     /// Find / Replace widget of file views.
     pub find: crate::find::Find,
+    /// Search view (find / replace in files).
+    pub srch: crate::search::SearchView,
     /// Visual rows of the active file or diff with word wrap.
     pub wrap: Option<crate::wrap::WrapMap>,
     /// Columns of the widest line of a file view, for the horizontal scroll bar: (view id,
@@ -750,7 +769,7 @@ impl App {
             sel: HashSet::new(),
             focus_row: None,
             anchor_row: None,
-            scroll: [0; 7],
+            scroll: [0; 8],
             hscroll: 0,
             view: MainView::Empty,
             tabs: Vec::new(),
@@ -777,8 +796,9 @@ impl App {
             edit_brush: std::ptr::null_mut(),
             edit_lines: 1,
             overlay_bounds: None,
-            edit_clip: [None; 3],
+            edit_clip: [None; 5],
             find: crate::find::Find::new(),
+            srch: Default::default(),
             wrap: None,
             file_cols: std::cell::Cell::new((0, 0, 0)),
             l: Layout::default(),
@@ -919,7 +939,7 @@ impl App {
         self.log_key.clear();
         self.sel.clear();
         self.crows.clear();
-        self.scroll = [0; 7];
+        self.scroll = [0; 8];
         self.ex = crate::explorer::Explorer::default();
         self.brows.clear();
         self.branch_sel = None;
@@ -1067,6 +1087,7 @@ impl App {
                     self.rebuild_graph();
                 }
                 JobResult::Files { gen, root, files } => self.on_files_listed(gen, root, files),
+                JobResult::Search { gen, query, files, capped } => self.on_search_done(gen, query, files, capped),
                 JobResult::View { gen, view, keep_scroll } => {
                     // route the result to the tab that asked for it (it may be in the background now)
                     let Some(ti) = self.tabs.iter().position(|t| t.gen == gen) else { continue };
@@ -1127,6 +1148,8 @@ impl App {
                     if let Some((l, c)) = goto {
                         self.goto_line(l, c);
                     }
+                    // a match opened from the Search view
+                    self.take_search_pending(gen);
                 }
                 JobResult::Op { title, root, result, then, on_err } => {
                     if let Some(i) = self.ops.iter().position(|t| *t == title) {
@@ -1407,7 +1430,7 @@ impl App {
     fn remember_focus(&mut self) {
         if self.overlay.is_none() {
             let f = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
-            let back = f == self.commit_edit || f == self.find.find_edit || f == self.find.repl_edit;
+            let back = f == self.commit_edit || f == self.find.find_edit || f == self.find.repl_edit || f == self.srch.find_edit || f == self.srch.repl_edit;
             self.overlay_prev_focus = if back && !f.is_null() { f } else { std::ptr::null_mut() };
         }
     }
@@ -2544,7 +2567,7 @@ impl App {
         win::set_app_dark_mode(self.t.dark);
         win::set_control_theme(self.commit_edit, self.t.dark);
         win::set_control_theme(self.overlay_edit, self.t.dark);
-        for h in [self.find.find_edit, self.find.repl_edit] {
+        for h in [self.find.find_edit, self.find.repl_edit, self.srch.find_edit, self.srch.repl_edit] {
             if !h.is_null() {
                 win::set_control_theme(h, self.t.dark);
                 unsafe { windows_sys::Win32::Graphics::Gdi::InvalidateRect(h, std::ptr::null(), 1) };
@@ -2594,7 +2617,7 @@ impl App {
     pub fn exec(&mut self, c: Cmd) {
         let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal | Cmd::Find | Cmd::Replace | Cmd::FindNext | Cmd::FindPrev | Cmd::FindNextSel | Cmd::FindPrevSel | Cmd::ReplaceAll | Cmd::ToggleWordWrap);
         // the Explorer and the editor work in a folder without a repository too
-        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew);
+        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew | Cmd::FindInFiles | Cmd::ReplaceInFiles | Cmd::ClearSearch);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
             self.info("There are no available repositories. Open a folder first.");
             return;
@@ -2780,6 +2803,9 @@ impl App {
                 }
                 self.focus = if v == 1 { Focus::Explorer } else { Focus::Changes };
             }
+            Cmd::FindInFiles => self.find_in_files(false),
+            Cmd::ReplaceInFiles => self.find_in_files(true),
+            Cmd::ClearSearch => self.search_clear(),
             Cmd::GotoFile => self.goto_file(),
             Cmd::GotoLine => self.goto_line_pick(),
             Cmd::ExplorerCollapse => self.explorer_collapse_all(),

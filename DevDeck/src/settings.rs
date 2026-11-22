@@ -114,7 +114,7 @@ impl Settings {
                 "sidebar_w" => s.sidebar_w = v.parse().unwrap_or(320).clamp(180, 2000),
                 "sidebar_right" => s.sidebar_right = b,
                 "sidebar_visible" => s.sidebar_visible = b,
-                "side_view" => s.side_view = v.parse().unwrap_or(0).min(1),
+                "side_view" => s.side_view = v.parse().unwrap_or(0).min(2),
                 "tree_view" => s.tree_view = b,
                 "graph_split" => s.graph_split = v.parse().unwrap_or(0.55f32).clamp(0.1, 0.9),
                 "branches_open" => s.branches_open = b,

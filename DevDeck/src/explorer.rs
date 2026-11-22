@@ -173,11 +173,16 @@ impl App {
         self.st.sidebar_visible && self.st.side_view == 1
     }
 
-    /// Activity bar click: switches the side bar to `view` (0 Source Control, 1 Explorer);
+    /// Activity bar click: switches the side bar to `view` (0 Source Control, 1 Explorer, 2 Search);
     /// clicking the view that is already shown hides the side bar, like VS Code.
     pub fn set_side_view(&mut self, view: u8) {
         if self.st.sidebar_visible && self.st.side_view == view {
             self.set_sidebar_visible(false);
+            return;
+        }
+        if view == 2 {
+            // the keyboard goes to the search box
+            self.open_search(false, false);
             return;
         }
         self.st.side_view = view;

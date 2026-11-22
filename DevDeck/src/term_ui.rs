@@ -695,6 +695,8 @@ impl App {
             (0x47, true, true) => Some(Cmd::FocusCommit),
             (0x42, true, false) if !alt => Some(Cmd::ToggleSidebar),
             (0x45, true, true) => Some(Cmd::ShowExplorer),
+            (0x46, true, true) => Some(Cmd::FindInFiles),
+            (0x48, true, true) => Some(Cmd::ReplaceInFiles),
             (0x41, true, true) => Some(Cmd::ClaudeNew),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),

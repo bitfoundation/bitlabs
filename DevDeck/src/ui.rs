@@ -192,8 +192,15 @@ impl App {
             (l.sidebar, l.title, l.changes_header, l.edit, l.button, l.changes) = (z, z, z, z, z, z);
             (l.graph_header, l.graph, l.branches_header, l.branches) = (z, z, z, z);
         }
-        // Explorer view: one section with the repository's folder tree
+        // Explorer view: one section with the repository's folder tree; the Search view has
+        // its own layout (see `search.rs`)
         let explorer = side && self.st.side_view == 1;
+        let search = side && self.st.side_view == 2;
+        if search {
+            let z = rect(0, 0, 0, 0);
+            (l.changes_header, l.edit, l.button, l.changes) = (z, z, z, z);
+            (l.graph_header, l.graph, l.branches_header, l.branches) = (z, z, z, z);
+        }
         if explorer {
             let z = rect(0, 0, 0, 0);
             l.explorer_header = rect(sx, avail_top, sx + sw, avail_top + hdr);
@@ -219,20 +226,25 @@ impl App {
                 (l.explorer_header, l.explorer) = (z, z);
             }
         }
+        l.search = rect(0, 0, 0, 0);
         // the editor tabs sit in the title bar above the main area, between the app icon
         // (in the activity bar's column) and the caption buttons
         l.main_header = if rh(&l.main) > 0 { rect(l.main.left.max(ab), 0, l.main.right.min(l.captions.left), th) } else { rect(0, 0, 0, 0) };
         l.main_body = l.main;
         l.output_body = rect(l.output.left, l.output.top + self.s(35), l.output.right, l.output.bottom);
         self.l = l;
+        if search && mode != PanelMode::FullScreen {
+            self.l.search = self.search_list_rect();
+        }
+        self.search_place();
         unsafe {
-            let show = self.repo.is_some() && mode != PanelMode::FullScreen && side && !explorer;
+            let show = self.repo.is_some() && mode != PanelMode::FullScreen && side && !explorer && !search;
             ShowWindow(self.commit_edit, if show { SW_SHOW } else { SW_HIDE });
             let pad_x = self.s(6);
             let pad_y = self.s(4);
             MoveWindow(self.commit_edit, l.edit.left + pad_x, l.edit.top + pad_y, (rw(&l.edit) - pad_x * 2).max(10), (rh(&l.edit) - pad_y * 2).max(10), 1);
         }
-        for a in [Area::Explorer, Area::Changes, Area::Branches, Area::Graph, Area::Main, Area::Output] {
+        for a in [Area::Explorer, Area::Search, Area::Changes, Area::Branches, Area::Graph, Area::Main, Area::Output] {
             self.clamp_scroll(a);
         }
         self.resize_terminal();
@@ -243,7 +255,7 @@ impl App {
     /// Shows / hides the primary side bar (the activity bar stays).
     pub fn set_sidebar_visible(&mut self, visible: bool) {
         self.st.sidebar_visible = visible;
-        if !visible && matches!(self.focus, Focus::Changes | Focus::Graph | Focus::Branches) {
+        if !visible && matches!(self.focus, Focus::Changes | Focus::Graph | Focus::Branches | Focus::Explorer | Focus::Search) {
             self.focus = Focus::Main;
             unsafe {
                 if GetFocus() == self.commit_edit {
@@ -365,6 +377,7 @@ impl App {
             Area::Graph => self.l.graph,
             Area::Branches => self.l.branches,
             Area::Explorer => self.l.explorer,
+            Area::Search => self.l.search,
             Area::Main => self.l.main_body,
             Area::Output => self.l.output_body,
             Area::Pick => {
@@ -388,6 +401,7 @@ impl App {
             Area::Changes => self.crows.len() as i32 * rh22,
             Area::Branches => self.brows.len() as i32 * rh22,
             Area::Explorer => self.ex.rows.len() as i32 * rh22,
+            Area::Search => self.srch.rows.len() as i32 * rh22,
             Area::Graph => (self.commits.len() as i32 + if self.has_more { 1 } else { 0 }) * rh22,
             Area::Main => match &self.view {
                 MainView::Diff(d) => crate::wrap::vtotal(self.wrap_map(), d.rows.len()) as i32 * self.line_h() + self.s(8) + self.hbar().map_or(0, |_| self.s(10)),
@@ -472,7 +486,7 @@ impl App {
         self.hits.push((thumb, Hit::HThumb));
     }
 
-    fn draw_scrollbar(&mut self, g: &Gfx, a: Area) {
+    pub fn draw_scrollbar(&mut self, g: &Gfx, a: Area) {
         let r = self.area_rect(a);
         let content = self.content_h(a);
         let view = rh(&r);
@@ -511,7 +525,7 @@ impl App {
         let g = Gfx { dc: self.buf.0 };
         self.hits.clear();
         // content that shrank (a commit, a reload) leaves no list scrolled into empty space
-        for a in [Area::Changes, Area::Graph, Area::Branches, Area::Explorer, Area::Main, Area::Output] {
+        for a in [Area::Changes, Area::Graph, Area::Branches, Area::Explorer, Area::Search, Area::Main, Area::Output] {
             self.clamp_scroll(a);
         }
         g.fill(&c, self.t.editor);
@@ -522,6 +536,8 @@ impl App {
             if self.st.sidebar_visible {
                 if self.st.side_view == 1 {
                     self.paint_explorer(&g);
+                } else if self.st.side_view == 2 {
+                    self.paint_search(&g);
                 } else {
                     self.paint_sidebar(&g);
                 }
@@ -547,6 +563,7 @@ impl App {
             BitBlt(hdc, 0, 0, w, h, self.buf.0, 0, 0, SRCCOPY);
         }
         self.find_place();
+        self.search_place();
         self.clip_edits();
         // after a wheel scroll: hover (highlight, row actions, tooltip) follows what is now under
         // the pointer; one more paint shows it
@@ -565,7 +582,7 @@ impl App {
     /// their window region so it shows through. Changing the region invalidates the uncovered
     /// area, which then repaints once.
     fn clip_edits(&mut self) {
-        for (k, h) in [self.commit_edit, self.find.find_edit, self.find.repl_edit].into_iter().enumerate() {
+        for (k, h) in [self.commit_edit, self.find.find_edit, self.find.repl_edit, self.srch.find_edit, self.srch.repl_edit].into_iter().enumerate() {
             if !h.is_null() && unsafe { IsWindowVisible(h) } != 0 {
                 self.clip_edit(h, k);
             }
@@ -706,9 +723,9 @@ impl App {
         let right = self.st.sidebar_right;
         g.vline(if right { r.left } else { r.right - 1 }, r.top, r.bottom, self.t.border);
         let inner = if right { rect(r.left + 1, r.top, r.right, r.bottom) } else { rect(r.left, r.top, r.right - 1, r.bottom) };
-        // views: Explorer, Source Control. Clicking the shown one hides the side bar, like VS Code.
+        // views: Explorer, Search, Source Control. Clicking the shown one hides the side bar, like VS Code.
         let mut item = rect(0, 0, 0, 0);
-        for (k, view) in [1u8, 0u8].into_iter().enumerate() {
+        for (k, view) in [1u8, 2u8, 0u8].into_iter().enumerate() {
             let it = xywh(inner.left, inner.top + k as i32 * self.s(48), rw(&inner), self.s(48));
             let active = self.st.sidebar_visible && self.st.side_view == view;
             if active {
@@ -720,6 +737,8 @@ impl App {
             if view == 0 {
                 draw_branch_icon(g, it.left + rw(&it) / 2, it.top + rh(&it) / 2, self.s(24), fg, self.scale);
                 item = it;
+            } else if view == 2 {
+                g.icon(&it, I_SEARCH, self.fonts.icon_big, fg);
             } else {
                 g.icon(&it, '\u{E8C8}', self.fonts.icon_big, fg);
             }
@@ -733,9 +752,9 @@ impl App {
             g.round_rect(&b, self.s(16), self.t.accent, None);
             g.text_in(&b, &label, self.fonts.cap, self.t.accent_fg, DT_LINE | DT_CENTER);
         }
-        let srch = xywh(inner.left, r.top + self.s(96), rw(&inner), self.s(48));
+        let srch = xywh(inner.left, r.top + self.s(144), rw(&inner), self.s(48));
         let hit = Hit::Cmd(Cmd::Palette);
-        g.icon(&srch, I_SEARCH, self.fonts.icon_big, if self.hover == hit { self.t.fg_strong } else { self.t.fg_dim });
+        g.icon(&srch, '\u{E756}', self.fonts.icon_big, if self.hover == hit { self.t.fg_strong } else { self.t.fg_dim });
         self.hits.push((srch, hit));
         let gear = xywh(inner.left, r.bottom - self.s(48), rw(&inner), self.s(48));
         let hit = Hit::Cmd(Cmd::ToggleTheme);
@@ -1446,7 +1465,7 @@ impl App {
     /// Rows partly scrolled out of a list must not catch clicks meant for what is next to it
     /// (header buttons, the commit button, editor tabs): the hit rectangles pushed since `from`
     /// are cut to the list's area.
-    fn clip_hits(&mut self, from: usize, area: RECT) {
+    pub fn clip_hits(&mut self, from: usize, area: RECT) {
         let mut i = from;
         while i < self.hits.len() {
             let r = &mut self.hits[i].0;
@@ -2710,7 +2729,11 @@ impl App {
                     base.into()
                 }
             }
+            Hit::ActivityView(2) => "Search (Ctrl+Shift+F)".into(),
             Hit::ActivityView(_) => "Explorer (Ctrl+Shift+E)".into(),
+            Hit::Search(w) => self.search_tooltip(w)?,
+            Hit::SearchRow(i) => self.search_row_tooltip(i)?,
+            Hit::SearchAct(i, a) => self.search_act_tooltip(i, a)?,
             Hit::DiffBlock(usize::MAX, a) => {
                 let untracked = matches!(&self.view, MainView::Diff(d) if d.kind == DiffKind::Untracked);
                 match a {
@@ -2814,7 +2837,7 @@ impl App {
         match self.hit_test(x, y) {
             Hit::Sash(Sash::Sidebar) => Some(IDC_SIZEWE),
             Hit::Sash(_) => Some(IDC_SIZENS),
-            Hit::TermBody | Hit::EditorTerm | Hit::EditorText | Hit::DiffRow(_) | Hit::Find(crate::find::F_FIND_INPUT | crate::find::F_REPLACE_INPUT) => Some(IDC_IBEAM),
+            Hit::TermBody | Hit::EditorTerm | Hit::EditorText | Hit::DiffRow(_) | Hit::Find(crate::find::F_FIND_INPUT | crate::find::F_REPLACE_INPUT) | Hit::Search(crate::search::S_FIND_INPUT | crate::search::S_REPLACE_INPUT) => Some(IDC_IBEAM),
             // everything that does something when clicked: buttons, links, tabs, list rows
             Hit::Cmd(_)
             | Hit::GroupRow(_)
@@ -2853,7 +2876,10 @@ impl App {
             | Hit::TermKillPanel
             | Hit::TermTab(_)
             | Hit::TermTabKill(_)
-            | Hit::Find(_) => Some(IDC_HAND),
+            | Hit::Find(_)
+            | Hit::Search(_)
+            | Hit::SearchRow(_)
+            | Hit::SearchAct(..) => Some(IDC_HAND),
             // scroll bar thumbs, the caption buttons (arrow, like every Windows title bar) and
             // empty space keep the arrow
             Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::Thumb(_) | Hit::HThumb | Hit::HTrack | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose | Hit::FindBox => None,
@@ -2864,7 +2890,7 @@ impl App {
         if self.overlay.is_some() {
             return Some(Area::Pick);
         }
-        for a in [Area::Explorer, Area::Changes, Area::Branches, Area::Graph, Area::Main, Area::Output] {
+        for a in [Area::Explorer, Area::Search, Area::Changes, Area::Branches, Area::Graph, Area::Main, Area::Output] {
             if a == Area::Output && !self.st.output_visible {
                 continue;
             }
@@ -3009,6 +3035,8 @@ impl App {
             Focus::Main
         } else if self.st.side_view == 1 {
             Focus::Explorer
+        } else if self.st.side_view == 2 {
+            Focus::Search
         } else {
             Focus::Changes
         }
@@ -3023,7 +3051,7 @@ impl App {
         }
         unsafe {
             // the find widget's buttons leave the keyboard where it is (its boxes or the editor)
-            if GetFocus() != self.hwnd && hit != Hit::Backdrop && !matches!(hit, Hit::None | Hit::Find(_) | Hit::FindBox) && self.overlay.is_none() {
+            if GetFocus() != self.hwnd && hit != Hit::Backdrop && !matches!(hit, Hit::None | Hit::Find(_) | Hit::FindBox | Hit::Search(_)) && self.overlay.is_none() {
                 SetFocus(self.hwnd);
             }
             SetCapture(self.hwnd);
@@ -3054,6 +3082,19 @@ impl App {
                 self.find_click(w);
             }
             Hit::FindBox => {}
+            Hit::Search(w) => {
+                unsafe {
+                    ReleaseCapture();
+                }
+                self.search_click(w);
+            }
+            Hit::SearchRow(i) => {
+                unsafe {
+                    SetFocus(self.hwnd);
+                }
+                self.search_activate(i, false);
+            }
+            Hit::SearchAct(i, a) => self.search_act(i, a),
             Hit::Sash(s) => {
                 let orig = match s {
                     Sash::Sidebar => rw(&self.l.sidebar),
@@ -3337,6 +3378,7 @@ impl App {
                 self.keep_tab(self.tab_active);
                 self.focus = Focus::Main;
             }
+            Hit::SearchRow(i) if matches!(self.srch.rows.get(i), Some(crate::search::SRow::Match(..))) => self.search_activate(i, true),
             Hit::EditorText => self.editor_dblclick(x, y),
             Hit::DiffRow(_) => self.diff_select_word(x, y),
             Hit::CommitFile(i) => {
@@ -3457,12 +3499,13 @@ impl App {
     /// Opens the context menu of the focused list's selected row when it is in view (its
     /// rectangle comes from the last paint). False when there is none.
     fn context_menu_key(&mut self) -> bool {
-        let (focus_row, graph, branch, explorer) = (self.focus_row, self.graph_sel, self.branch_sel_index(), self.ex.sel_index());
+        let (focus_row, graph, branch, explorer, search) = (self.focus_row, self.graph_sel, self.branch_sel_index(), self.ex.sel_index(), self.srch.sel);
         let want = |h: &Hit| match (self.focus, h) {
             (Focus::Changes, Hit::FileRow(i) | Hit::DirRow(i)) => focus_row == Some(*i),
             (Focus::Graph, Hit::GraphRow(i)) => graph == Some(*i),
             (Focus::Branches, Hit::BranchRow(i)) => branch == Some(*i),
             (Focus::Explorer, Hit::ExplorerRow(i)) => explorer == Some(*i),
+            (Focus::Search, Hit::SearchRow(i)) => search == Some(*i),
             _ => false,
         };
         let Some(r) = self.hits.iter().find(|(_, h)| want(h)).map(|(r, _)| *r) else { return false };
@@ -3530,6 +3573,11 @@ impl App {
                 }
             }
             let items = self.editor_menu(&mut m);
+            self.show_menu(x, y, items, m);
+            return;
+        }
+        if let Hit::SearchRow(i) | Hit::SearchAct(i, _) = hit {
+            let items = self.search_menu(i, &mut m);
             self.show_menu(x, y, items, m);
             return;
         }
@@ -3849,6 +3897,8 @@ impl App {
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),                 // Ctrl+Shift+M
             (0x42, true, false) => Some(Cmd::ToggleSidebar),                 // Ctrl+B
             (0x45, true, true) => Some(Cmd::ShowExplorer),                   // Ctrl+Shift+E
+            (0x46, true, true) => Some(Cmd::FindInFiles),                    // Ctrl+Shift+F
+            (0x48, true, true) => Some(Cmd::ReplaceInFiles),                 // Ctrl+Shift+H
             (0x50, true, false) | (0x45, true, false) => Some(Cmd::GotoFile), // Ctrl+P, Ctrl+E
             (0x47, true, false) => Some(Cmd::GotoLine),                      // Ctrl+G
             (0x46, true, false) if find_ok => Some(Cmd::Find),               // Ctrl+F
@@ -3979,6 +4029,8 @@ impl App {
                     vec![Focus::Main]
                 } else if self.st.side_view == 1 {
                     vec![Focus::Explorer, Focus::Main]
+                } else if self.st.side_view == 2 {
+                    vec![Focus::Search, Focus::Main]
                 } else {
                     [Some(Focus::Changes), self.st.graph_open.then_some(Focus::Graph), self.st.branches_open.then_some(Focus::Branches), Some(Focus::Main)].into_iter().flatten().collect()
                 };
@@ -3993,6 +4045,7 @@ impl App {
                 Focus::Changes => self.changes_key(vk, ctrl, shift),
                 Focus::Branches => self.branches_key(vk),
                 Focus::Explorer => self.explorer_key(vk),
+                Focus::Search => self.search_key(vk),
                 Focus::Graph => self.graph_key(vk),
                 Focus::Main => self.main_key(vk, ctrl),
                 Focus::Terminal => {}

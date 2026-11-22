@@ -1167,6 +1167,39 @@ impl Search {
     }
 }
 
+/// Replaces the matches of `search` in `lines` that `keep` accepts (by start and end), like
+/// Replace All: returns (first changed line, end of the last match's line, new text, count),
+/// the new text taking the place of everything from the start of that first line to that end.
+/// None when nothing was replaced.
+pub fn replace_lines(search: &mut Search, lines: &[String], rep: &str, preserve: bool, keep: &mut dyn FnMut(Pos, Pos) -> bool) -> Option<(usize, Pos, String, usize)> {
+    let regex = search.is_regex();
+    let mut out = String::new();
+    let mut first: Option<usize> = None;
+    let mut last = P::default();
+    let mut count = 0usize;
+    search.scan(lines, (0, 0), &mut |s, e, caps| {
+        if !keep(s.pos(), e.pos()) {
+            return true;
+        }
+        let copy_from = match first {
+            None => {
+                first = Some(s.l);
+                P { l: s.l, c: 0, b: 0 }
+            }
+            Some(_) => last,
+        };
+        push_text(&mut out, lines, copy_from, s);
+        out.push_str(&replacement(rep, regex, lines, s, e, caps, preserve));
+        last = e;
+        count += 1;
+        true
+    });
+    let first = first?;
+    let line_end = P { l: last.l, c: char_len(&lines[last.l]), b: lines[last.l].len() };
+    push_text(&mut out, lines, last, line_end);
+    Some((first, line_end.pos(), out, count))
+}
+
 /// The replacement for a match: `rep` with `$1`, `$&`, `\n`, `\u`... expanded for a regular
 /// expression, adapted to the matched text's case with `preserve`.
 fn replacement(rep: &str, regex: bool, lines: &[String], s: P, e: P, caps: &[Option<P>], preserve: bool) -> String {
@@ -1725,7 +1758,7 @@ impl App {
     }
 
     /// Selects match `r` (an editable view) or makes it current (read-only), and scrolls to it.
-    fn find_select(&mut self, r: Range) {
+    pub fn find_select(&mut self, r: Range) {
         let MainView::File(f) = &mut self.view else { return };
         if f.ed.editable {
             f.move_to(r.0, false);
@@ -2455,7 +2488,7 @@ impl App {
 }
 
 /// The word at char column `col` of `line` (or just before it).
-fn word_at(line: &str, col: usize) -> Option<String> {
+pub fn word_at(line: &str, col: usize) -> Option<String> {
     let chars: Vec<char> = line.chars().collect();
     let at = if col < chars.len() && is_word(chars[col]) {
         col
