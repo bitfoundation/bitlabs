@@ -1,0 +1,1236 @@
+// BlazorTestPlatform locator engine and in-app driver.
+// The locator engine resolves play-script locators against the real DOM with the same semantics as the in-memory
+// engine (BlazorTestPlatform.Accessibility: AriaRoles, AccessibleName, DomFacts.TextOf, DomQueries), so roles,
+// accessible names, text and query results agree across drivers. Both browser drivers use it: the in-app driver runs
+// play scripts inside the workbench frame (the C# play function executes in the Server circuit or WebAssembly runtime
+// and drives the DOM through the functions below), and the Playwright driver imports this module into the frame to
+// resolve locators before acting with real input.
+// Queries see only the story: descendants of [data-btp-root], without the workbench's [data-btp-arg-errors] list.
+
+const ROOT = '[data-btp-root]';
+const OUTSIDE_STORY = '[data-btp-arg-errors]';
+
+// ---- text ----------------------------------------------------------------------------------------------------------
+
+// TextMatch.Normalize: .NET whitespace plus zero-width spaces collapse to one space.
+const WHITESPACE = /[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200b\u2028\u2029\u202f\u205f\u3000]+/g;
+const normalize = s => (s || '').replace(WHITESPACE, ' ').replace(/^ | $/g, '');
+const matches = (actual, expected, exact) => {
+    const a = normalize(actual), e = normalize(expected);
+    return exact ? a === e : a.toLowerCase().includes(e.toLowerCase());
+};
+const blank = s => !s || !s.trim();
+// TextMatch.Matches with a pattern: a .NET Regex sent as source and flags (DriverJson.WritePattern).
+const matchesQuery = (actual, expected, exact, q) => q.pattern != null ? new RegExp(q.pattern, q.flags || '').test(normalize(actual)) : matches(actual, expected, exact);
+
+// DomFacts.TextOf: text content without non-rendered elements, with a space after line-breaking elements, so
+// <div>A</div><div>B</div> reads "A B".
+const NEVER_RENDERED = new Set(['script', 'style', 'template', 'head', 'noscript', 'meta', 'link', 'title']);
+const TEXT_BREAKS = new Set(['br', 'p', 'div', 'li']);
+
+function appendText(node, out) {
+    if (node.nodeType === Node.ELEMENT_NODE && NEVER_RENDERED.has(node.localName)) return;
+    if (node.nodeType === Node.TEXT_NODE) { out.push(node.textContent); return; }
+    for (const child of node.childNodes) {
+        appendText(child, out);
+        if (child.nodeType === Node.ELEMENT_NODE && TEXT_BREAKS.has(child.localName)) out.push(' ');
+    }
+}
+
+function textOf(node) {
+    const out = [];
+    appendText(node, out);
+    return normalize(out.join(''));
+}
+
+// ---- scope ---------------------------------------------------------------------------------------------------------
+
+function storyRoot() {
+    return document.querySelector(ROOT) || document.body;
+}
+
+function inStory(e, root) {
+    return e !== root && root.contains(e) && !e.closest(OUTSIDE_STORY);
+}
+
+function storyElements(root) {
+    return Array.from(root.querySelectorAll('*')).filter(e => !e.closest(OUTSIDE_STORY));
+}
+
+function byId(root, id) {
+    const e = root.querySelector('#' + CSS.escape(id));
+    return e && inStory(e, root) ? e : null;
+}
+
+function idRefs(root, value) {
+    return blank(value) ? [] : value.split(' ').filter(Boolean).map(id => byId(root, id)).filter(Boolean);
+}
+
+// ---- visibility, focus and state -----------------------------------------------------------------------------------
+
+const VISIBILITY_OPTIONS = { visibilityProperty: true, checkVisibilityCSS: true };
+
+/**
+ * Not rendered (DomFacts.IsHidden, from computed styles): display:none or visibility:hidden here or above, closed
+ * details and dialogs, hidden inputs. Size does not matter: empty and visually hidden elements are still rendered.
+ */
+function isHidden(e) {
+    if (!e.isConnected) return true;
+    // A collapsed <select> renders no boxes for its options, but they are still part of the control.
+    if (e.localName === 'option' || e.localName === 'optgroup') { const select = e.closest('select'); if (select) return isHidden(select); }
+    const style = getComputedStyle(e);
+    if (style.display === 'contents') {
+        // No box of its own (so checkVisibility() is false), but its content renders.
+        return style.visibility === 'hidden' || style.visibility === 'collapse' || (!!e.parentElement && isHidden(e.parentElement));
+    }
+    if (e.checkVisibility) return !e.checkVisibility(VISIBILITY_OPTIONS);
+    if (style.visibility === 'hidden' || style.visibility === 'collapse') return true;
+    for (let c = e; c; c = c.parentElement) if (getComputedStyle(c).display === 'none') return true;
+    return false;
+}
+
+/** DomFacts.IsExcludedFromAccessibilityTree. */
+function isExcluded(e) {
+    return isHidden(e) || !!e.closest('[aria-hidden="true" i], [inert]');
+}
+
+function visibleText(node) {
+    const range = document.createRange();
+    range.selectNode(node);
+    const rect = range.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+/** Visible as a user sees it (Playwright's definition): rendered, visibility:visible and a non-empty box. */
+function isVisible(e) {
+    if (!e.isConnected) return false;
+    const style = getComputedStyle(e);
+    if (style.display === 'contents') {
+        for (let c = e.firstChild; c; c = c.nextSibling) {
+            if (c.nodeType === Node.ELEMENT_NODE && isVisible(c)) return true;
+            if (c.nodeType === Node.TEXT_NODE && visibleText(c)) return true;
+        }
+        return false;
+    }
+    if (e.checkVisibility && !e.checkVisibility()) return false;
+    if (style.visibility !== 'visible') return false;
+    const rect = e.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const isAriaTrue = (e, name) => (e.getAttribute(name) || '').toLowerCase() === 'true';
+
+function isDisabled(e) {
+    return (e.matches && e.matches(':disabled')) || isAriaTrue(e, 'aria-disabled');
+}
+
+const isContentEditable = e => e.hasAttribute('contenteditable') && e.getAttribute('contenteditable').toLowerCase() !== 'false';
+const TEXT_INPUT_TYPES = ['text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'datetime-local', 'month', 'time', 'week'];
+const isTextInput = e => e.localName === 'input' && TEXT_INPUT_TYPES.includes(e.type);
+
+function isEditable(e) {
+    if (isDisabled(e) || e.hasAttribute('readonly')) return false;
+    return e.localName === 'textarea' || isContentEditable(e) || isTextInput(e);
+}
+
+function tabIndexAttribute(e) {
+    const value = e.getAttribute('tabindex');
+    if (value === null) return null;
+    const parsed = parseInt(value, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+}
+
+/** Only the first <summary> child of a <details> is its summary (and focusable). */
+const isDetailsSummary = e => e.localName === 'summary' && e.parentElement?.localName === 'details' && e.parentElement.querySelector(':scope > summary') === e;
+const isLink = e => (e.localName === 'a' || e.localName === 'area') && e.hasAttribute('href');
+
+function isNativelyFocusable(e) {
+    switch (e.localName) {
+        case 'a': case 'area': return e.hasAttribute('href');
+        case 'button': case 'select': case 'textarea': case 'iframe': case 'embed': case 'object': return true;
+        case 'input': return e.type !== 'hidden';
+        case 'summary': return isDetailsSummary(e);
+        case 'audio': case 'video': return e.hasAttribute('controls');
+        default: return isContentEditable(e);
+    }
+}
+
+/** As browsers decide it: rendered, not inert, not disabled (a disabled fieldset disables controls outside its first legend). */
+function isFocusable(e) {
+    if (isHidden(e) || e.closest('[inert]') || e.matches(':disabled')) return false;
+    return tabIndexAttribute(e) !== null || isNativelyFocusable(e);
+}
+
+function isTabbable(e) {
+    if (!isFocusable(e)) return false;
+    const tabIndex = tabIndexAttribute(e);
+    return tabIndex === null || tabIndex >= 0;
+}
+
+/** DomQueries.CheckedState: native checkboxes and radios, then aria-checked/aria-selected/aria-pressed. */
+function checkedState(e, role) {
+    if (e.localName === 'input' && (e.type === 'checkbox' || e.type === 'radio')) return !!e.checked;
+    if (['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio', 'option', 'treeitem'].includes(role)) {
+        const state = e.getAttribute('aria-checked') ?? (role === 'option' || role === 'treeitem' ? e.getAttribute('aria-selected') : null);
+        return state !== null ? state.toLowerCase() === 'true' : (['checkbox', 'radio', 'switch'].includes(role) ? false : null);
+    }
+    if (role === 'button' && e.hasAttribute('aria-pressed')) return isAriaTrue(e, 'aria-pressed');
+    return null;
+}
+
+// ---- roles (AriaRoles) ---------------------------------------------------------------------------------------------
+
+const VALID_ROLES = new Set([
+    'alert', 'alertdialog', 'application', 'article', 'banner', 'blockquote', 'button', 'caption', 'cell', 'checkbox',
+    'code', 'columnheader', 'combobox', 'complementary', 'contentinfo', 'definition', 'deletion', 'dialog', 'directory',
+    'document', 'emphasis', 'feed', 'figure', 'form', 'generic', 'grid', 'gridcell', 'group', 'heading', 'img', 'image',
+    'insertion', 'link', 'list', 'listbox', 'listitem', 'log', 'main', 'mark', 'marquee', 'math', 'menu', 'menubar',
+    'menuitem', 'menuitemcheckbox', 'menuitemradio', 'meter', 'navigation', 'none', 'note', 'option', 'paragraph',
+    'presentation', 'progressbar', 'radio', 'radiogroup', 'region', 'row', 'rowgroup', 'rowheader', 'scrollbar', 'search',
+    'searchbox', 'separator', 'slider', 'spinbutton', 'status', 'strong', 'subscript', 'superscript', 'switch', 'tab',
+    'table', 'tablist', 'tabpanel', 'term', 'textbox', 'time', 'timer', 'toolbar', 'tooltip', 'tree', 'treegrid', 'treeitem',
+]);
+const ABSTRACT_ROLES = new Set(['command', 'composite', 'input', 'landmark', 'range', 'roletype', 'section', 'sectionhead', 'select', 'structure', 'widget', 'window']);
+const NAME_FROM_CONTENT = new Set(['button', 'cell', 'checkbox', 'columnheader', 'gridcell', 'heading', 'link', 'menuitem', 'menuitemcheckbox',
+    'menuitemradio', 'option', 'radio', 'row', 'rowheader', 'switch', 'tab', 'tooltip', 'treeitem', 'caption']);
+// The global states and properties of WAI-ARIA 1.2 (AriaRoles.GlobalAttributes).
+const GLOBAL_ARIA = ['aria-atomic', 'aria-busy', 'aria-controls', 'aria-current', 'aria-describedby', 'aria-description', 'aria-details', 'aria-disabled',
+    'aria-dropeffect', 'aria-errormessage', 'aria-flowto', 'aria-grabbed', 'aria-haspopup', 'aria-hidden', 'aria-invalid', 'aria-keyshortcuts',
+    'aria-label', 'aria-labelledby', 'aria-live', 'aria-owns', 'aria-relevant', 'aria-roledescription'];
+const SIMPLE_ROLES = {
+    article: 'article', aside: 'complementary', blockquote: 'blockquote', button: 'button', caption: 'caption', code: 'code',
+    datalist: 'listbox', dd: 'definition', del: 'deletion', details: 'group', dfn: 'term', dt: 'term', dialog: 'dialog',
+    em: 'emphasis', fieldset: 'group', figure: 'figure', form: 'form', h1: 'heading', h2: 'heading', h3: 'heading',
+    h4: 'heading', h5: 'heading', h6: 'heading', hr: 'separator', ins: 'insertion', li: 'listitem', main: 'main',
+    mark: 'mark', math: 'math', menu: 'list', ol: 'list', ul: 'list', meter: 'meter', nav: 'navigation', optgroup: 'group',
+    option: 'option', output: 'status', p: 'paragraph', progress: 'progressbar', search: 'search', strong: 'strong',
+    sub: 'subscript', sup: 'superscript', svg: 'graphics-document', table: 'table', tbody: 'rowgroup', thead: 'rowgroup',
+    tfoot: 'rowgroup', td: 'cell', textarea: 'textbox', time: 'time', tr: 'row', div: 'generic', span: 'generic',
+    b: 'generic', i: 'generic', u: 'generic', small: 'generic', bdi: 'generic', bdo: 'generic', data: 'generic',
+    samp: 'generic', q: 'generic', s: 'generic', pre: 'generic',
+};
+
+const isValidRole = r => VALID_ROLES.has(r) || r.startsWith('doc-') || r.startsWith('graphics-');
+
+function explicitRole(e) {
+    const value = e.getAttribute('role');
+    if (blank(value)) return null;
+    for (const token of value.split(' ')) {
+        const role = token.toLowerCase();
+        if (role && isValidRole(role) && !ABSTRACT_ROLES.has(role)) return role;
+    }
+    return null;
+}
+
+const inSectioningContent = e => !!e.parentElement?.closest('article, aside, main, nav, section');
+
+function inputRole(e) {
+    const type = (e.getAttribute('type') ?? 'text').trim().toLowerCase();
+    switch (type) {
+        case 'button': case 'image': case 'reset': case 'submit': return 'button';
+        case 'file': return 'button';
+        case 'checkbox': return 'checkbox';
+        case 'radio': return 'radio';
+        case 'range': return 'slider';
+        case 'number': return 'spinbutton';
+        case 'search': return e.hasAttribute('list') ? 'combobox' : 'searchbox';
+        case 'email': case 'tel': case 'text': case 'url': case '': return e.hasAttribute('list') ? 'combobox' : 'textbox';
+        case 'hidden': return 'none';
+        default: return 'textbox';
+    }
+}
+
+/** HTML-AAM implicit role (AriaRoles.GetImplicitRole). */
+function implicitRole(e) {
+    switch (e.localName) {
+        case 'a': case 'area': return e.hasAttribute('href') ? 'link' : 'generic';
+        case 'footer': return inSectioningContent(e) ? 'generic' : 'contentinfo';
+        case 'header': return inSectioningContent(e) ? 'generic' : 'banner';
+        case 'img': return e.getAttribute('alt') === '' && !e.hasAttribute('aria-label') && !e.hasAttribute('aria-labelledby') ? 'presentation' : 'img';
+        case 'input': return inputRole(e);
+        case 'section': return e.hasAttribute('aria-label') || e.hasAttribute('aria-labelledby') || e.hasAttribute('title') ? 'region' : 'generic';
+        case 'select': return e.hasAttribute('multiple') || parseInt(e.getAttribute('size'), 10) > 1 ? 'listbox' : 'combobox';
+        case 'th': return (e.getAttribute('scope') || '').toLowerCase() === 'row' ? 'rowheader' : 'columnheader';
+        default: return Object.hasOwn(SIMPLE_ROLES, e.localName) ? SIMPLE_ROLES[e.localName] : null;
+    }
+}
+
+/** The computed role: explicit (unless none/presentation conflicts with focusability or global ARIA) or implicit. */
+function roleOf(e) {
+    const role = explicitRole(e);
+    if ((role === 'none' || role === 'presentation') && (isFocusable(e) || GLOBAL_ARIA.some(a => e.hasAttribute(a)))) return implicitRole(e);
+    return role ?? implicitRole(e);
+}
+
+// ---- accessible names (AccessibleName) -----------------------------------------------------------------------------
+
+const isLabelable = e => ['button', 'meter', 'output', 'progress', 'select', 'textarea'].includes(e.localName)
+    || (e.localName === 'input' && (e.getAttribute('type') || '').toLowerCase() !== 'hidden');
+
+function labelsOf(e, root) {
+    const labels = [];
+    const id = e.getAttribute('id');
+    if (id) labels.push(...Array.from(root.querySelectorAll('label')).filter(l => l.getAttribute('for') === id && inStory(l, root)));
+    for (let parent = e.parentElement; parent; parent = parent.parentElement) {
+        if (parent.localName === 'label' && !labels.includes(parent) && (!parent.hasAttribute('for') || parent.getAttribute('for') === id)) {
+            // A label without "for" labels only its first labelable descendant.
+            if (parent.hasAttribute('for') || Array.from(parent.querySelectorAll('*')).find(isLabelable) === e) labels.push(parent);
+            break;
+        }
+    }
+    return labels;
+}
+
+const firstChild = (e, name) => Array.from(e.children).find(c => c.localName === name);
+
+function labelsText(e, root, visited) {
+    return labelsOf(e, root).map(label => contentText(label, root, visited)).filter(t => !blank(t)).join(' ');
+}
+
+/** The current value of a control embedded in a label (accname step 2C). */
+function controlValue(e) {
+    if (e.localName === 'select') {
+        const option = e.selectedOptions?.[0] ?? e.options?.[0];
+        return option ? textOf(option) : '';
+    }
+    if (e.localName === 'input' || e.localName === 'textarea') return e.value;
+    return e.getAttribute('value') ?? e.getAttribute('aria-valuetext') ?? e.getAttribute('aria-valuenow') ?? e.textContent;
+}
+
+function nativeName(e, root, visited) {
+    switch (e.localName) {
+        case 'input': {
+            const type = (e.getAttribute('type') ?? 'text').toLowerCase();
+            if (type === 'button' || type === 'submit' || type === 'reset') {
+                const value = e.getAttribute('value');
+                if (!blank(value)) return value;
+                return type === 'submit' ? 'Submit' : type === 'reset' ? 'Reset' : labelsText(e, root, visited);
+            }
+            if (type === 'image') return e.getAttribute('alt') ?? e.getAttribute('value') ?? '';
+            return labelsText(e, root, visited);
+        }
+        case 'textarea': case 'select': case 'meter': case 'progress': case 'output': case 'button':
+            return labelsText(e, root, visited);
+        case 'img': case 'area':
+            return e.getAttribute('alt') ?? '';
+        case 'fieldset': case 'figure': case 'table': {
+            const caption = firstChild(e, e.localName === 'fieldset' ? 'legend' : e.localName === 'figure' ? 'figcaption' : 'caption');
+            return caption ? computeName(caption, root, visited, false, true) : '';
+        }
+        case 'svg': {
+            const title = firstChild(e, 'title');
+            return title ? textOf(title) : '';
+        }
+        case 'iframe': case 'frame':
+            return e.getAttribute('title') ?? '';
+        default:
+            return '';
+    }
+}
+
+/** AccessibleName.NameBlocks: elements that are not inline by default; their text is set apart by spaces in names. */
+const NAME_BLOCKS = new Set(['address', 'article', 'aside', 'blockquote', 'br', 'caption', 'dd', 'details', 'dialog', 'div', 'dl', 'dt',
+    'fieldset', 'figcaption', 'figure', 'footer', 'form', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hgroup', 'hr', 'legend', 'li',
+    'main', 'nav', 'ol', 'p', 'pre', 'search', 'section', 'summary', 'table', 'tbody', 'td', 'tfoot', 'th', 'thead', 'tr', 'ul']);
+
+function contentText(e, root, visited, includeHidden) {
+    let text = '';
+    for (const child of e.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) text += child.textContent;
+        else if (child.nodeType === Node.ELEMENT_NODE && (includeHidden || !isExcluded(child))) {
+            const block = NAME_BLOCKS.has(child.localName);
+            const name = computeName(child, root, visited, false, true, includeHidden);
+            text += block ? ' ' + name + ' ' : name;
+        }
+    }
+    return text;
+}
+
+// 2B: the referencing element may name itself, so it leaves the visited set for this target while the rest of the
+// traversal stays in it (cycles still end); a hidden target contributes its hidden content too (2A). Same rules as
+// AccessibleName.Referenced.
+function referencedName(target, root, visited, referencer) {
+    const chain = new Set(visited);
+    chain.delete(referencer);
+    return computeName(target, root, chain, true, false, isExcluded(target));
+}
+
+function computeName(e, root, visited, inLabelledBy, inContent, includeHidden = false) {
+    if (visited.has(e)) return '';
+    visited.add(e);
+    if (!inLabelledBy && !includeHidden && isExcluded(e)) return '';
+
+    // 2B: aria-labelledby (not followed recursively).
+    if (!inLabelledBy) {
+        const labelledBy = idRefs(root, e.getAttribute('aria-labelledby'));
+        if (labelledBy.length) return labelledBy.map(l => referencedName(l, root, visited, e)).join(' ');
+    }
+
+    // 2C: a control embedded in a label contributes its value.
+    const role = roleOf(e);
+    if ((inContent || inLabelledBy) && ['textbox', 'combobox', 'listbox', 'slider', 'spinbutton'].includes(role)) return controlValue(e);
+
+    // 2D: aria-label.
+    const ariaLabel = e.getAttribute('aria-label');
+    if (!blank(ariaLabel)) return ariaLabel;
+
+    // 2E: native labelling.
+    if (role !== 'presentation' && role !== 'none') {
+        const native = nativeName(e, root, visited);
+        if (!blank(native)) return native;
+    }
+
+    // 2F: name from content.
+    if (inLabelledBy || inContent || (role && NAME_FROM_CONTENT.has(role)) || ['label', 'legend', 'caption', 'figcaption', 'summary'].includes(e.localName)) {
+        const content = contentText(e, root, visited, includeHidden);
+        if (!blank(content)) return content;
+    }
+
+    // 2I: tooltip attribute fallbacks.
+    // An empty title is no tooltip: the placeholder still names the field.
+    const title = e.getAttribute('title');
+    return !blank(title) ? title : (e.localName === 'input' || e.localName === 'textarea' ? e.getAttribute('placeholder') ?? '' : '');
+}
+
+function accessibleName(e, root) {
+    return normalize(computeName(e, root, new Set(), false, false));
+}
+
+/** AccessibleName.ComputeDescription: aria-describedby, aria-description, then a title that is not the name. */
+function accessibleDescription(e, root, name) {
+    const describedBy = idRefs(root, e.getAttribute('aria-describedby'));
+    if (describedBy.length) return normalize(describedBy.map(t => referencedName(t, root, new Set(), e)).join(' '));
+    const description = e.getAttribute('aria-description');
+    if (description !== null) return normalize(description);
+    const title = normalize(e.getAttribute('title') ?? '');
+    return name && name !== title ? title : '';
+}
+
+/** AccessibleName.ComputeErrorMessage: the aria-errormessage targets' text while the element is invalid. */
+function accessibleErrorMessage(e, root) {
+    const invalid = (e.getAttribute('aria-invalid') ?? '').trim().toLowerCase();
+    if (invalid === '' || invalid === 'false') return '';
+    return normalize(idRefs(root, e.getAttribute('aria-errormessage')).map(t => referencedName(t, root, new Set(), e)).join(' '));
+}
+
+// ---- queries (DomQueries) ------------------------------------------------------------------------------------------
+
+function labelMatches(e, root, q) {
+    const match = text => matchesQuery(text, q.value, q.exact, q);
+    const ariaLabel = e.getAttribute('aria-label');
+    if (ariaLabel !== null && match(ariaLabel)) return true;
+    const labelledBy = idRefs(root, e.getAttribute('aria-labelledby'));
+    if (labelledBy.length && match(labelledBy.map(textOf).join(' '))) return true;
+    return ['input', 'textarea', 'select', 'button', 'meter', 'output', 'progress'].includes(e.localName)
+        && labelsOf(e, root).some(label => match(textOf(label)));
+}
+
+// DomQueries.MatchesRoleState: getByRole's checked, pressed, expanded, selected, disabled and level options.
+function roleStateMatches(e, role, q) {
+    const tristate = (value, wanted) => wanted == null || (value ?? '').trim().toLowerCase() === (wanted ? 'true' : 'false');
+    if (q.checked != null) {
+        const state = role === 'button' ? null : checkedState(e, role);
+        if (state === null || state !== q.checked || (e.getAttribute('aria-checked') ?? '').trim().toLowerCase() === 'mixed') return false;
+    }
+    const selected = e.getAttribute('aria-selected') ?? (e.localName === 'option' ? (e.selected ? 'true' : 'false') : null);
+    if (!tristate(e.getAttribute('aria-pressed'), q.pressed) || !tristate(e.getAttribute('aria-expanded'), q.expanded) || !tristate(selected, q.selected)) return false;
+    if (q.disabled != null && isDisabled(e) !== q.disabled) return false;
+    if (q.level != null) {
+        const ariaLevel = /^\s*[+-]?\d+\s*$/.test(e.getAttribute('aria-level') ?? '') ? parseInt(e.getAttribute('aria-level'), 10) : null;
+        if ((role === 'heading' ? headingLevel(e) : ariaLevel) !== q.level) return false;
+    }
+    return true;
+}
+
+const isTextCandidate = e => !['script', 'style', 'template', 'head', 'html', 'body'].includes(e.localName);
+
+function textFor(e) {
+    return e.localName === 'input' && ['button', 'submit', 'reset'].includes((e.getAttribute('type') || '').toLowerCase())
+        ? e.getAttribute('value') ?? ''
+        : textOf(e);
+}
+
+const innermost = list => list.filter(c => !list.some(o => o !== c && c.contains(o)));
+
+function query(root, candidates, q, within) {
+    switch (q.type) {
+        case 'css':
+            return Array.from(within.querySelectorAll(q.selector)).filter(e => inStory(e, root));
+        case 'role': {
+            const wanted = q.role.toLowerCase();
+            return candidates.filter(e => roleOf(e) === wanted && (q.includeHidden || !isExcluded(e)) && roleStateMatches(e, wanted, q)
+                && (q.name == null || matchesQuery(accessibleName(e, root), q.name, q.exact, q)));
+        }
+        case 'text':
+            return innermost(candidates.filter(e => isTextCandidate(e) && matchesQuery(textFor(e), q.value, q.exact, q)));
+        case 'label':
+            return candidates.filter(e => labelMatches(e, root, q));
+        case 'placeholder':
+            return candidates.filter(e => e.hasAttribute('placeholder') && matchesQuery(e.getAttribute('placeholder'), q.value, q.exact, q));
+        case 'testid':
+            return candidates.filter(e => e.getAttribute(q.attribute) === q.value);
+        case 'alt':
+            return candidates.filter(e => ['img', 'area', 'input'].includes(e.localName) && e.hasAttribute('alt') && matchesQuery(e.getAttribute('alt'), q.value, q.exact, q));
+        case 'title':
+            return candidates.filter(e => e.hasAttribute('title') && matchesQuery(e.getAttribute('title'), q.value, q.exact, q));
+        default:
+            throw new Error('Unsupported query ' + q.type);
+    }
+}
+
+/** Resolves a locator chain to story elements (DomQueries.Resolve). */
+function resolve(steps) {
+    const root = storyRoot();
+    return resolveFrom(root, null, steps);
+}
+
+// `current` null means the whole story; a filter's inner chain starts from the element it tests (DomQueries.ResolveWithin).
+function resolveFrom(root, current, steps) {
+    for (const step of steps) {
+        if (step.kind === 'find') {
+            if (current === null) current = query(root, storyElements(root), step.query, root);
+            else {
+                const found = new Set();
+                for (const parent of current) for (const e of query(root, Array.from(parent.querySelectorAll('*')).filter(c => inStory(c, root)), step.query, parent)) found.add(e);
+                current = [...found];
+            }
+        } else if (step.kind === 'nth') {
+            current = current ?? storyElements(root);
+            const i = step.index < 0 ? current.length + step.index : step.index;
+            current = i >= 0 && i < current.length ? [current[i]] : [];
+        } else if (step.kind === 'hasText') current = (current ?? storyElements(root)).filter(e => matchesQuery(textOf(e), step.text, false, step));
+        else if (step.kind === 'hasNotText') current = (current ?? storyElements(root)).filter(e => !matchesQuery(textOf(e), step.text, false, step));
+        else if (step.kind === 'has') current = (current ?? storyElements(root)).filter(e => resolveFrom(root, [e], step.inner).length > 0);
+        else if (step.kind === 'hasNot') current = (current ?? storyElements(root)).filter(e => resolveFrom(root, [e], step.inner).length === 0);
+        else throw new Error('Unsupported locator step ' + step.kind);
+    }
+    return current ?? [];
+}
+
+const SNIPPET_NOISE = /\s(?:blazor:[^\s=>]+|b-[a-z0-9]{10}|_bl_[0-9a-f-]+)(?:="[^"]*")?/g;
+
+/** DomFacts.Snippet: outer HTML without Blazor bookkeeping attributes, truncated. */
+function snippet(e) {
+    const html = e.outerHTML.replace(SNIPPET_NOISE, '');
+    return html.length > 300 ? html.slice(0, 300) + '…' : html;
+}
+
+function describe(e, root) {
+    const role = roleOf(e);
+    const attrs = {};
+    for (const a of e.attributes) if (!a.name.startsWith('_bl_')) attrs[a.name] = a.value;
+    let value = null;
+    if (['input', 'textarea', 'select'].includes(e.localName)) value = e.value;
+    else if (isContentEditable(e)) value = e.textContent;
+    const name = accessibleName(e, root);
+    return {
+        tagName: e.localName, role, accessibleName: name, accessibleDescription: accessibleDescription(e, root, name),
+        accessibleErrorMessage: accessibleErrorMessage(e, root), text: textOf(e), value, attributes: attrs,
+        isVisible: isVisible(e), isEnabled: !isDisabled(e), isChecked: checkedState(e, role), isFocused: document.activeElement === e,
+        isEditable: isEditable(e), html: snippet(e)
+    };
+}
+
+// ---- events (in-app driver) ----------------------------------------------------------------------------------------
+
+const MODS = m => ({ altKey: !!(m & 1), ctrlKey: !!(m & 2), metaKey: !!(m & 4), shiftKey: !!(m & 8) });
+const MODIFIER_BITS = { Alt: 1, Control: 2, Ctrl: 2, Meta: 4, Cmd: 4, ControlOrMeta: 4, Shift: 8 };
+
+/** Keys.Parse: "Shift+Tab" is Tab with Shift; "+" is the plus key. */
+function parseChord(value) {
+    if (value.length <= 1) return { key: value, mods: 0 };
+    const parts = value.split('+');
+    const last = parts.pop();
+    let mods = 0;
+    for (const part of parts) mods |= MODIFIER_BITS[part] || 0;
+    return { key: last || '+', mods };
+}
+
+function mouse(e, type, init) {
+    const ctor = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+    return e.dispatchEvent(new ctor(type, { bubbles: true, cancelable: true, composed: true, view: window, pointerId: 1, pointerType: 'mouse', isPrimary: true, ...init }));
+}
+
+function key(e, type, k, mods) {
+    const domKey = k === 'Space' ? ' ' : k;
+    const code = k === 'Space' || k === ' ' ? 'Space' : (/^[a-z]$/i.test(k) ? 'Key' + k.toUpperCase() : (/^[0-9]$/.test(k) ? 'Digit' + k : k));
+    return e.dispatchEvent(new KeyboardEvent(type, { key: domKey, code, bubbles: true, cancelable: true, composed: true, ...MODS(mods) }));
+}
+
+function setValue(e, value) {
+    const proto = e.localName === 'textarea' ? HTMLTextAreaElement.prototype : e.localName === 'select' ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(e, value);
+}
+
+// Browsers fire `change` when a user-edited control loses focus; scripted edits don't, so emulate it.
+function commit(e) {
+    if (e && e.__btpDirty) {
+        e.__btpDirty = false;
+        const before = e.__btpValueAtFocus;
+        e.__btpValueAtFocus = undefined;
+
+        // Like browsers: no change when the user put the original value back before leaving the field.
+        if (e.value !== before) {
+            e.__btpLastCommitted = e.value;
+            e.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+}
+
+let changeOnBlur = false;
+
+function edited(e) {
+    if (!changeOnBlur) {
+        changeOnBlur = true;
+        document.addEventListener('focusout', ev => commit(ev.target), true);
+    }
+    // Called before each edit is applied, so the first call sees the value the field had when editing started.
+    if (e.__btpValueAtFocus === undefined) e.__btpValueAtFocus = e.value;
+    e.__btpDirty = true;
+}
+
+function tabOrder() {
+    const all = storyElements(storyRoot()).filter(isTabbable);
+    const radiosSeen = new Set();
+    const filtered = all.filter(e => {
+        if (e.localName === 'input' && e.type === 'radio' && e.name) {
+            const group = all.filter(r => r.localName === 'input' && r.type === 'radio' && r.name === e.name && r.form === e.form);
+            const rep = group.find(r => r.checked) || group[0];
+            if (rep !== e || radiosSeen.has(group[0])) return false;
+            radiosSeen.add(group[0]);
+        }
+        return true;
+    });
+    return filtered.map((e, i) => ({ e, i })).sort((a, b) => {
+        const pa = a.e.tabIndex > 0 ? 0 : 1, pb = b.e.tabIndex > 0 ? 0 : 1;
+        return pa - pb || (pa === 0 ? a.e.tabIndex - b.e.tabIndex : 0) || a.i - b.i;
+    }).map(x => x.e);
+}
+
+// Where Tab continues from after a click on non-focusable content (the browser's sequential focus navigation start point).
+let navigationStart = null;
+
+function moveFocus(backwards) {
+    const order = tabOrder();
+    let active = document.activeElement && document.activeElement !== document.body ? document.activeElement : null;
+    if (!active && navigationStart && navigationStart.isConnected) active = navigationStart;
+    navigationStart = null;
+    const index = active ? order.indexOf(active) : -1;
+    let next;
+    if (index < 0) {
+        if (!active) next = backwards ? order.length - 1 : 0;
+        else {
+            const after = order.findIndex(e => active.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_FOLLOWING);
+            next = backwards ? (after < 0 ? order.length - 1 : after - 1) : after;
+        }
+    } else next = backwards ? index - 1 : index + 1;
+    if (next < 0 || next >= order.length) { if (active) active.blur(); return; }
+    order[next].focus();
+}
+
+// Enter and Space click buttons, button-like inputs and the summary of a details element. Enter also follows links;
+// Space also toggles checkboxes and checks radios. Neither does anything else: Enter on a checkbox doesn't toggle it.
+const isKeyboardClickable = e => e.localName === 'button' || isDetailsSummary(e)
+    || (e.localName === 'input' && ['button', 'submit', 'reset', 'image', 'file', 'color'].includes(e.type));
+const isCheckable = e => e.localName === 'input' && (e.type === 'checkbox' || e.type === 'radio');
+
+/** Inputs whose form submits on Enter when it has no submit button and only one of them. */
+const blocksImplicitSubmission = e => e.localName === 'input'
+    && !['hidden', 'checkbox', 'radio', 'range', 'color', 'file', 'button', 'submit', 'reset', 'image'].includes(e.type);
+
+/**
+ * Implicit submission (Enter in any other input): the edit is committed (change) first; then the owner form's default
+ * button (its first submit button) is clicked unless it is disabled. A form without one submits only when the field is
+ * its single text-like field.
+ */
+function submitImplicitly(field) {
+    commit(field);
+    const form = field.form;
+    if (!form) return;
+    const defaultButton = Array.from(form.elements).find(c => (c.localName === 'button' && c.type === 'submit') || (c.localName === 'input' && (c.type === 'submit' || c.type === 'image')));
+    if (defaultButton) {
+        if (!defaultButton.matches(':disabled')) defaultButton.click();
+        return;
+    }
+    if (blocksImplicitSubmission(field) && Array.from(form.elements).filter(blocksImplicitSubmission).length === 1) form.requestSubmit();
+}
+
+function insertText(e, ch) {
+    edited(e);
+    if (e.isContentEditable) e.textContent += ch; else setValue(e, (e.value || '') + ch);
+    e.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
+}
+
+/** Arrow keys in a radio group move to the next (or previous) enabled radio, focus and check it. */
+function moveInRadioGroup(radio, forward) {
+    if (!radio.name) return;
+    const group = Array.from(document.querySelectorAll('input[type=radio]'))
+        .filter(r => r.name === radio.name && r.form === radio.form && (r === radio || (!r.disabled && isVisible(r))));
+    if (group.length < 2) return;
+    const next = group[(group.indexOf(radio) + (forward ? 1 : -1) + group.length) % group.length];
+    next.focus();
+    next.click();
+}
+
+export function pressKey(k, mods) {
+    const pressed = document.activeElement || document.body;
+    const printable = (k.length === 1 || k === 'Space') && !(mods & (1 | 2 | 4));
+    const notPrevented = key(pressed, 'keydown', k, mods);
+
+    // A keydown handler that moves focus (roving tabindex, dialogs) redirects the rest of the key press.
+    const target = document.activeElement || document.body;
+    // Browsers fire the legacy keypress for character keys and for Enter.
+    if (printable || (k === 'Enter' && !(mods & (1 | 2 | 4)))) key(target, 'keypress', k, mods);
+    if (notPrevented) {
+        if (k === 'Tab') moveFocus(!!(mods & 8));
+        else if (k === 'Enter') {
+            if (isKeyboardClickable(target) || isLink(target)) target.click();
+            else if (target.localName === 'input') submitImplicitly(target);
+            else if ((target.localName === 'textarea' || target.isContentEditable) && isEditable(target)) insertText(target, '\n');
+        } else if (['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft'].includes(k) && target.localName === 'input' && target.type === 'radio') {
+            moveInRadioGroup(target, k === 'ArrowDown' || k === 'ArrowRight');
+        } else if (isEditable(target) && printable) insertText(target, k === 'Space' ? ' ' : k);
+        else if (isEditable(target) && k === 'Backspace' && (target.value || '').length > 0) {
+            edited(target);
+            setValue(target, target.value.slice(0, -1));
+            target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+        }
+    }
+    key(document.activeElement || document.body, 'keyup', k, mods);
+
+    // Space clicks on keyup, if the pressed element kept focus. Never links.
+    const space = k === 'Space' || k === ' ';
+    if (notPrevented && space && document.activeElement === pressed && (isKeyboardClickable(pressed) || isCheckable(pressed))) pressed.click();
+}
+
+// MouseEvent.buttons for MouseEvent.button: primary 1, auxiliary (middle) 4, secondary (right) 2.
+const BUTTONS = { 0: 1, 1: 4, 2: 2 };
+
+function click(e, kind, mods, button) {
+    e.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    mouse(e, 'pointerover', {}); mouse(e, 'mouseover', {});
+    const clicks = kind === 'dblclick' ? 2 : 1;
+    for (let i = 1; i <= clicks; i++) {
+        mouse(e, 'pointerdown', { button, buttons: BUTTONS[button] ?? 1, ...MODS(mods) });
+        mouse(e, 'mousedown', { button, buttons: BUTTONS[button] ?? 1, detail: i, ...MODS(mods) });
+        let target = e;
+        while (target && !isFocusable(target)) target = target.parentElement;
+        if (target) target.focus(); else if (document.activeElement) { commit(document.activeElement); document.activeElement.blur(); }
+        navigationStart = target ? null : e;
+        mouse(e, 'pointerup', { button, ...MODS(mods) });
+        mouse(e, 'mouseup', { button, detail: i, ...MODS(mods) });
+        if (button === 2) mouse(e, 'contextmenu', { button, detail: i, ...MODS(mods) });
+        else if (mods === 0 && button === 0) e.click();
+        else mouse(e, 'click', { button, detail: i, ...MODS(mods) });
+    }
+    if (clicks === 2) mouse(e, 'dblclick', { button, detail: 2, ...MODS(mods) });
+}
+
+// ---- API used by the C# drivers ------------------------------------------------------------------------------------
+
+export function queryAll(steps) {
+    const root = storyRoot();
+    return resolve(steps).map(e => describe(e, root));
+}
+
+/** The focused story element, or null when focus is on the body or outside the story. */
+export function focused() {
+    const root = storyRoot();
+    const e = document.activeElement;
+    return !e || e === document.body || e === document.documentElement || !inStory(e, root) ? null : describe(e, root);
+}
+
+/** Checked state of an element (null when it is not checkable). */
+export function checkedOf(e) {
+    return checkedState(e, roleOf(e));
+}
+
+/** What CheckAsync/UncheckAsync must do: 'click' to change the state, null when it already matches, or the problem. */
+export function checkPlan(e, want) {
+    const state = checkedOf(e);
+    if (state === null) return 'element is not a checkbox, radio or switch';
+    if (state === want) return null;
+    if (!want && e.localName === 'input' && e.type === 'radio') return 'cannot uncheck a radio button';
+    return 'click';
+}
+
+const NEEDS_ENABLED = ['click', 'dblclick', 'fill', 'clear', 'type', 'check', 'uncheck', 'select', 'files'];
+// Choosing files needs no box: file inputs are often visually hidden behind a styled drop zone.
+const NO_BOX = ['files'];
+const FOCUS_ONLY = ['focus', 'blur', 'scroll'];
+const POINTER_ACTIONS = ['click', 'dblclick', 'hover', 'pointerdown', 'pointerup'];
+let lastTarget = null;
+
+/** Resolves the single element an action targets, or returns a problem to retry on (strictness, visibility, state). */
+/** Why files cannot be chosen in this element (the same messages as the bUnit driver), or null. */
+export function fileInputProblem(e, files) {
+    if (e.localName !== 'input' || (e.getAttribute('type') ?? '').toLowerCase() !== 'file') return 'element is not a file input';
+    if (files.length > 1 && !e.multiple) return 'the file input does not accept multiple files';
+    return null;
+}
+
+export function actionTarget(steps, action) {
+    const found = resolve(steps);
+    if (found.length !== 1) return found.length === 0 ? 'no element matches' : `strict mode violation: ${found.length} elements match`;
+    const e = found[0];
+    if (!action.force) {
+        // Pointer and typing actions need what a user sees (a box); focus, blur and scrolling only need a rendered element.
+        if (!NO_BOX.includes(action.kind)) {
+            if (FOCUS_ONLY.includes(action.kind) ? isHidden(e) : !isVisible(e)) return 'element is not visible';
+            if (!FOCUS_ONLY.includes(action.kind) && e.closest('[inert]')) return 'element is inert';
+        }
+        if (NEEDS_ENABLED.includes(action.kind) && isDisabled(e)) return 'element is disabled';
+    }
+    if ((action.kind === 'fill' || action.kind === 'clear') && !isEditable(e) && !(e.localName === 'input' && ['color', 'range'].includes(e.type))) return 'element is not editable';
+    lastTarget = e;
+    return e;
+}
+
+/** Where a pointer aimed at an element lands: hit testing skips inert content (reached only by forced actions). */
+function hitTarget(e) {
+    let hit = e;
+    while (hit && hit.closest('[inert]')) hit = hit.parentElement;
+    return hit && (hit === e || inStory(hit, storyRoot())) ? hit : null;
+}
+
+/** Checked state of the last action's target, re-resolving the locator when a re-render replaced it. */
+export function targetChecked(steps) {
+    if (lastTarget && lastTarget.isConnected) return checkedOf(lastTarget);
+    const found = resolve(steps);
+    return found.length === 1 ? checkedOf(found[0]) : null;
+}
+
+/** Performs an action; returns null on success or a problem description to retry on. */
+export function perform(steps, action) {
+    let e = actionTarget(steps, action);
+    if (typeof e === 'string') return e;
+    if (POINTER_ACTIONS.includes(action.kind)) {
+        e = hitTarget(e);
+        if (!e) return null;
+    }
+    const mods = action.modifiers || 0, button = action.button || 0;
+    switch (action.kind) {
+        case 'click': case 'dblclick':
+            click(e, action.kind, mods, button);
+            return null;
+        case 'hover':
+            for (const t of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'pointermove', 'mousemove']) mouse(e, t, {});
+            return null;
+        case 'focus': e.focus(); return null;
+        case 'blur': commit(e); e.blur(); return null;
+        case 'fill': case 'clear': {
+            e.focus();
+            edited(e);
+            if (e.isContentEditable) e.textContent = action.text || ''; else setValue(e, action.kind === 'clear' ? '' : (action.text || ''));
+            e.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertReplacementText' }));
+            return null;
+        }
+        case 'type':
+            e.focus();
+            for (const ch of (action.text || '')) pressKey(ch, 0);
+            return null;
+        case 'press': {
+            e.focus();
+            const chord = parseChord(action.text);
+            pressKey(chord.key, chord.mods);
+            return null;
+        }
+        case 'check': case 'uncheck': {
+            // Click once; the C# driver then waits for the state, which Server circuits and async handlers update later.
+            const plan = checkPlan(e, action.kind === 'check');
+            if (plan !== 'click') return plan;
+            click(e, 'click', 0, 0);
+            return null;
+        }
+        case 'select': {
+            if (e.localName !== 'select') return 'element is not a <select>';
+            const options = Array.from(e.options);
+            const wanted = action.values.map(v => options.find(o => o.value === v) || options.find(o => normalize(o.textContent) === v));
+            if (wanted.some(o => !o)) return 'no option matches ' + action.values.join(', ');
+            e.focus();
+            options.forEach(o => { o.selected = wanted.includes(o); });
+            e.dispatchEvent(new Event('input', { bubbles: true }));
+            e.dispatchEvent(new Event('change', { bubbles: true }));
+            return null;
+        }
+        case 'pointerdown': mouse(e, 'pointerdown', { button, buttons: BUTTONS[button] ?? 1 }); mouse(e, 'mousedown', { button, buttons: BUTTONS[button] ?? 1 }); return null;
+        case 'pointerup': mouse(e, 'pointerup', { button }); mouse(e, 'mouseup', { button }); return null;
+        case 'drag': {
+            const target = actionTarget(action.target, { kind: 'hover' });
+            if (typeof target === 'string') return 'drop target: ' + target;
+            const data = new DataTransfer();
+            const drag = (el, type) => el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: data }));
+            drag(e, 'dragstart'); drag(target, 'dragenter');
+
+            // A drop target must cancel dragover; otherwise the drag leaves it and nothing is dropped.
+            const accepted = !drag(target, 'dragover');
+            drag(target, accepted ? 'drop' : 'dragleave');
+            drag(e, 'dragend');
+            return null;
+        }
+        case 'scroll': e.scrollIntoView({ block: 'center' }); return null;
+        case 'files': {
+            const problem = fileInputProblem(e, action.files);
+            if (problem) return problem;
+            const data = new DataTransfer();
+            for (const f of action.files) {
+                const bytes = Uint8Array.from(atob(f.content), c => c.charCodeAt(0));
+                data.items.add(new File([bytes], f.name, { type: f.type, lastModified: f.lastModified }));
+            }
+            e.files = data.files;
+            e.dispatchEvent(new Event('input', { bubbles: true }));
+            e.dispatchEvent(new Event('change', { bubbles: true }));
+            return null;
+        }
+        default: return 'unsupported action ' + action.kind;
+    }
+}
+
+export function keyboard(kind, value) {
+    const { key: k, mods } = parseChord(value);
+    const target = document.activeElement || document.body;
+    if (kind === 'press') pressKey(k, mods);
+    else if (kind === 'type') for (const ch of value) pressKey(ch, 0);
+    else if (kind === 'down') key(target, 'keydown', k, mods);
+    else if (kind === 'up') key(target, 'keyup', k, mods);
+}
+
+export function settle() {
+    return new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))));
+}
+
+// ---- accessibility snapshot (AriaSnapshot) -------------------------------------------------------------------------
+
+const SNAPSHOT_SKIPPED = new Set(['script', 'style', 'template', 'head', 'noscript', 'meta', 'link', 'title']);
+const SNAPSHOT_FLATTENED = new Set(['generic', 'none', 'presentation']);
+
+function headingLevel(e) {
+    const level = /^\s*[+-]?\d+\s*$/.test(e.getAttribute('aria-level') ?? '') ? parseInt(e.getAttribute('aria-level'), 10) : NaN;
+    if (level >= 1) return level;
+    const match = /^h([1-6])$/.exec(e.localName);
+    return match ? Number(match[1]) : 2;
+}
+
+function snapshotLines(elements, root, depth, out) {
+    for (const e of elements) {
+        if (SNAPSHOT_SKIPPED.has(e.localName) || e.matches(OUTSIDE_STORY) || isExcluded(e)) continue;
+        const role = roleOf(e);
+        if (!role || SNAPSHOT_FLATTENED.has(role)) {
+            snapshotLines(e.children, root, depth, out);
+            continue;
+        }
+
+        let line = '  '.repeat(depth) + '- ' + role;
+        const name = accessibleName(e, root);
+        if (name) line += ' "' + name.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+        // Same states as AriaSnapshot.States: toggle buttons are pressed; options and tree items are checked only
+        // through aria-checked and selected through aria-selected.
+        const states = [];
+        const ariaChecked = (e.getAttribute('aria-checked') ?? '').trim().toLowerCase();
+        if (role === 'button') {
+            const pressed = (e.getAttribute('aria-pressed') ?? '').trim().toLowerCase();
+            if (pressed === 'true') states.push('pressed');
+            else if (pressed === 'false') states.push('pressed=false');
+            else if (pressed === 'mixed') states.push('pressed=mixed');
+        } else if (ariaChecked === 'mixed' && ['checkbox', 'menuitemcheckbox', 'option', 'treeitem'].includes(role)) {
+            states.push('checked=mixed');
+        } else if (!['option', 'treeitem'].includes(role) || e.hasAttribute('aria-checked')) {
+            const checked = checkedState(e, role);
+            if (checked !== null) states.push(checked ? 'checked' : 'checked=false');
+        }
+        if (isDisabled(e)) states.push('disabled');
+        if (isRequired(e, role)) states.push('required');
+        const expanded = (e.getAttribute('aria-expanded') ?? '').trim().toLowerCase();
+        if (expanded === 'true') states.push('expanded');
+        else if (expanded === 'false') states.push('expanded=false');
+        if ((e.getAttribute('aria-selected') ?? '').trim().toLowerCase() === 'true') states.push('selected');
+        if (role === 'heading') states.push('level=' + headingLevel(e));
+        if (states.length) line += ' [' + states.join('] [') + ']';
+
+        const children = [];
+        snapshotLines(e.children, root, depth + 1, children);
+        out.push(children.length ? line + ':' : line, ...children);
+    }
+}
+
+// AriaSnapshot.IsRequired: aria-required="true", or a native required field unless aria-required="false".
+const requirableRoles = new Set(['checkbox', 'switch', 'combobox', 'gridcell', 'columnheader', 'rowheader', 'listbox', 'radiogroup', 'spinbutton', 'textbox', 'searchbox', 'tree', 'treegrid']);
+function isRequired(e, role) {
+    if (!requirableRoles.has(role)) return false;
+    const aria = (e.getAttribute('aria-required') ?? '').trim().toLowerCase();
+    return aria === 'true' || (aria !== 'false' && e.hasAttribute('required') && ['input', 'select', 'textarea'].includes(e.localName));
+}
+
+/** AriaSnapshot.Of: the story's accessibility tree as text. */
+export function ariaSnapshot() {
+    const root = storyRoot();
+    if (!root) return '';
+    const out = [];
+    snapshotLines(root.children, root, 0, out);
+    return out.join('\n');
+}
+
+// ---- interaction recorder (workbench "Record") ---------------------------------------------------------------------
+// Turns what a person does in the story frame into play-function C#: the most readable locator that finds exactly the
+// element (role and name, test id, placeholder, then a CSS path), and the action the driver API offers for it.
+
+const csString = s => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n') + '"';
+const RECORDED_KEYS = new Set(['Enter', 'Escape', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown', ' ', 'Backspace', 'Delete']);
+const FILLABLE = e => e.localName === 'textarea' || isTextInput(e) || isContentEditable(e);
+const TOGGLES = e => e.localName === 'input' && (e.type === 'checkbox' || e.type === 'radio');
+let recorder = null;
+
+function cssPath(e, root) {
+    const parts = [];
+    for (let current = e; current && current !== root; current = current.parentElement) {
+        const sameTag = Array.from(current.parentElement?.children ?? []).filter(c => c.localName === current.localName);
+        parts.unshift(sameTag.length > 1 ? `${current.localName}:nth-of-type(${sameTag.indexOf(current) + 1})` : current.localName);
+    }
+    return parts.join(' > ');
+}
+
+/** The most readable locator expression that resolves to exactly this element. */
+export function locatorFor(e) {
+    const root = storyRoot();
+    const unique = steps => {
+        const found = resolve(steps);
+        return found.length === 1 && found[0] === e;
+    };
+    const role = roleOf(e);
+    if (role && !SNAPSHOT_FLATTENED.has(role)) {
+        const name = accessibleName(e, root);
+        if (name && unique([{ kind: 'find', query: { type: 'role', role, name, exact: true } }])) return `ctx.GetByRole(${csString(role)}, ${csString(name)}, exact: true)`;
+        if (!name && unique([{ kind: 'find', query: { type: 'role', role } }])) return `ctx.GetByRole(${csString(role)})`;
+    }
+    const testId = e.getAttribute('data-testid');
+    if (testId && unique([{ kind: 'find', query: { type: 'testid', attribute: 'data-testid', value: testId } }])) return `ctx.GetByTestId(${csString(testId)})`;
+    const placeholder = e.getAttribute('placeholder');
+    if (placeholder && unique([{ kind: 'find', query: { type: 'placeholder', value: placeholder, exact: true } }])) return `ctx.GetByPlaceholder(${csString(placeholder)}, exact: true)`;
+    const path = cssPath(e, root);
+    const matches = resolve([{ kind: 'find', query: { type: 'css', selector: path } }]);
+    return matches.length === 1 ? `ctx.Locate(${csString(path)})` : `ctx.Locate(${csString(path)}).Nth(${matches.indexOf(e)})`;
+}
+
+function record(line) {
+    recorder.lines.push(line);
+}
+
+function flushFill() {
+    const pending = recorder.pendingFill;
+    recorder.pendingFill = null;
+    if (pending) record(`await ${pending.locator}.FillAsync(${csString(pending.element.isContentEditable ? pending.element.textContent : pending.element.value)});`);
+}
+
+function onInput(event) {
+    const e = event.target;
+    if (!event.isTrusted || !inStory(e, storyRoot()) || !FILLABLE(e)) return;
+    if (recorder.pendingFill && recorder.pendingFill.element !== e) flushFill();
+    recorder.pendingFill = { element: e, locator: recorder.pendingFill?.locator ?? locatorFor(e) };
+}
+
+function onChange(event) {
+    const e = event.target;
+    if (!event.isTrusted || !inStory(e, storyRoot())) return;
+    if (FILLABLE(e)) return flushFill();
+    flushFill();
+    if (TOGGLES(e)) record(`await ${locatorFor(e)}.${e.checked ? 'CheckAsync' : 'UncheckAsync'}();`);
+    else if (e.localName === 'select') record(`await ${locatorFor(e)}.SelectOptionAsync(${Array.from(e.selectedOptions).map(o => csString(o.value)).join(', ')});`);
+}
+
+function onClick(event) {
+    // Keyboard activation (Enter/Space) clicks with detail 0: the key press is recorded instead.
+    if (!event.isTrusted || event.detail === 0 || event.button !== 0) return;
+    const root = storyRoot();
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target || !inStory(target, root)) return;
+    const control = target.closest('button, a[href], summary, select, textarea, input, label, [role], [tabindex]') ?? target;
+    if (!inStory(control, root) || TOGGLES(control) || FILLABLE(control) || control.localName === 'select' || control.localName === 'label') return;
+    flushFill();
+    record(`await ${locatorFor(control)}.ClickAsync();`);
+}
+
+function onKeyDown(event) {
+    if (!event.isTrusted || !RECORDED_KEYS.has(event.key)) return;
+    const e = event.target instanceof Element ? event.target : null;
+    const root = storyRoot();
+    if (e && TOGGLES(e) && event.key === ' ') return; // the change is recorded
+    flushFill();
+    const chord = [event.ctrlKey && 'Control', event.altKey && 'Alt', event.shiftKey && 'Shift', event.metaKey && 'Meta', event.key === ' ' ? 'Space' : event.key].filter(Boolean).join('+');
+    record(e && e !== document.body && inStory(e, root) ? `await ${locatorFor(e)}.PressAsync(${csString(chord)});` : `await ctx.PressAsync(${csString(chord)});`);
+}
+
+const RECORDER_EVENTS = { input: onInput, change: onChange, click: onClick, keydown: onKeyDown };
+
+/** Starts recording trusted user interactions in the story (restarts an earlier recording). */
+export function startRecording() {
+    stopRecording();
+    recorder = { lines: [], pendingFill: null };
+    for (const [type, handler] of Object.entries(RECORDER_EVENTS)) document.addEventListener(type, handler, true);
+    return true;
+}
+
+/** Stops recording; the lines stay readable. */
+export function stopRecording() {
+    if (!recorder) return false;
+    flushFill();
+    for (const [type, handler] of Object.entries(RECORDER_EVENTS)) document.removeEventListener(type, handler, true);
+    recorder.stopped = true;
+    return true;
+}
+
+/** The recorded play-function lines (a typed value counts once typing stops), as JSON. */
+export function recording() {
+    if (!recorder) return JSON.stringify({ recording: false, lines: [] });
+    const pending = recorder.pendingFill;
+    const lines = [...recorder.lines];
+    if (pending) lines.push(`await ${pending.locator}.FillAsync(${csString(pending.element.isContentEditable ? pending.element.textContent : pending.element.value)});`);
+    return JSON.stringify({ recording: !recorder.stopped, lines });
+}
+
+export function markup() {
+    const root = document.querySelector(ROOT);
+    if (!root) return '';
+
+    // Rejected arg overrides are listed inside the root by the workbench; they are not part of the story.
+    const copy = root.cloneNode(true);
+    copy.querySelectorAll('[data-btp-arg-errors]').forEach(e => e.remove());
+    return copy.innerHTML;
+}
+
+export function publishResult(storyId, result) {
+    const root = document.querySelector(ROOT);
+    if (root) root.setAttribute('data-btp-play-status', result.status);
+    window.__btpPlayResult = result;
+    // Only the workbench shell, served from this origin, may read results (they quote the story's markup).
+    if (window.parent && window.parent !== window) window.parent.postMessage({ source: 'btp', type: 'play-result', storyId, ...result }, window.location.origin);
+}
+
+/** The share (0..1) of an element's box in the viewport, as an IntersectionObserver reports it (Playwright's toBeInViewport). */
+function viewportRatio(e) {
+    return new Promise(resolve => {
+        const observer = new IntersectionObserver(entries => {
+            observer.disconnect();
+            resolve(entries.length ? entries[entries.length - 1].intersectionRatio : 0);
+        });
+        observer.observe(e);
+    });
+}
+
+/**
+ * Computed style (of a pseudo-element, when given), viewport share (when asked) and box of the match:
+ * IStoryDriver.MeasureAsync. Assertions are strict, so only a single match is measured; other counts return empty entries.
+ */
+export async function measure(steps, property, pseudo, wantRatio) {
+    const matches = resolve(steps);
+    if (matches.length !== 1) return matches.map(() => ({}));
+    const e = matches[0];
+    const box = e.getBoundingClientRect();
+    return [{
+        style: property ? getComputedStyle(e, pseudo || null).getPropertyValue(property) : null,
+        ratio: wantRatio ? await viewportRatio(e) : 0,
+        x: box.x, y: box.y, width: box.width, height: box.height,
+    }];
+}
+
+// Forced pseudo-classes (storybook-addon-pseudo-states' approach, in every browser): each style rule whose selector
+// uses a user-action pseudo-class gets a twin in which the pseudo-class is an attribute selector, and the element (and,
+// for :hover, :active and :focus-within, its ancestors, as with a real pointer) carries the attribute.
+const PSEUDO_CLASSES = ['focus-visible', 'focus-within', 'hover', 'active', 'focus', 'visited'];
+const PSEUDO_PATTERN = new RegExp(':(' + PSEUDO_CLASSES.join('|') + ')(?![\\w-])', 'g');
+const PSEUDO_ATTRIBUTE = 'data-btp-pseudo';
+const rewrittenSheets = new WeakSet();
+
+function rewriteRules(list) {
+    // Backwards, so inserted twins do not shift the rules still to visit.
+    for (let i = list.cssRules.length - 1; i >= 0; i--) {
+        const rule = list.cssRules[i];
+        if (rule.cssRules && !(rule instanceof CSSStyleRule)) { rewriteRules(rule); continue; }
+        if (!(rule instanceof CSSStyleRule) || !PSEUDO_PATTERN.test(rule.selectorText)) continue;
+        PSEUDO_PATTERN.lastIndex = 0;
+        const selector = rule.selectorText.replace(PSEUDO_PATTERN, (_, name) => `[${PSEUDO_ATTRIBUTE}~="${name}"]`);
+        try { list.insertRule(`${selector} { ${rule.style.cssText} }`, i + 1); } catch { /* a selector the engine cannot parse */ }
+    }
+}
+
+function rewriteStylesheets() {
+    for (const sheet of Array.from(document.styleSheets)) {
+        if (rewrittenSheets.has(sheet)) continue;
+        try { rewriteRules(sheet); } catch { /* cross-origin sheets cannot be read */ }
+        rewrittenSheets.add(sheet);
+    }
+}
+
+/** Forces pseudo-classes on the single element a locator matches (empty clears): IStoryDriver.ForcePseudoStatesAsync. */
+export function forcePseudo(stepsJson, names) {
+    const matches = resolve(JSON.parse(stepsJson));
+    if (matches.length !== 1) return matches.length === 0 ? 'no element matches' : `strict mode violation: ${matches.length} elements match`;
+    rewriteStylesheets();
+    const root = storyRoot();
+    for (const e of root.querySelectorAll(`[${PSEUDO_ATTRIBUTE}]`)) e.removeAttribute(PSEUDO_ATTRIBUTE);
+    const own = names.filter(n => n !== 'focus-within');
+    const inherited = names.filter(n => n === 'hover' || n === 'active' || n === 'focus-within');
+    const set = (e, list) => {
+        const merged = new Set([...(e.getAttribute(PSEUDO_ATTRIBUTE) || '').split(' ').filter(Boolean), ...list]);
+        if (merged.size) e.setAttribute(PSEUDO_ATTRIBUTE, [...merged].join(' '));
+    };
+    set(matches[0], names.includes('focus-within') ? [...own, 'focus-within'] : own);
+    for (let e = matches[0].parentElement; e && root.contains(e); e = e.parentElement) set(e, inherited);
+    return null;
+}
+
+// Prerender parity: the distinct accessibility trees the story shows while Blazor starts (one per animation frame with DOM
+// changes), compared by the browser runner with the prerendered tree.
+let ariaWatch = null;
+
+/** What the story shows: its accessibility tree, then its visible text (paragraph text has no place in the tree). */
+export function storyState() {
+    const root = storyRoot();
+    const text = root ? (root.innerText || '').replace(/\s+/g, ' ').trim() : '';
+    return `${ariaSnapshot()}
+# text: ${text}`;
+}
+
+/** Starts recording the distinct accessibility trees of the story (watchAria / stopWatchAria). */
+export function watchAria() {
+    stopWatchAria();
+    const seen = [];
+    const record = () => {
+        const tree = storyState();
+        if (!seen.includes(tree)) seen.push(tree);
+    };
+    let pending = false;
+    const observer = new MutationObserver(() => {
+        if (pending) return;
+        pending = true;
+        requestAnimationFrame(() => { pending = false; record(); });
+    });
+    observer.observe(document, { subtree: true, childList: true, characterData: true, attributes: true });
+    ariaWatch = { observer, seen, record };
+    return true;
+}
+
+/** Stops recording and returns the trees seen (the current one last), as JSON. */
+export function stopWatchAria() {
+    if (!ariaWatch) return '[]';
+    const watch = ariaWatch;
+    ariaWatch = null;
+    watch.observer.disconnect();
+    watch.record();
+    return JSON.stringify(watch.seen);
+}
+
+/** The single element a locator chain matches, or why there is none (screenshots of a locator). */
+export function single(stepsJson) {
+    const matches = resolve(JSON.parse(stepsJson));
+    return matches.length === 1 ? matches[0] : matches.length === 0 ? 'no element matches' : `strict mode violation: ${matches.length} elements match`;
+}
+
+// JSON entry points (the .NET side passes and receives strings, which keeps interop trimming-safe).
+export async function measureJson(stepsJson, property, pseudo, wantRatio) { return JSON.stringify(await measure(JSON.parse(stepsJson), property, pseudo, wantRatio)); }
+export function queryJson(stepsJson) { return JSON.stringify(queryAll(JSON.parse(stepsJson))); }
+export function performJson(stepsJson, actionJson) { return perform(JSON.parse(stepsJson), JSON.parse(actionJson)); }
+export function actionTargetJson(stepsJson, actionJson) { return actionTarget(JSON.parse(stepsJson), JSON.parse(actionJson)); }
+export function targetCheckedJson(stepsJson) { return JSON.stringify(targetChecked(JSON.parse(stepsJson))); }
+export function focusedJson() { const f = focused(); return f ? JSON.stringify(f) : null; }
+export function publishResultJson(storyId, resultJson) { publishResult(storyId, JSON.parse(resultJson)); }

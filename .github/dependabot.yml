@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # BlazorTestPlatform: Playwright upgrades change browser builds and therefore screenshots. Dependabot opens the PR;
+  # run the "BlazorTestPlatform visual baselines" workflow on its branch to commit the new Linux baselines
+  # (see BlazorTestPlatform/docs/ci.md).
+  - package-ecosystem: nuget
+    directory: /BlazorTestPlatform
+    schedule:
+      interval: weekly
+    allow:
+      - dependency-name: Microsoft.Playwright
+    groups:
+      blazortestplatform-playwright:
+        patterns: ["Microsoft.Playwright*"]
+    commit-message:
+      prefix: "chore(blazortestplatform)"

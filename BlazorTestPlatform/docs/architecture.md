@@ -1,0 +1,100 @@
+# Architecture
+
+```
+                         ┌───────────────────────────── BlazorTestPlatform.Core ─────────────────────────────┐
+  Stories<T> ──build──▶  │ Story (args, decorators, play, fixtures, user, fake time, gate options)           │
+  IStoryConfiguration    │ StoryCatalog · TestMatrix/MatrixCase · StoryRoot (renders any story)             │
+                         │ StoryContext ─▶ ElementLocator / LocatorAssertions / ActionAssertions / Poll       │
+                         │        │            (locator chains, auto-wait, messages, timeline)                │
+                         │        ▼                                                                           │
+                         │ IStoryDriver  (Query, Perform, Keyboard, Focused, Actions, Idle, AdvanceTime)     │
+                         │ Results (StoryResult, StepRecord) · Accessibility/Performance models · Settings   │
+                         └───────────┬───────────────────────────────────────────────┬───────────────────────┘
+                                     │                                               │
+               ┌──────────── BlazorTestPlatform.Bunit ───────────┐   ┌──────── BlazorTestPlatform.Playwright ───────┐
+               │ BunitStoryDriver  (event-faithful emulation)    │   │ PlaywrightStoryDriver (shared query script)   │
+               │ BunitStoryRunner  (play, markup a11y, budgets)  │   │ WorkbenchBrowser/StoryPage (hydration-aware)  │
+               │ AccessibilityReviews (fingerprints)             │   │ BrowserStoryRunner (retries, visual, axe,     │
+               └─────────────────────┬───────────────────────────┘   │   console/error-UI checks, artifacts)         │
+                                     │                               │ Hosts: Kestrel WAF · process · external       │
+               ┌─ BlazorTestPlatform.Accessibility ─┐                └──────────┬──────────────────────┬─────────────┘
+               │ ARIA roles & names · DomQueries    │                           │ HTTP                 │ PNG
+               │ 37 markup rules · fingerprints     │       ┌── BlazorTestPlatform.Workbench ──┐  ┌── .Visual ──────────┐
+               └────────────────────────────────────┘       │ /_workbench (shell UI)           │  │ PngCodec · YIQ diff │
+                                                            │ /_workbench/frame/{id}?mode=…    │  │ SnapshotStore       │
+                                                            │ StoryHost (status, bridge)       │  └─────────────────────┘
+                                                            │ StoryServiceScope (overrides)    │
+                                                            │ InAppStoryDriver (in-frame play) │
+                                                            └──────────────────────────────────┘
+               BlazorTestPlatform.Reporting (HTML · JUnit · Markdown · SARIF · flake history · PR comment) ◀── results JSON ──▶ btp CLI
+               BlazorTestPlatform.Xunit / .NUnit / .MSTest / .TUnit (data rows, skip reporting) ── StoryTestCase ──▶ Core
+```
+
+Core also holds the cross-cutting services every runner shares: `BtpTelemetry` (an `ActivitySource` and a `Meter`
+named `BlazorTestPlatform`), `StoryImpact` (changed files to stories), `BrowserEmulation` and `BrowserBudget` (applied
+by the Playwright runner) and the driver contract's accessibility snapshot (`GetAriaSnapshotAsync`, computed by
+`AriaSnapshot` in bUnit and by its port in `btp-driver.js` in browsers). The Core package ships two analyzer
+assemblies under `analyzers/dotnet/cs`: the source generator with the story analyzers, and their code fixes
+(`BlazorTestPlatform.CodeFixes`, separate because analyzers must not load Workspaces).
+
+## Discovery without reflection
+
+`BlazorTestPlatform.Generators` ships inside the Core package. For every assembly that declares story collections or `IStoryConfiguration`s, it emits an `IStoryCatalogProvider`, plus an assembly attribute pointing at it. `StoryCatalog.FromAssemblies` prefers the provider and falls back to a reflection scan for assemblies built without the generator. The selection rules are identical, and a test checks that the generated and reflected catalogs match.
+
+## Design principles
+
+1. **Stories are the single source of truth.** Every feature consumes `Story`: the workbench, both drivers, the matrix, gates and reports. Nothing is configured twice.
+2. **Drivers implement primitives; the core implements semantics.** Locator chains, auto-waiting assertions, assertion messages and timelines live in Core, so every driver shares them. Drivers resolve queries and perform actions, each against its own DOM: bUnit through `BlazorTestPlatform.Accessibility` (`DomQueries`, the ARIA role and name engine), Playwright and the in-app driver through scripts that follow the same rules. The demo runs every play script through all three drivers to keep them aligned. A new driver (for example, a MAUI/WebView driver) implements `IStoryDriver` and inherits the rest.
+3. **One renderer for every host.** `StoryRoot` renders decorators, bindings, fake authentication and the component identically in bUnit and in the frame's `StoryHost` under every render mode.
+4. **Determinism by construction.** Seeds, fake time, a fixed locale and time zone, reduced motion, stabilised screenshots, hydration-aware waits and render-mode verification remove sources of nondeterminism up front; retries are a last resort, not the strategy.
+5. **Gates are versioned data.** Baselines, budgets, suppressions (with expiry) and manual reviews (with fingerprints) are files in the repository, reviewed in pull requests.
+6. **No lock-in.** The packages work with xUnit, NUnit and MSTest, depend on no SaaS, write portable JSON, and bundle axe-core so the platform runs offline.
+
+## The story frame contract
+
+`StoryHost` renders a root element:
+
+```html
+<div data-btp-root data-btp-story="inputs-button--primary"
+     data-btp-status="loading|ready|error"
+     data-btp-renderer="Static|Server|WebAssembly"
+     data-btp-interactive="true|false"
+     data-btp-layout="padded|centered|fullscreen"
+     data-btp-unsupported-overrides="…">…</div>
+```
+
+`data-btp-unsupported-overrides` is present only when the story registers services that cannot apply per story in browsers (see [test data](test-data.md#how-overrides-reach-server-and-webassembly)).
+
+In interactive modes it also registers `window.__btp` with `getActions()`, `getRequests()`, `getJSCalls()`, `setArgs(token)`, `hasFakeTime()`, `advanceTime(ms)` and `waitForIdle()`. Frame URLs accept arg overrides as `arg.Name=value`; the accepted ones are echoed in `data-btp-args` and rejected ones are listed in `[data-btp-arg-errors]`. With `?play=1`, the frame runs the play function in-app and then sets `data-btp-play-status` to `passed`, `failed` or `skipped`. It also exposes `window.__btpPlayResult` and posts a `play-result` message to the parent window. Static SSR frames can't run play, so they report `skipped` right away. External tools, for example an existing Playwright test suite in TypeScript, can use this contract directly.
+
+## Writing a driver
+
+Implement `IStoryDriver` (it is also `IAsyncDisposable`):
+
+```csharp
+string Name { get; }                              // e.g. "bunit", "chromium"
+DriverCapabilities Capabilities { get; }          // what play scripts may Require()
+HostingModel HostingModel { get; }
+IServiceProvider? Services { get; }               // in-process services, or null
+Task<IReadOnlyList<ElementInfo>> QueryAsync(LocatorChain locator, CancellationToken ct);
+Task PerformAsync(LocatorChain locator, ElementAction action, TimeSpan timeout, CancellationToken ct);
+Task KeyboardAsync(KeyboardAction action, CancellationToken ct);
+Task<ElementInfo?> GetFocusedElementAsync(CancellationToken ct);
+Task<IReadOnlyList<ActionRecord>> GetActionsAsync(CancellationToken ct);
+Task WaitForIdleAsync(CancellationToken ct);
+Task AdvanceTimeAsync(TimeSpan delta, CancellationToken ct);
+Task<string> GetMarkupAsync(CancellationToken ct);
+// Optional (default implementations return nothing):
+Task<IReadOnlyList<HttpRequestRecord>> GetHttpRequestsAsync(CancellationToken ct);
+Task<IReadOnlyList<JSCallRecord>> GetJSCallsAsync(CancellationToken ct);
+// Optional (default implementations throw NotSupportedException; the checks are then recorded as skipped):
+Task<IReadOnlyList<ElementMeasurement>> MeasureAsync(LocatorChain locator, string? cssProperty, string? pseudoElement, CancellationToken ct);
+Task<AccessibilityReport> ScanAccessibilityAsync(AccessibilityPolicy policy, StoryAccessibilityOptions storyOptions, CancellationToken ct);
+Task<VisualResult> MatchScreenshotAsync(string name, LocatorChain? target, bool fullPage, CancellationToken ct);
+```
+
+A runner applies `RunPolicy.Apply(story, result, settings)` to each finished result (expected failures, `BTP_FAIL_ON_FLAKY`, quarantine and the `BTP_MAX_FAILURES` count) and, before starting a story, `StoryRunFilter.ExcludeReason(story, settings)` and `RunPolicy.StopReason(settings)`, which give the reason to report it as skipped.
+
+To support JS mocks and `ExpectJSCall`, wrap the `IJSRuntime` your host gives components with `StoryJSRuntime.Create(runtime, story.JSInterop, log, mode)` when the story declares mocks (`story.JSInterop` is null otherwise). `JSMockMode.Answer` answers mocks in the wrapper, `AnsweredByInner` lets a mocking runtime such as bUnit's answer them and only records, and `RecordOnly` records while real JavaScript answers.
+
+Then run stories through `new StoryContext(story, driver)` and, for stories that have one (`story.HasPlay`), `story.Play!(context)`. Before rendering, skip stories whose declared requirements the driver does not meet: `story.UnsupportedReason(driver.Capabilities, driver.Name)` returns the reason to report (null when the story can run). Claim only capabilities the driver really has; an emulated or approximated behaviour (the bUnit driver's focus, CSS and JavaScript) is not a capability, so stories that need the real thing are skipped instead of passing against an approximation. `BlazorTestPlatform.Accessibility.Dom.DomQueries` resolves locator chains against any AngleSharp DOM.

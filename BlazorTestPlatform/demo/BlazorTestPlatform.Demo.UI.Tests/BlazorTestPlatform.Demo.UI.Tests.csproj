@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <IsTestProject>true</IsTestProject>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <!-- Code coverage (the coverage and coverage-output-format cobertura options of dotnet test): btp report merges it into story coverage. -->
+    <PackageReference Include="Microsoft.Testing.Extensions.CodeCoverage" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\BlazorTestPlatform.Demo.Workbench\BlazorTestPlatform.Demo.Workbench.csproj" />
+    <ProjectReference Include="..\BlazorTestPlatform.Demo.UI.Stories\BlazorTestPlatform.Demo.UI.Stories.csproj" />
+    <ProjectReference Include="..\..\src\BlazorTestPlatform.Bunit\BlazorTestPlatform.Bunit.csproj" />
+    <ProjectReference Include="..\..\src\BlazorTestPlatform.Playwright\BlazorTestPlatform.Playwright.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+    <Using Include="BlazorTestPlatform" />
+  </ItemGroup>
+
+</Project>

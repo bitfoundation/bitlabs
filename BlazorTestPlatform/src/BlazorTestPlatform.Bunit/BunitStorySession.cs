@@ -1,0 +1,411 @@
+using BlazorTestPlatform.Accessibility;
+using BlazorTestPlatform.Accessibility.Dom;
+using BlazorTestPlatform.Configuration;
+using BlazorTestPlatform.Drivers;
+using BlazorTestPlatform.Performance;
+using BlazorTestPlatform.Results;
+using Bunit;
+using Microsoft.AspNetCore.Components;
+using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+
+namespace BlazorTestPlatform.Bunit;
+
+/// <summary>Options for running stories with bUnit.</summary>
+public sealed class BunitStoryOptions
+{
+    /// <summary>Extra configuration of the bUnit context (JS interop setups, component stubs...), applied after story services.</summary>
+    public Action<BunitContext>? ConfigureContext { get; set; }
+
+    /// <summary>JS interop mode. Default <see cref="JSRuntimeMode.Loose"/> so components calling JS still render.</summary>
+    public JSRuntimeMode JSInteropMode { get; set; } = JSRuntimeMode.Loose;
+
+    /// <summary>Execute the story's play function. Default true.</summary>
+    public bool RunPlay { get; set; } = true;
+
+    /// <summary>Run static accessibility rules after play. Default true.</summary>
+    public bool CheckAccessibility { get; set; } = true;
+
+    /// <summary>Measure render performance when the story declares a budget. Default true.</summary>
+    public bool MeasurePerformance { get; set; } = true;
+
+    /// <summary>Write a JSON result into the results directory. Default true.</summary>
+    public bool WriteResults { get; set; } = true;
+
+    /// <summary>
+    /// Shrinks the steps of a failed <c>ctx.ExploreAsync</c> (default true): candidates without some of the steps are replayed
+    /// on fresh renders, and the failure reports the shortest sequence found that still fails the same way.
+    /// </summary>
+    public bool ShrinkExplorations { get; set; } = true;
+
+    /// <summary>The most replays one shrink may make (default 200).</summary>
+    public int MaxShrinkProbes { get; set; } = 200;
+
+    /// <summary>
+    /// Fails a story whose components, once disposed, are still referenced (default true): by a <c>DotNetObjectReference</c>
+    /// they passed to JavaScript and did not dispose, or by a handler they added to an event of a service they injected
+    /// and did not remove. Both keep a removed component in memory and let it be called later. Checked after the story
+    /// passes; a story that leaks on purpose says why with <c>AllowLeaks(reason)</c>.
+    /// </summary>
+    public bool DetectLeaks { get; set; } = true;
+
+    /// <summary>
+    /// Records the rendered markup after each action, assertion and wait (default true) and keeps the last ones in the
+    /// results of failed runs, a step-by-step DOM to see where the page first went wrong (the HTML report and the hub
+    /// show it under each step). Passed runs keep none. bUnit builds the markup again only after a render, so steps that
+    /// render nothing cost nothing.
+    /// </summary>
+    public bool RecordStepMarkup { get; set; } = true;
+
+    /// <summary>Accessibility policy (defaults to <see cref="BtpSettings.Accessibility"/>).</summary>
+    public AccessibilityPolicy? AccessibilityPolicy { get; set; }
+
+    /// <summary>Settings (defaults to <see cref="BtpSettings.Current"/>).</summary>
+    public BtpSettings? Settings { get; set; }
+
+    /// <summary>Overall timeout (defaults to the story timeout or 30 s).</summary>
+    public TimeSpan? Timeout { get; set; }
+
+    /// <summary>
+    /// What <c>ComponentBase.RendererInfo</c> reports to the story's components. Default: an interactive <c>Server</c>
+    /// renderer, the closest match to how bUnit renders (events run, the component stays live). Set
+    /// <c>new RendererInfo("Static", false)</c> to check what a component renders while it is prerendered, or
+    /// <c>new RendererInfo("WebAssembly", true)</c> for components that branch on the WebAssembly renderer.
+    /// Without a value, bUnit throws <c>MissingRendererInfoException</c> for components that read it.
+    /// </summary>
+    public RendererInfo RendererInfo { get; set; } = new("Server", isInteractive: true);
+
+    /// <summary>
+    /// CSS text whose <c>display</c>/<c>visibility</c> rules decide element visibility in memory (in addition to
+    /// <see cref="BtpSettings.BunitStylesheets"/>). Load your design system's CSS or CSS-isolation bundle so components
+    /// hidden by a class are hidden in bUnit too.
+    /// </summary>
+    public List<string> Stylesheets { get; } = [];
+
+    /// <summary>Adds a stylesheet file.</summary>
+    public BunitStoryOptions AddStylesheetFile(string path)
+    {
+        Stylesheets.Add(File.ReadAllText(path));
+        return this;
+    }
+
+    /// <summary>
+    /// Viewport the in-memory driver pretends to have: stylesheet <c>@media</c> queries are evaluated against it and
+    /// it is exposed as <see cref="StoryRenderContext.Viewport"/>. Defaults to <see cref="BtpSettings.BunitViewport"/>
+    /// (<c>btp.json</c> → <c>bunit.viewport</c>), then <see cref="Viewport.Desktop"/>.
+    /// </summary>
+    public Viewport? Viewport { get; set; }
+
+    /// <summary>
+    /// Theme applied to the story: its decorator wraps the story, and its color scheme drives
+    /// <c>prefers-color-scheme</c> media queries. Default: none (light).
+    /// </summary>
+    public ThemeDefinition? Theme { get; set; }
+
+    /// <summary>
+    /// Arg overrides as control text (<c>["Variant"] = "Danger"</c>), converted exactly like the workbench's controls
+    /// and <c>?arg.Name=value</c> links (see <see cref="StoryArgs"/>). Invalid values throw <see cref="ArgumentException"/>.
+    /// </summary>
+    public IDictionary<string, string?> Args { get; } = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// Measures the initial render's allocations and the wall-clock time of render + play, excluding harness setup.
+/// Allocations stop at the end of the first render because play-script assertions (DOM queries) would dwarf the
+/// component's own allocations; the cost of interactions is tracked through render counts and time.
+/// Allocations are counted on the rendering thread only: bUnit renders synchronously on the caller's thread, and a
+/// process-wide counter would also count whatever runs in parallel (other tests, an in-process web host, browsers).
+/// </summary>
+internal sealed class RenderMeasurement
+{
+    private readonly System.Diagnostics.Stopwatch _clock = new();
+    private long _allocatedBefore;
+    private long? _renderAllocations;
+    private int _thread;
+
+    public void Start()
+    {
+        _thread = Environment.CurrentManagedThreadId;
+        _allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        _clock.Restart();
+    }
+
+    public void Rendered()
+    {
+        if (_renderAllocations is null)
+        {
+            if (Environment.CurrentManagedThreadId != _thread)
+            {
+                throw new InvalidOperationException("Render allocations must be measured on the thread that started the render.");
+            }
+
+            _renderAllocations = GC.GetAllocatedBytesForCurrentThread() - _allocatedBefore;
+        }
+    }
+
+    public (double Milliseconds, long AllocatedBytes) Stop()
+    {
+        _clock.Stop();
+        Rendered();
+        return (_clock.Elapsed.TotalMilliseconds, _renderAllocations!.Value);
+    }
+}
+
+/// <summary>
+/// A story rendered with bUnit. Gives direct access to the bUnit context and rendered tree for custom assertions,
+/// on top of the driver-agnostic <see cref="StoryContext"/>.
+/// </summary>
+public sealed class BunitStorySession : IAsyncDisposable
+{
+    // The settings the session was started with: its default accessibility policy comes from them, not from the
+    // process-wide BtpSettings.Current.
+    private readonly BtpSettings _settings;
+
+    private BunitStorySession(Story story, BunitContext context, IRenderedComponent<StoryRoot> root, StoryRenderContext renderContext, BunitStoryDriver driver, StoryContext storyContext, BtpSettings settings)
+    {
+        _settings = settings;
+        Story = story;
+        Context = context;
+        Root = root;
+        RenderContext = renderContext;
+        Driver = driver;
+        StoryContext = storyContext;
+    }
+
+    /// <summary>The story.</summary>
+    public Story Story { get; }
+
+    /// <summary>The bUnit context (services, JS interop...).</summary>
+    public BunitContext Context { get; }
+
+    /// <summary>The rendered story root.</summary>
+    public IRenderedComponent<StoryRoot> Root { get; }
+
+    /// <summary>The render context (actions, bound values...).</summary>
+    public StoryRenderContext RenderContext { get; }
+
+    /// <summary>The in-memory driver.</summary>
+    public BunitStoryDriver Driver { get; }
+
+    /// <summary>The play-function API (also usable directly from tests).</summary>
+    public StoryContext StoryContext { get; }
+
+    /// <summary>Current markup.</summary>
+    public string Markup => Root.Markup;
+
+    /// <summary>Recorded actions.</summary>
+    public ActionLog Actions => RenderContext.Actions;
+
+    /// <summary>Renders a story.</summary>
+    public static Task<BunitStorySession> StartAsync(Story story, BunitStoryOptions? options = null, StepRecorder? recorder = null, CancellationToken cancellationToken = default) =>
+        StartAsync(story, options, recorder, measurement: null, cancellationToken);
+
+    internal static async Task<BunitStorySession> StartAsync(Story story, BunitStoryOptions? options, StepRecorder? recorder, RenderMeasurement? measurement, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(story);
+        options ??= new BunitStoryOptions();
+        var settings = options.Settings ?? BtpSettings.Current;
+        if (story.CultureUnder(options.Theme) is { } culture)
+        {
+            // Covers the first render; BunitStoryRunner sets it for the whole run (render and play).
+            System.Globalization.CultureInfo.CurrentCulture = System.Globalization.CultureInfo.CurrentUICulture = System.Globalization.CultureInfo.GetCultureInfo(culture);
+        }
+
+        var context = new BunitContext();
+        try
+        {
+            context.JSInterop.Mode = options.JSInteropMode;
+            if (story.JSInterop is { } jsMocks)
+            {
+                JSInteropMockAdapter.Apply(context.JSInterop, jsMocks);
+
+                // bUnit answers the mocks; the decorator records calls in order (with their module) for ExpectJSCall.
+                var jsCalls = new JSCallLog();
+                context.Services.AddSingleton(jsCalls);
+                context.Services.AddSingleton(StoryJSRuntime.Create(context.JSInterop.JSRuntime, jsMocks, jsCalls, JSMockMode.AnsweredByInner));
+            }
+
+            var viewport = options.Viewport ?? settings.BunitViewport ?? Viewport.Desktop;
+            var args = StoryArgs.Resolve(story, options.Args.AsReadOnly(), fromLink: false);
+            if (args.Errors.Count > 0)
+            {
+                throw new ArgumentException($"Invalid args for story '{story.Id}': {string.Join(" ", args.Errors)}", nameof(options));
+            }
+
+            var renderContext = new StoryRenderContext(story, context.Services, HostingModel.InMemory) { Viewport = viewport, Theme = options.Theme, ArgOverrides = args.Values };
+            var fixtureContext = new FixtureContext(story, HostingModel.InMemory);
+
+            if (renderContext.Authentication is { } authentication)
+            {
+                // Replace bUnit's authorization placeholders with the real authorization services so roles,
+                // claims and policies evaluate against the fake user's ClaimsPrincipal.
+                context.Services.RemoveAll<Microsoft.AspNetCore.Authorization.IAuthorizationService>();
+                context.Services.RemoveAll<Microsoft.AspNetCore.Authorization.IAuthorizationPolicyProvider>();
+                context.Services.RemoveAll<AuthenticationStateProvider>();
+                context.Services.AddAuthorizationCore();
+                context.Services.AddSingleton<AuthenticationStateProvider>(authentication);
+                context.Services.AddSingleton(authentication);
+            }
+
+            story.ConfigureServices(context.Services, fixtureContext, story.TimeZoneUnder(options.Theme));
+            options.ConfigureContext?.Invoke(context);
+            await story.InitializeFixturesAsync(context.Services, fixtureContext).ConfigureAwait(false);
+
+            // Build the service provider and renderer up front so measurements only see the component's own work.
+            // (Setting the renderer info creates the renderer, so it comes after every service registration.)
+            context.SetRendererInfo(options.RendererInfo ?? throw new ArgumentException("RendererInfo cannot be null.", nameof(options)));
+
+            // Every navigation the story asks for, in order, external and replaced ones included (the driver adds the
+            // options bUnit's NavigationManager kept in its history).
+            var navigation = context.Services.GetRequiredService<NavigationManager>();
+            _ = navigation.RegisterLocationChangingHandler(change =>
+            {
+                renderContext.Navigations.Add(navigation.ToAbsoluteUri(change.TargetLocation).ToString(), navigation.BaseUri, isLinkClick: change.IsNavigationIntercepted);
+                return ValueTask.CompletedTask;
+            });
+            IRenderedComponent<StoryRoot>? root = null;
+            var recorderToUse = recorder ?? new StepRecorder();
+            await recorderToUse.RunAsync($"render {story.Id}", StepKind.Render, () =>
+            {
+                measurement?.Start();
+                root = context.Render<StoryRoot>(p => p.Add(r => r.Context, renderContext));
+                measurement?.Rendered();
+                return Task.CompletedTask;
+            }).ConfigureAwait(false);
+
+            if (options.RecordStepMarkup)
+            {
+                var rendered = root!;
+                recorderToUse.CaptureMarkup = () => rendered.Markup;
+            }
+
+            var driver = new BunitStoryDriver(context, root!, renderContext, StylesheetCache.Resolve(options.Stylesheets, settings.BunitStylesheets, MediaEnvironment.For(viewport, options.Theme)));
+            var storyContext = new StoryContext(story, driver, settings.DefaultTimeout, recorderToUse, cancellationToken)
+            {
+                AccessibilityPolicy = options.AccessibilityPolicy ?? settings.Accessibility,
+                ActionTimeout = settings.ActionTimeout,
+                Settings = settings,
+
+                // Runs with a viewport, a theme or arg overrides may render differently (components read the viewport from
+                // the render context): their markup snapshots get their own files.
+                SnapshotVariant = string.Join('.', new[] { options.Viewport?.Name, options.Theme?.Name, BunitStoryRunner.ArgsKey(options.Args) }.Where(p => !string.IsNullOrEmpty(p))) is { Length: > 0 } variant ? variant : null,
+            };
+            return new BunitStorySession(story, context, root!, renderContext, driver, storyContext, settings);
+        }
+        catch
+        {
+            await context.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Runs the story's play function, then waits until renders settle. Stories without one still settle, so checks
+    /// that follow (markup rules, captured markup) see the state after initial asynchronous work, not the first frame.
+    /// </summary>
+    public async Task PlayAsync()
+    {
+        if (Story.Play is not null)
+        {
+            await StoryContext.Recorder.RunAsync("play", StepKind.Step, StoryContext.RunPlayAsync).ConfigureAwait(false);
+        }
+
+        await Driver.WaitForIdleAsync(StoryContext.CancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// An exception a component threw that the renderer caught outside any error boundary (for example after an
+    /// <c>await</c> in <c>OnInitializedAsync</c>), or null. In a browser it would show the Blazor error UI.
+    /// </summary>
+    public Exception? UnhandledException =>
+        Context.Renderer.UnhandledException is { IsCompletedSuccessfully: true } unhandled ? unhandled.Result : null;
+
+    /// <summary>Runs static accessibility rules on the current markup.</summary>
+    public AccessibilityReport AnalyzeAccessibility(AccessibilityPolicy? policy = null) =>
+        new MarkupAccessibilityAnalyzer().Analyze(Driver.Scope(), policy ?? _settings.Accessibility, Story.Accessibility);
+
+    /// <summary>Throws <see cref="AccessibilityViolationException"/> when the policy fails.</summary>
+    public void AssertAccessible(AccessibilityPolicy? policy = null)
+    {
+        policy ??= _settings.Accessibility;
+        var evaluation = policy.Evaluate(AnalyzeAccessibility(policy), Story.Id, Story.Accessibility);
+        if (!evaluation.Passed)
+        {
+            throw new AccessibilityViolationException(evaluation, Story.Id);
+        }
+    }
+
+    /// <summary>Render counts of the current tree (no timing/allocation data).</summary>
+    public RenderMetrics CaptureRenderCounts()
+    {
+        var components = Root.FindComponents<IComponent>();
+        var byType = new Dictionary<string, int>(StringComparer.Ordinal);
+        var rootRenders = 0;
+        var total = 0;
+        foreach (var component in components)
+        {
+            var type = component.Instance.GetType();
+            total += component.RenderCount;
+            byType[type.FullName ?? type.Name] = byType.GetValueOrDefault(type.FullName ?? type.Name) + component.RenderCount;
+            if (rootRenders == 0 && type == Story.ComponentType)
+            {
+                rootRenders = component.RenderCount;
+            }
+        }
+
+        return new RenderMetrics
+        {
+            RootRenderCount = rootRenders,
+            TotalRenderCount = total,
+            ComponentCount = components.Count,
+            RendersByComponent = byType,
+            Iterations = 1,
+        };
+    }
+
+    private LeakCheck? _leakCheck;
+
+    /// <summary>
+    /// Records the components the story shows (now, after every action and before disposal) and what they hold, so
+    /// <see cref="Leaks"/> can be computed after <see cref="DisposeAsync"/>.
+    /// </summary>
+    internal bool TrackLeaks
+    {
+        get => _leakCheck is not null;
+        set
+        {
+            if (value && _leakCheck is null)
+            {
+                var check = new LeakCheck(Context);
+                check.Observe(Root);
+                Driver.Settled = () => check.Observe(Root);
+                _leakCheck = check;
+            }
+        }
+    }
+
+    /// <summary>
+    /// With <see cref="TrackLeaks"/>, after <see cref="DisposeAsync"/>: what the disposed components left behind (see
+    /// <see cref="BunitStoryOptions.DetectLeaks"/>). Empty otherwise.
+    /// </summary>
+    internal IReadOnlyList<string> Leaks { get; private set; } = [];
+
+    /// <inheritdoc />
+    public async ValueTask DisposeAsync()
+    {
+        // Steps after the session (checks on the result) have no DOM to show.
+        StoryContext.Recorder.CaptureMarkup = null;
+        var leaks = _leakCheck;
+        if (leaks is not null)
+        {
+            Driver.Settled = null;
+            leaks.Observe(Root);
+            leaks.CaptureReferences();
+        }
+
+        await Driver.DisposeAsync().ConfigureAwait(false);
+        await Context.DisposeAsync().ConfigureAwait(false);
+        Leaks = leaks?.Find() ?? [];
+    }
+}

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Not xUnit: tests/Directory.Build.props leaves out its xUnit packages. -->
+    <BtpTestFramework>nunit</BtpTestFramework>
+    <EnableNUnitRunner>true</EnableNUnitRunner>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The package is built against NUnit 4 (its lowest supported version); the tests run it on the newest major. -->
+    <PackageReference Include="NUnit" VersionOverride="5.0.0" />
+    <PackageReference Include="NUnit3TestAdapter" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BlazorTestPlatform.NUnit\BlazorTestPlatform.NUnit.csproj" />
+    <ProjectReference Include="..\..\src\BlazorTestPlatform.Bunit\BlazorTestPlatform.Bunit.csproj" />
+    <Compile Include="..\Shared\FrameworkStories.cs" Link="FrameworkStories.cs" />
+  </ItemGroup>
+
+</Project>
