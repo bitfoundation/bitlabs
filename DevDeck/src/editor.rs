@@ -1322,6 +1322,9 @@ impl App {
                 if from < to {
                     g.text_cells(x0 + from as i32 * mw, y + self.s(1), &cells[from..to], mw, self.fonts.mono, self.t.fg, &clip);
                 }
+                if let Some(l) = self.link.filter(|l| l.at == crate::link::At::Editor && l.line == li) {
+                    g.hline((x0 + vcol(line, l.s) as i32 * mw).max(clip.left), (x0 + vcol(line, l.e) as i32 * mw).min(clip.right), y + lh - 2, self.t.fg);
+                }
                 if focused && caret_seg == Some(k) {
                     caret = Some((x0 + vcol(line, cur.1) as i32 * mw, y, clip));
                 }

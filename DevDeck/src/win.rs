@@ -100,6 +100,7 @@ pub struct Fonts {
     pub cap: HFONT,
     pub mono_small: HFONT,
     pub mono_small_h: i32,
+    pub mono_small_w: i32,
     pub mono_w: i32,
     pub mono_h: i32,
 }
@@ -109,20 +110,22 @@ impl Fonts {
         let s = |v: f32| (v * scale).round() as i32;
         let icon_face = if font_exists("Segoe Fluent Icons") { "Segoe Fluent Icons" } else { "Segoe MDL2 Assets" };
         let mono = create_font(s(14.0), 400, "Consolas");
-        let (mono_w, mono_h) = unsafe {
+        let mono_small = create_font(s(12.0), 400, "Consolas");
+        let metrics = |f: HFONT| unsafe {
             let dc = GetDC(null_mut());
-            let old = SelectObject(dc, mono as HGDIOBJ);
+            let old = SelectObject(dc, f as HGDIOBJ);
             let mut tm: TEXTMETRICW = std::mem::zeroed();
             GetTextMetricsW(dc, &mut tm);
             SelectObject(dc, old);
             ReleaseDC(null_mut(), dc);
             (tm.tmAveCharWidth, tm.tmHeight)
         };
-        let mono_small = create_font(s(12.0), 400, "Consolas");
+        let (mono_w, mono_h) = metrics(mono);
         Fonts {
             cap: create_font(s(11.0), 400, "Segoe UI"),
             mono_small,
             mono_small_h: s(17.0),
+            mono_small_w: metrics(mono_small).0,
             ui: create_font(s(13.0), 400, "Segoe UI"),
             ui_italic: create_font_ex(s(13.0), 400, true, "Segoe UI"),
             ui_bold: create_font(s(13.0), 700, "Segoe UI"),

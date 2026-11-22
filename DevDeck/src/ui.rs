@@ -1737,6 +1737,10 @@ impl App {
                                     g.fill(&r, sel_bg);
                                 }
                             }
+                            if let Some(l) = self.link.filter(|l| l.at == crate::link::At::Diff(sd) && l.line == i) {
+                                let (c0, c1) = (crate::editor::vcol(t, l.s) as i32, crate::editor::vcol(t, l.e) as i32);
+                                g.hline((tx + c0 * mw).max(clip.left), (tx + c1 * mw).min(clip.right), ry + lh - 2, self.t.fg);
+                            }
                             if cols.is_some() {
                                 let to = sg.ve.min(cells.len());
                                 if sg.vs < to {
@@ -2039,6 +2043,10 @@ impl App {
             let is_err = !line.contains(" > git ");
             let ws = win::w(line);
             g.text_clip(body.left + self.s(20), y, &ws, self.fonts.mono_small, if is_err { self.t.fg_dim } else { self.t.fg }, &body);
+            if let Some(l) = self.link.filter(|l| l.at == crate::link::At::Output && l.line == first + k) {
+                let (x0, mw) = (body.left + self.s(20), self.fonts.mono_small_w);
+                g.hline(x0 + l.s as i32 * mw, x0 + l.e as i32 * mw, y + self.s(14), self.t.fg);
+            }
         }
         g.unclip(saved);
         self.draw_scrollbar(g, Area::Output);
@@ -2463,6 +2471,7 @@ impl App {
         }
         let h = self.hit_test(x, y);
         self.set_hover(h);
+        self.hover_link(x, y);
     }
 
     /// Tab drag: once the mouse moved a few pixels, the dragged tab trades places with the
@@ -2834,6 +2843,9 @@ impl App {
     }
 
     pub fn cursor_for(&self, x: i32, y: i32) -> Option<windows_sys::core::PCWSTR> {
+        if self.link.is_some() {
+            return Some(IDC_HAND);
+        }
         match self.hit_test(x, y) {
             Hit::Sash(Sash::Sidebar) => Some(IDC_SIZEWE),
             Hit::Sash(_) => Some(IDC_SIZENS),
@@ -3055,6 +3067,10 @@ impl App {
                 SetFocus(self.hwnd);
             }
             SetCapture(self.hwnd);
+        }
+        // Ctrl+click on a link (terminal, editor, diff, Output) follows it
+        if ctrl && self.follow_link(hit, x, y) {
+            return;
         }
         match hit {
             Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose => unsafe {

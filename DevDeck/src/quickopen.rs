@@ -435,7 +435,12 @@ impl App {
             }
             return;
         }
-        let rel = it.data.clone();
+        self.open_file_at(it.data.clone(), line);
+    }
+
+    /// Opens file `rel` in a kept-open tab with the keyboard in it, at `line` (1-based line
+    /// and column) when given.
+    pub fn open_file_at(&mut self, rel: String, line: Option<(usize, Option<usize>)>) {
         self.open_file_viewer(rel.clone(), true);
         self.focus = Focus::Main;
         self.sync_term_focus();

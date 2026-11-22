@@ -620,6 +620,8 @@ pub struct App {
     pub toasts: Vec<Toast>,
     pub hits: Vec<(RECT, Hit)>,
     pub hover: Hit,
+    /// Link under the pointer while Ctrl is held (underlined; Ctrl+click opens it).
+    pub link: Option<crate::link::Link>,
     pub drag: Option<Drag>,
     pub focus: Focus,
     pub commit_edit: HWND,
@@ -782,6 +784,7 @@ impl App {
             toasts: Vec::new(),
             hits: Vec::new(),
             hover: Hit::None,
+            link: None,
             tip: None,
             tip_bounds: None,
             drag: None,

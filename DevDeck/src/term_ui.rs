@@ -942,6 +942,10 @@ impl App {
                 }
             }
         }
+        // the link under the pointer while Ctrl is held
+        if let Some(l) = self.link.filter(|l| l.at == crate::link::At::Term(t.id) && l.line >= top && l.line < top + sc.rows) {
+            g.hline(r.left + l.s as i32 * cw, r.left + l.e as i32 * cw, r.top + (l.line - top) as i32 * chh + chh - 2, self.t.fg);
+        }
         // cursor
         if sc.cursor_visible && scroll == 0 && t.exited.is_none() {
             let x = r.left + sc.cx as i32 * cw;

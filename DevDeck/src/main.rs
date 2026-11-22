@@ -14,6 +14,7 @@ mod find;
 mod fuzzy;
 mod git;
 mod graph;
+mod link;
 mod quickopen;
 mod search;
 mod settings;
@@ -486,7 +487,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_MOUSELEAVE => {
-            with_app(hwnd, |a| a.set_hover(app::Hit::None));
+            with_app(hwnd, |a| {
+                a.set_hover(app::Hit::None);
+                a.hover_link(-1, -1);
+            });
             0
         }
         WM_SETCURSOR => {
@@ -533,9 +537,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(hwnd, |a| a.on_wheel(p.x, p.y, delta, horizontal));
             0
         }
+        WM_KEYUP if wp as u16 == VK_CONTROL => {
+            with_app(hwnd, |a| a.ctrl_changed());
+            0
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = wp as u16;
             let (ctrl, shift) = (key_down(VK_CONTROL), key_down(VK_SHIFT));
+            // Ctrl underlines the link under the pointer (lp bit 30: not a key repeat)
+            if vk == VK_CONTROL && lp & (1 << 30) == 0 {
+                with_app(hwnd, |a| a.ctrl_changed());
+            }
             if msg == WM_SYSKEYDOWN {
                 // Alt+C / W / R / P / L toggle the find widget's options, also from the editor;
                 // Alt+Z toggles word wrap
