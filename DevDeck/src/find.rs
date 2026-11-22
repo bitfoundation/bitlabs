@@ -2144,9 +2144,14 @@ impl App {
         }
     }
 
-    /// Alt shortcuts of the editor area: Alt+Z (word wrap), and the find widget's options
-    /// while the editor or the widget has the keyboard.
+    /// Alt shortcuts of the editor area: Alt+Z (word wrap), Alt+Shift+R (reveal the active
+    /// file in the Explorer), and the find widget's options while the editor or the widget
+    /// has the keyboard.
     pub fn alt_key(&mut self, vk: u16) -> bool {
+        if vk == 0x52 && crate::key_down(VK_SHIFT) && !crate::key_down(VK_CONTROL) {
+            self.exec(Cmd::RevealInExplorer);
+            return true;
+        }
         if vk == 0x5A && matches!(self.view, MainView::File(_) | MainView::Diff(_)) {
             self.toggle_word_wrap();
             return true;

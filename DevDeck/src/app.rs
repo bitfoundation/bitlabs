@@ -498,6 +498,7 @@ cmds! {
     Clone => "Git: Clone", "";
     Init => "Git: Initialize Repository", "";
     OpenExplorer => "File: Reveal Repository in File Explorer", "";
+    RevealInExplorer => "File: Reveal Active File in Explorer View", "Alt+Shift+R";
     OpenTerminal => "Terminal: Open External Terminal", "Ctrl+Shift+C";
     ToggleTerminal => "View: Toggle Terminal", "Ctrl+`";
     NewTerminal => "Terminal: Create New Terminal", "Ctrl+Alt+`";
@@ -2617,7 +2618,7 @@ impl App {
     pub fn exec(&mut self, c: Cmd) {
         let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal | Cmd::Find | Cmd::Replace | Cmd::FindNext | Cmd::FindPrev | Cmd::FindNextSel | Cmd::FindPrevSel | Cmd::ReplaceAll | Cmd::ToggleWordWrap);
         // the Explorer and the editor work in a folder without a repository too
-        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew | Cmd::FindInFiles | Cmd::ReplaceInFiles | Cmd::ClearSearch);
+        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::RevealInExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew | Cmd::FindInFiles | Cmd::ReplaceInFiles | Cmd::ClearSearch);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
             self.info("There are no available repositories. Open a folder first.");
             return;
@@ -2689,6 +2690,10 @@ impl App {
                     win::shell_open(&r.display().to_string());
                 }
             }
+            Cmd::RevealInExplorer => match self.tab_reveal_path(self.tab_active) {
+                Some(p) => self.reveal_in_explorer(&p),
+                None => self.info("There is no file in the active editor to reveal."),
+            },
             Cmd::OpenTerminal => {
                 if let Some(r) = self.folder() {
                     let d = r.display().to_string();

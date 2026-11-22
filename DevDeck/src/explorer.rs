@@ -434,6 +434,34 @@ impl App {
         }
     }
 
+    /// "Reveal in Explorer" of an editor tab (Alt+Shift+R for the active one): shows the
+    /// Explorer, selects file `rel` in it and gives it the keyboard.
+    pub fn reveal_in_explorer(&mut self, rel: &str) {
+        if rel.is_empty() || self.folder().is_none() {
+            return;
+        }
+        if !self.explorer_active() {
+            self.set_side_view(1);
+        }
+        self.explorer_reveal(rel);
+        self.focus = Focus::Explorer;
+        unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.hwnd);
+        }
+        self.invalidate();
+    }
+
+    /// The file of editor tab `i` (a file or diff view), when it is on disk: what
+    /// "Reveal in Explorer" can show.
+    pub fn tab_reveal_path(&self, i: usize) -> Option<String> {
+        let p = match self.tabs.get(i).map(|_| self.tab_view(i)) {
+            Some(MainView::Diff(d)) => d.path.clone(),
+            Some(MainView::File(f)) => f.path.clone(),
+            _ => return None,
+        };
+        (!p.is_empty() && self.folder()?.join(&p).is_file()).then_some(p)
+    }
+
     /// "New File..." / "New Folder..." in the folder of row `i`. Like VS Code, a name with
     /// '/' creates the folders in between.
     pub fn explorer_new(&mut self, i: usize, folder: bool) {

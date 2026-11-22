@@ -930,6 +930,10 @@ impl App {
                 self.search_focus_results();
                 true
             }
+            0x52 if alt && shift && !ctrl => {
+                self.exec(Cmd::RevealInExplorer);
+                true
+            }
             0x43 | 0x57 | 0x52 | 0x50 if alt && !ctrl => self.search_alt_key(vk),
             0x41 if ctrl && !shift && !alt => {
                 let h = if repl { self.srch.repl_edit } else { self.srch.find_edit };
