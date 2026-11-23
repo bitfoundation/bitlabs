@@ -434,33 +434,86 @@ pub fn reveal(path: &str) {
     shell_exec("explorer.exe", &format!("/select,\"{}\"", path), "");
 }
 
+/// Modern Explorer-style folder picker (IFileOpenDialog with FOS_PICKFOLDERS).
+/// windows-sys has no COM interface bindings, so the vtables are declared by hand
+/// (only the slots up to the ones used; the order must match ShObjIdl_core.h).
 pub fn pick_folder(hwnd: HWND, title: &str) -> Option<String> {
+    use windows_sys::core::{GUID, HRESULT, PWSTR};
+    use windows_sys::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+
+    type Unk = unsafe extern "system" fn(*mut c_void) -> u32;
+    #[repr(C)]
+    struct FileDialogVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: Unk,
+        show: unsafe extern "system" fn(*mut c_void, HWND) -> HRESULT,
+        set_file_types: usize,
+        set_file_type_index: usize,
+        get_file_type_index: usize,
+        advise: usize,
+        unadvise: usize,
+        set_options: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT,
+        get_options: unsafe extern "system" fn(*mut c_void, *mut u32) -> HRESULT,
+        set_default_folder: usize,
+        set_folder: usize,
+        get_folder: usize,
+        get_current_selection: usize,
+        set_file_name: usize,
+        get_file_name: usize,
+        set_title: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT,
+        set_ok_button_label: usize,
+        set_file_name_label: usize,
+        get_result: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT,
+    }
+    #[repr(C)]
+    struct ShellItemVtbl {
+        query_interface: usize,
+        add_ref: usize,
+        release: Unk,
+        bind_to_handler: usize,
+        get_parent: usize,
+        get_display_name: unsafe extern "system" fn(*mut c_void, i32, *mut PWSTR) -> HRESULT,
+    }
+
+    const CLSID_FILE_OPEN_DIALOG: GUID = GUID::from_u128(0xdc1c5a9c_e88a_4dde_a5a1_60f82a20aef7);
+    const IID_IFILE_OPEN_DIALOG: GUID = GUID::from_u128(0xd57c7288_d4ad_4768_be02_9d969532d960);
+    const FOS_PICKFOLDERS: u32 = 0x20;
+    const FOS_FORCEFILESYSTEM: u32 = 0x40;
+    const FOS_PATHMUSTEXIST: u32 = 0x800;
+    const SIGDN_FILESYSPATH: i32 = 0x8005_8000u32 as i32;
+
     let t = wz(title);
-    let mut buf = [0u16; 1024];
     unsafe {
-        let _ = windows_sys::Win32::System::Com::CoInitializeEx(null(), 2 /* COINIT_APARTMENTTHREADED */);
-        let bi = BROWSEINFOW {
-            hwndOwner: hwnd,
-            pidlRoot: null_mut(),
-            pszDisplayName: buf.as_mut_ptr(),
-            lpszTitle: t.as_ptr(),
-            ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE,
-            lpfn: None,
-            lParam: 0,
-            iImage: 0,
-        };
-        let pidl = SHBrowseForFolderW(&bi);
-        if pidl.is_null() {
+        let _ = CoInitializeEx(null(), 2 /* COINIT_APARTMENTTHREADED */);
+        let mut dlg: *mut c_void = null_mut();
+        if CoCreateInstance(&CLSID_FILE_OPEN_DIALOG, null_mut(), CLSCTX_INPROC_SERVER, &IID_IFILE_OPEN_DIALOG, &mut dlg) < 0 || dlg.is_null() {
             return None;
         }
-        let mut path = [0u16; 1024];
-        let ok = SHGetPathFromIDListW(pidl, path.as_mut_ptr());
-        windows_sys::Win32::System::Com::CoTaskMemFree(pidl as *const c_void);
-        if ok == 0 {
-            return None;
+        let vt = &**(dlg as *mut *const FileDialogVtbl);
+        let mut opts = 0u32;
+        (vt.get_options)(dlg, &mut opts);
+        (vt.set_options)(dlg, opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+        (vt.set_title)(dlg, t.as_ptr());
+        let mut out = None;
+        if (vt.show)(dlg, hwnd) >= 0 {
+            let mut item: *mut c_void = null_mut();
+            if (vt.get_result)(dlg, &mut item) >= 0 && !item.is_null() {
+                let ivt = &**(item as *mut *const ShellItemVtbl);
+                let mut p: PWSTR = null_mut();
+                if (ivt.get_display_name)(item, SIGDN_FILESYSPATH, &mut p) >= 0 && !p.is_null() {
+                    let mut n = 0;
+                    while *p.add(n) != 0 {
+                        n += 1;
+                    }
+                    out = Some(String::from_utf16_lossy(std::slice::from_raw_parts(p, n)));
+                    CoTaskMemFree(p as *const c_void);
+                }
+                (ivt.release)(item);
+            }
         }
-        let len = path.iter().position(|&c| c == 0).unwrap_or(0);
-        Some(String::from_utf16_lossy(&path[..len]))
+        (vt.release)(dlg);
+        out
     }
 }
 
