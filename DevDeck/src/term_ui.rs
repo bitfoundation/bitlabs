@@ -484,14 +484,14 @@ impl App {
         }
     }
 
-    /// "Claude Code: Open": focuses the running Claude Code session (the
+    /// "Claude Code: Open" / "Codex: Open": focuses the agent's running session (the
     /// terminal tab used last first, then any other, in the editor area or the panel), else
     /// starts one in an editor tab in the open folder.
-    pub fn open_claude(&mut self) {
-        let running = |t: &TermSession| t.shell.name == term::CLAUDE && t.exited.is_none();
+    pub fn open_agent(&mut self, agent: &term::Agent) {
+        let running = |t: &TermSession| t.shell.name == agent.name && t.exited.is_none();
         let last = self.term_editor_last.and_then(|id| self.term_index(id)).filter(|&i| running(&self.terms[i]));
         let Some(i) = last.or_else(|| self.terms.iter().position(running)) else {
-            self.new_claude_session();
+            self.new_agent_session(agent);
             return;
         };
         if !self.terms[i].editor {
@@ -502,11 +502,12 @@ impl App {
         self.invalidate();
     }
 
-    /// Ctrl+Shift+A, "Claude Code: New Session": starts Claude Code in a new editor tab.
-    pub fn new_claude_session(&mut self) {
-        match term::find_claude() {
+    /// Ctrl+Shift+A "Claude Code: New Session", Ctrl+Shift+O "Codex: New Session": starts the
+    /// agent in a new editor tab.
+    pub fn new_agent_session(&mut self, agent: &term::Agent) {
+        match agent.find() {
             Some(shell) => self.new_editor_terminal(Some(shell)),
-            None => self.info("Claude Code is not installed. Install it from https://claude.com/claude-code and try again."),
+            None => self.info(&format!("{} is not installed. Install it from {} and try again.", agent.name, agent.url)),
         }
     }
 
@@ -698,6 +699,7 @@ impl App {
             (0x46, true, true) => Some(Cmd::FindInFiles),
             (0x48, true, true) => Some(Cmd::ReplaceInFiles),
             (0x41, true, true) => Some(Cmd::ClaudeNew),
+            (0x4F, true, true) => Some(Cmd::CodexNew),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),
             // Ctrl+W / Ctrl+F4 close a terminal tab like any other tab
@@ -728,10 +730,11 @@ impl App {
         }
         // xterm keys the character messages cannot tell apart
         let seq: Option<&[u8]> = match vk {
-            // Shift+Tab: back-tab (Claude Code mode cycling, PSReadLine completion)
+            // Shift+Tab: back-tab (Claude Code / Codex mode cycling, PSReadLine completion)
             0x09 if shift && !ctrl => Some(b"\x1b[Z"),
             // Shift+Enter: a new line in the prompt, as Claude Code's /terminal-setup binds it
-            0x0D if shift && !ctrl && !alt && self.term().is_some_and(|t| t.shell.name == term::CLAUDE) => Some(b"\x1b\r"),
+            // (Codex reads it as Alt+Enter, which inserts a new line there too)
+            0x0D if shift && !ctrl && !alt && self.term().is_some_and(|t| term::is_agent(&t.shell.name)) => Some(b"\x1b\r"),
             0x20 if ctrl && !shift && !alt => Some(b"\0"),
             _ => None,
         };
