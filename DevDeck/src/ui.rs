@@ -28,6 +28,7 @@ const I_UP_ARROW: char = '\u{E74A}';
 const I_DOWN_ARROW: char = '\u{E74B}';
 const I_BACK: char = '\u{E72B}';
 const I_CLOSE: char = '\u{E711}';
+const I_COPY: char = '\u{E8C8}';
 const I_INFO: char = '\u{E946}';
 const I_WARN: char = '\u{E7BA}';
 const I_ERROR: char = '\u{E783}';
@@ -2151,34 +2152,121 @@ impl App {
 
     fn paint_toasts(&mut self, g: &Gfx) {
         let c = self.client();
-        let w = self.s(420).min(rw(&c) - self.s(20));
         let mut y = self.l.status.top - self.s(10);
-        let toasts: Vec<(ToastKind, String)> = self.toasts.iter().map(|t| (t.kind, t.message.clone())).collect();
-        for (i, (kind, msg)) in toasts.iter().enumerate().rev() {
+        let toasts: Vec<Toast> = self.toasts.clone();
+        for (i, t) in toasts.iter().enumerate().rev() {
+            let interactive = t.code.is_some() || t.link.is_some() || !t.actions.is_empty();
+            let w = self.s(if interactive { 480 } else { 420 }).min(rw(&c) - self.s(20));
             let x = rw(&c) - w - self.s(10);
-            let tr = rect(x + self.s(36), 0, x + w - self.s(36), 1000);
-            let th = g.text_height(&tr, msg, self.fonts.ui, DT_WORDBREAK | DT_NOPREFIX).max(self.s(20));
-            let extra = if *kind == ToastKind::Error { self.s(26) } else { 0 };
-            let hgt = th + self.s(22) + extra;
+            // content column: right of the kind icon, left of the close button
+            let (cl, cr) = (x + self.s(36), x + w - self.s(36));
+            let th = g.text_height(&rect(cl, 0, cr, 1000), &t.message, self.fonts.ui, DT_WORDBREAK | DT_NOPREFIX).max(self.s(20));
+            let code_h = self.fonts.mono_h + self.s(12);
+            let link_h = self.s(18);
+            // buttons: "Open Git Log" for errors, else the toast's actions
+            let buttons: Vec<(String, Hit)> = if t.kind == ToastKind::Error {
+                vec![("Open Git Log".into(), Hit::ToastOutput)]
+            } else {
+                t.actions
+                    .iter()
+                    .enumerate()
+                    .map(|(k, a)| {
+                        let done = matches!(&a.act, ToastAct::Copy(s) if t.copied.as_ref() == Some(s));
+                        (if done { "Copied".into() } else { a.label.clone() }, Hit::ToastAct(i, k as u8))
+                    })
+                    .collect()
+            };
+            let mut hgt = self.s(11) + th + self.s(11);
+            if t.code.is_some() {
+                hgt += self.s(8) + code_h;
+            }
+            if t.link.is_some() {
+                hgt += self.s(6) + link_h;
+            }
+            if !buttons.is_empty() {
+                hgt += self.s(26);
+            }
             let box_ = rect(x, y - hgt, x + w, y);
             g.round_rect(&box_, self.s(6), self.t.widget_bg, Some(self.t.widget_border));
-            let (glyph, color) = match kind {
+            self.hits.push((box_, Hit::ToastBody(i)));
+            let (glyph, color) = match t.kind {
                 ToastKind::Info => (I_INFO, self.t.info),
                 ToastKind::Warning => (I_WARN, self.t.warning),
                 ToastKind::Error => (I_ERROR, self.t.error),
             };
             g.icon(&xywh(x + self.s(8), box_.top + self.s(10), self.s(20), self.s(20)), glyph, self.fonts.icon, color);
-            g.text_in(&rect(x + self.s(36), box_.top + self.s(11), x + w - self.s(36), box_.top + self.s(11) + th), msg, self.fonts.ui, self.t.fg, DT_WORDBREAK | DT_NOPREFIX);
+            let mut cy = box_.top + self.s(11);
+            g.text_in(&rect(cl, cy, cr, cy + th), &t.message, self.fonts.ui, self.t.fg, DT_WORDBREAK | DT_NOPREFIX);
+            cy += th;
             self.icon_button(g, xywh(x + w - self.s(30), box_.top + self.s(8), self.s(22), self.s(22)), I_CLOSE, Hit::ToastClose(i), true);
-            if *kind == ToastKind::Error {
-                let lbl = "Open Git Log";
+            // the command, in a box that copies it when clicked
+            if let Some(code) = &t.code {
+                cy += self.s(8);
+                let b = rect(cl, cy, x + w - self.s(10), cy + code_h);
+                let hot = self.hover == Hit::ToastCode(i);
+                g.round_rect(&b, self.s(4), self.t.input_bg, Some(if hot { self.t.focus } else { self.t.input_border }));
+                let copied = t.copied.as_ref() == Some(code);
+                let ir = xywh(b.right - self.s(26), b.top + (code_h - self.s(20)) / 2, self.s(20), self.s(20));
+                g.icon(&ir, if copied { I_CHECK } else { I_COPY }, self.fonts.icon, if hot || copied { self.t.fg } else { self.t.fg_dim });
+                g.text_in(&rect(b.left + self.s(8), b.top, ir.left - self.s(4), b.bottom), code, self.fonts.mono, self.t.fg_strong, DT_LINE | DT_END_ELLIPSIS);
+                self.hits.push((b, Hit::ToastCode(i)));
+                cy = b.bottom;
+            }
+            // the download page, as a link
+            if let Some(url) = &t.link {
+                cy += self.s(6);
+                let lr = rect(cl, cy, x + w - self.s(10), cy + link_h);
+                let prefix = if t.code.is_some() { "Or download it from " } else { "" };
+                let pw = g.text_w(prefix, self.fonts.small);
+                g.text_in(&lr, prefix, self.fonts.small, self.t.fg_dim, DT_LINE);
+                let uw = g.text_w(url, self.fonts.small).min(rw(&lr) - pw);
+                let ur = rect(lr.left + pw, lr.top, lr.left + pw + uw, lr.bottom);
+                g.text_in(&ur, url, self.fonts.small, self.t.link, DT_LINE | DT_END_ELLIPSIS);
+                if self.hover == Hit::ToastLink(i) {
+                    g.hline(ur.left, ur.right, (ur.top + ur.bottom) / 2 + self.s(7), self.t.link);
+                }
+                self.hits.push((ur, Hit::ToastLink(i)));
+            }
+            // buttons, right-aligned in order; the first action is the primary one
+            let mut bx = x + w - self.s(10);
+            let by = box_.bottom - self.s(30);
+            let primary = t.kind != ToastKind::Error;
+            for (k, (lbl, hit)) in buttons.iter().enumerate().rev() {
                 let tw = g.text_w(lbl, self.fonts.small) + self.s(16);
-                let b = rect(x + w - self.s(10) - tw, box_.bottom - self.s(30), x + w - self.s(10), box_.bottom - self.s(8));
-                g.fill(&b, if self.hover == Hit::ToastOutput { self.t.button2_hover } else { self.t.button2 });
-                g.text_in(&b, lbl, self.fonts.small, self.t.fg, DT_LINE | DT_CENTER);
-                self.hits.push((b, Hit::ToastOutput));
+                let b = rect(bx - tw, by, bx, by + self.s(22));
+                let hot = self.hover == *hit;
+                if primary && k == 0 {
+                    g.round_rect(&b, self.s(3), if hot { self.t.accent_hover } else { self.t.accent }, None);
+                    g.text_in(&b, lbl, self.fonts.small, self.t.accent_fg, DT_LINE | DT_CENTER);
+                } else {
+                    g.round_rect(&b, self.s(3), if hot { self.t.button2_hover } else { self.t.button2 }, None);
+                    g.text_in(&b, lbl, self.fonts.small, self.t.fg, DT_LINE | DT_CENTER);
+                }
+                self.hits.push((b, *hit));
+                bx = b.left - self.s(6);
             }
             y = box_.top - self.s(8);
+        }
+    }
+
+    /// Runs action `k` of toast `i`.
+    fn toast_action(&mut self, i: usize, k: usize) {
+        let Some(act) = self.toasts.get(i).and_then(|t| t.actions.get(k)).map(|a| a.act.clone()) else { return };
+        match act {
+            ToastAct::Copy(s) => self.toast_copy(i, s),
+            ToastAct::Open(url) => win::shell_open(&url),
+            ToastAct::Run(shell) => {
+                self.toasts.remove(i);
+                self.new_terminal(Some(shell));
+            }
+        }
+    }
+
+    /// Copies `s` from toast `i` and shows that it did.
+    fn toast_copy(&mut self, i: usize, s: String) {
+        win::set_clipboard(self.hwnd, &s);
+        if let Some(t) = self.toasts.get_mut(i) {
+            t.copied = Some(s);
         }
     }
 
@@ -2773,6 +2861,13 @@ impl App {
             .into(),
             Hit::ToastClose(_) => "Close Notification".into(),
             Hit::ToastOutput => "Show the git commands and their output".into(),
+            Hit::ToastCode(i) => format!("Copy: {}", self.toasts.get(i)?.code.as_ref()?),
+            Hit::ToastLink(i) => format!("Open {}", self.toasts.get(i)?.link.as_ref()?),
+            Hit::ToastAct(i, k) => match &self.toasts.get(i)?.actions.get(k as usize)?.act {
+                ToastAct::Copy(s) => format!("Copy to the clipboard: {s}"),
+                ToastAct::Open(url) => format!("Open {url}"),
+                ToastAct::Run(shell) => format!("Run in a new terminal: {}", shell.cmd),
+            },
             Hit::StatusBranch => {
                 let s = self.status()?;
                 let head = s.branch.clone().unwrap_or_else(|| format!("{} (detached)", s.head.as_deref().map(|h| &h[..h.len().min(8)]).unwrap_or("no commits")));
@@ -2810,7 +2905,7 @@ impl App {
             Hit::CaptionMin => "Minimize".into(),
             Hit::CaptionMax => if unsafe { IsZoomed(self.hwnd) } != 0 { "Restore Down" } else { "Maximize" }.into(),
             Hit::CaptionClose => "Close".into(),
-            Hit::None | Hit::Backdrop | Hit::FindBox | Hit::HThumb | Hit::HTrack | Hit::Sash(_) | Hit::DiffRow(_) | Hit::EditorText | Hit::Thumb(_) | Hit::PickRow(_) | Hit::DialogBtn(_) | Hit::TermBody | Hit::EditorTerm => return None,
+            Hit::None | Hit::Backdrop | Hit::ToastBody(_) | Hit::FindBox | Hit::HThumb | Hit::HTrack | Hit::Sash(_) | Hit::DiffRow(_) | Hit::EditorText | Hit::Thumb(_) | Hit::PickRow(_) | Hit::DialogBtn(_) | Hit::TermBody | Hit::EditorTerm => return None,
         };
         Some(t)
     }
@@ -2879,6 +2974,9 @@ impl App {
             | Hit::DialogBtn(_)
             | Hit::ToastClose(_)
             | Hit::ToastOutput
+            | Hit::ToastCode(_)
+            | Hit::ToastLink(_)
+            | Hit::ToastAct(..)
             | Hit::StatusBranch
             | Hit::StatusSync
             | Hit::Recent(_)
@@ -2894,7 +2992,7 @@ impl App {
             | Hit::SearchAct(..) => Some(IDC_HAND),
             // scroll bar thumbs, the caption buttons (arrow, like every Windows title bar) and
             // empty space keep the arrow
-            Hit::None | Hit::Backdrop | Hit::ExplorerHeader | Hit::Thumb(_) | Hit::HThumb | Hit::HTrack | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose | Hit::FindBox => None,
+            Hit::None | Hit::Backdrop | Hit::ToastBody(_) | Hit::ExplorerHeader | Hit::Thumb(_) | Hit::HThumb | Hit::HTrack | Hit::CaptionMin | Hit::CaptionMax | Hit::CaptionClose | Hit::FindBox => None,
         }
     }
 
@@ -3283,6 +3381,18 @@ impl App {
                     self.exec(Cmd::ToggleOutput);
                 }
             }
+            Hit::ToastCode(i) => {
+                if let Some(code) = self.toasts.get(i).and_then(|t| t.code.clone()) {
+                    self.toast_copy(i, code);
+                }
+            }
+            Hit::ToastLink(i) => {
+                if let Some(url) = self.toasts.get(i).and_then(|t| t.link.clone()) {
+                    win::shell_open(&url);
+                }
+            }
+            Hit::ToastAct(i, k) => self.toast_action(i, k as usize),
+            Hit::ToastBody(_) => {}
             Hit::StatusBranch => self.exec(Cmd::Checkout),
             Hit::StatusSync => self.exec(Cmd::Sync),
             Hit::Recent(i) => {

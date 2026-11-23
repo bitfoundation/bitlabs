@@ -277,10 +277,35 @@ pub enum ToastKind {
     Error,
 }
 
+#[derive(Clone)]
 pub struct Toast {
     pub kind: ToastKind,
     pub message: String,
     pub expires: std::time::Instant,
+    /// A command shown in a monospace box under the message; clicking it copies it.
+    pub code: Option<String>,
+    /// A URL shown as a link under the message (or the command); clicking it opens it.
+    pub link: Option<String>,
+    /// Buttons at the bottom, right-aligned in order (the first one is the primary button).
+    pub actions: Vec<ToastAction>,
+    /// The text copied last from it, for "Copied" feedback.
+    pub copied: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ToastAction {
+    pub label: String,
+    pub act: ToastAct,
+}
+
+#[derive(Clone)]
+pub enum ToastAct {
+    /// Puts the text on the clipboard (the button then reads "Copied").
+    Copy(String),
+    /// Opens a URL in the browser.
+    Open(String),
+    /// Runs a profile in a new panel terminal and closes the notification.
+    Run(crate::term::Shell),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -365,6 +390,12 @@ pub enum Hit {
     DialogBtn(usize),
     ToastClose(usize),
     ToastOutput,
+    /// Toast `.0`'s command box (copies it), its link, and its action button `.1`.
+    ToastCode(usize),
+    ToastLink(usize),
+    ToastAct(usize, u8),
+    /// The rest of toast `.0` (keeps clicks from reaching what is under it).
+    ToastBody(usize),
     StatusBranch,
     StatusSync,
     Recent(usize),
@@ -847,8 +878,16 @@ impl App {
     // ------------------------------------------------------------- toasts
 
     pub fn toast(&mut self, kind: ToastKind, msg: impl Into<String>) {
-        let secs = if kind == ToastKind::Error { 12 } else { 6 };
-        self.toasts.push(Toast { kind, message: msg.into(), expires: std::time::Instant::now() + std::time::Duration::from_secs(secs) });
+        self.push_toast(Toast { kind, message: msg.into(), expires: std::time::Instant::now(), code: None, link: None, actions: Vec::new(), copied: None });
+    }
+
+    /// Shows `t`; it expires after a time that depends on its kind and on whether it has
+    /// something to act on (a command, a link, buttons).
+    pub fn push_toast(&mut self, mut t: Toast) {
+        let interactive = t.code.is_some() || t.link.is_some() || !t.actions.is_empty();
+        let secs = if interactive { 30 } else if t.kind == ToastKind::Error { 12 } else { 6 };
+        t.expires = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        self.toasts.push(t);
         if self.toasts.len() > 3 {
             self.toasts.remove(0);
         }
@@ -873,6 +912,14 @@ impl App {
     pub fn tick_toasts(&mut self) {
         let now = std::time::Instant::now();
         let n = self.toasts.len();
+        // the toast under the mouse stays while it is being read or used
+        let hovered = match self.hover {
+            Hit::ToastClose(i) | Hit::ToastCode(i) | Hit::ToastLink(i) | Hit::ToastAct(i, _) | Hit::ToastBody(i) => Some(i),
+            _ => None,
+        };
+        if let Some(t) = hovered.and_then(|i| self.toasts.get_mut(i)) {
+            t.expires = t.expires.max(now + std::time::Duration::from_secs(3));
+        }
         self.toasts.retain(|t| t.expires > now);
         if self.toasts.is_empty() {
             unsafe {

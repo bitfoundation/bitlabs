@@ -507,8 +507,28 @@ impl App {
     pub fn new_agent_session(&mut self, agent: &term::Agent) {
         match agent.find() {
             Some(shell) => self.new_editor_terminal(Some(shell)),
-            None => self.info(&format!("{} is not installed. Install it from {} and try again.", agent.name, agent.url)),
+            None => self.agent_missing(agent),
         }
+    }
+
+    /// Tells that `agent` is not installed and how to install it: its WinGet command (run it
+    /// in a terminal, or copy it) and its download page.
+    fn agent_missing(&mut self, agent: &term::Agent) {
+        let cmd = agent.install_command();
+        let actions = vec![
+            ToastAction { label: "Run in Terminal".into(), act: ToastAct::Run(agent.installer()) },
+            ToastAction { label: "Copy Command".into(), act: ToastAct::Copy(cmd.clone()) },
+            ToastAction { label: "Copy Link".into(), act: ToastAct::Copy(agent.url.into()) },
+        ];
+        self.push_toast(Toast {
+            kind: ToastKind::Warning,
+            message: format!("{} is not installed (no {} found). Install it with WinGet, then start a new session again:", agent.name, agent.exe_names()),
+            expires: std::time::Instant::now(),
+            code: Some(cmd),
+            link: Some(agent.url.into()),
+            actions,
+            copied: None,
+        });
     }
 
     pub fn select_shell(&mut self) {

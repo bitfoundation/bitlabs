@@ -237,10 +237,12 @@ pub struct Agent {
     exe: &'static str,
     /// Where to install it from.
     pub url: &'static str,
+    /// Its WinGet package id.
+    winget: &'static str,
 }
 
-pub const CLAUDE: Agent = Agent { name: "Claude Code", exe: "claude", url: "https://claude.com/claude-code" };
-pub const CODEX: Agent = Agent { name: "Codex", exe: "codex", url: "https://github.com/openai/codex" };
+pub const CLAUDE: Agent = Agent { name: "Claude Code", exe: "claude", url: "https://claude.com/claude-code", winget: "Anthropic.ClaudeCode" };
+pub const CODEX: Agent = Agent { name: "Codex", exe: "codex", url: "https://github.com/openai/codex", winget: "OpenAI.Codex" };
 
 /// Whether a terminal profile is a coding agent's session.
 pub fn is_agent(name: &str) -> bool {
@@ -266,6 +268,23 @@ impl Agent {
         // a batch file runs through cmd.exe; /s strips the outer quotes and keeps the quoted path
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
         Some(Shell { name: self.name.into(), cmd: format!("\"{comspec}\" /d /s /c \"\"{}\"\"", script.display()) })
+    }
+
+    /// The files `find` looks for, for messages.
+    pub fn exe_names(&self) -> String {
+        format!("{0}.exe or {0}.cmd", self.exe)
+    }
+
+    /// The command that installs it with WinGet.
+    pub fn install_command(&self) -> String {
+        format!("winget install -e --id {}", self.winget)
+    }
+
+    /// A terminal profile that runs `install_command` in cmd.exe and stays open afterwards,
+    /// so its output (and any prompt) can be read.
+    pub fn installer(&self) -> Shell {
+        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
+        Shell { name: format!("Install {}", self.name), cmd: format!("\"{comspec}\" /d /k {}", self.install_command()) }
     }
 }
 
