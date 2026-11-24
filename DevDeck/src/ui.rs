@@ -48,6 +48,7 @@ const I_DIRTY: char = '\u{25CF}';
 const TREE_INDENT: i32 = 12;
 const I_TAG: char = '\u{E8EC}';
 const I_PIN: char = '\u{E718}';
+const I_DELETE: char = '\u{E74D}';
 
 pub struct Menu {
     pub acts: Vec<Option<Box<dyn FnOnce(&mut App)>>>,
@@ -755,9 +756,28 @@ impl App {
         }
         let srch = xywh(inner.left, r.top + self.s(144), rw(&inner), self.s(48));
         let hit = Hit::Cmd(Cmd::Palette);
-        g.icon(&srch, '\u{E756}', self.fonts.icon_big, if self.hover == hit { self.t.fg_strong } else { self.t.fg_dim });
+        // KeyboardClassic: the palette runs every command by name, from the keyboard
+        g.icon(&srch, '\u{E765}', self.fonts.icon_big, if self.hover == hit { self.t.fg_strong } else { self.t.fg_dim });
         self.hits.push((srch, hit));
         let gear = xywh(inner.left, r.bottom - self.s(48), rw(&inner), self.s(48));
+        // coding agents (Claude Code, Codex, Cursor Agent): each starts a new session in an
+        // editor tab, or tells how to install the agent when it is missing. They go below the
+        // palette button as long as they fit above the theme button.
+        for (k, cmd) in [Cmd::ClaudeNew, Cmd::CodexNew, Cmd::CursorNew].into_iter().enumerate() {
+            let it = xywh(inner.left, srch.bottom + k as i32 * self.s(48), rw(&inner), self.s(48));
+            if it.bottom > gear.top {
+                break;
+            }
+            let hit = Hit::Cmd(cmd);
+            let fg = if self.hover == hit { self.t.fg_strong } else { self.t.fg_dim };
+            let (cx, cy, size) = (it.left + rw(&it) / 2, it.top + rh(&it) / 2, self.s(24));
+            match cmd {
+                Cmd::ClaudeNew => draw_claude_icon(g, cx, cy, size, fg, self.scale),
+                Cmd::CodexNew => draw_codex_icon(g, cx, cy, size, fg, self.scale),
+                _ => draw_cursor_icon(g, cx, cy, size, fg, self.scale),
+            }
+            self.hits.push((it, hit));
+        }
         let hit = Hit::Cmd(Cmd::ToggleTheme);
         g.icon(&gear, '\u{E790}', self.fonts.icon_big, if self.hover == hit { self.t.fg_strong } else { self.t.fg_dim });
         self.hits.push((gear, hit));
@@ -1210,6 +1230,8 @@ impl App {
         self.icon_button(g, xywh(x, bh.top, bs, bs), I_ADD, Hit::Cmd(Cmd::Branch), true);
         x -= bs;
         self.icon_button(g, xywh(x, bh.top, bs, bs), I_TAG, Hit::Cmd(Cmd::TagCreate), true);
+        x -= bs;
+        self.icon_button(g, xywh(x, bh.top, bs, bs), I_DELETE, Hit::Cmd(Cmd::DeleteGoneBranches), true);
         if open {
             let m = self.hits.len();
             self.paint_branches(g);
@@ -2663,6 +2685,9 @@ impl App {
     fn cmd_tooltip(&self, c: Cmd) -> String {
         let title = match c {
             Cmd::Palette => "Show All Commands",
+            Cmd::ClaudeNew => "New Claude Code Session",
+            Cmd::CodexNew => "New Codex Session",
+            Cmd::CursorNew => "New Cursor Agent Session",
             Cmd::ToggleTheme => if self.t.dark { "Switch to the Light Theme" } else { "Switch to the Dark Theme" },
             Cmd::ToggleCompact => if self.st.compact_diff { "Show All Lines" } else { "Collapse Unchanged Regions" },
             Cmd::ToggleInline => if self.st.inline_diff { "Show Side by Side" } else { "Show Inline" },
@@ -2681,6 +2706,7 @@ impl App {
             Cmd::Refresh => "Refresh",
             Cmd::Commit => "Commit",
             Cmd::FetchAll => "Fetch From All Remotes",
+            Cmd::DeleteGoneBranches => "Delete Branches With Gone Remotes",
             Cmd::Publish => "Publish Branch: push it to a remote and track it",
             Cmd::StashView => "View Stashes",
             _ => {
@@ -4055,6 +4081,7 @@ impl App {
             (0x72, true, true) => Some(Cmd::FindPrevSel),                    // Ctrl+Shift+F3
             (0x53, true, false) => Some(Cmd::Save),                          // Ctrl+S
             (0x57, true, false) | (0x73, true, false) => Some(Cmd::CloseEditor), // Ctrl+W, Ctrl+F4
+            (0x57, true, true) => Some(Cmd::CloseAllEditors),                // Ctrl+Shift+W
             (0x09, true, false) | (0x22, true, false) => Some(Cmd::NextEditor), // Ctrl+Tab, Ctrl+PageDown
             (0x09, true, true) | (0x21, true, false) => Some(Cmd::PrevEditor), // Ctrl+Shift+Tab, Ctrl+PageUp
             (0xC0, true, true) => Some(Cmd::ToggleEditorTerminal),           // Ctrl+Shift+`
@@ -4487,6 +4514,73 @@ pub fn draw_branch_icon(g: &Gfx, cx: i32, cy: i32, size: i32, color: u32, scale:
     g.bezier(&pts, color, pw);
     for (x, y) in [(x1, y1), (x2, y2), (x3, y3)] {
         g.ring(x, y, r, color, pw);
+    }
+}
+
+/// Stroke width of the outline icons drawn at `size`, like `draw_branch_icon`'s.
+fn icon_pen(size: i32, scale: f32) -> i32 {
+    ((size as f32 / 12.0).round() as i32).max((scale * 1.5).round() as i32).max(1)
+}
+
+/// Claude Code's activity bar icon: a starburst of spokes of alternating length.
+pub fn draw_claude_icon(g: &Gfx, cx: i32, cy: i32, size: i32, color: u32, scale: f32) {
+    let s = size as f32;
+    let pw = icon_pen(size, scale);
+    let n = 12;
+    for k in 0..n {
+        let a = k as f32 * std::f32::consts::TAU / n as f32 - std::f32::consts::FRAC_PI_2;
+        let (r0, r1) = (s * 0.08, if k % 2 == 0 { s * 0.44 } else { s * 0.32 });
+        let (c, si) = (a.cos(), a.sin());
+        g.line(cx + (c * r0).round() as i32, cy + (si * r0).round() as i32, cx + (c * r1).round() as i32, cy + (si * r1).round() as i32, color, pw);
+    }
+}
+
+/// Codex's activity bar icon: a terminal prompt (`>_`) in a rounded frame.
+pub fn draw_codex_icon(g: &Gfx, cx: i32, cy: i32, size: i32, color: u32, scale: f32) {
+    let s = size as f32;
+    let pw = icon_pen(size, scale);
+    let (hw, hh) = ((s * 0.42) as i32, (s * 0.34) as i32);
+    let rr = (s * 0.12) as i32;
+    let (l, t, r, b) = (cx - hw, cy - hh, cx + hw, cy + hh);
+    // frame: four sides and quarter-circle corners
+    g.line(l + rr, t, r - rr, t, color, pw);
+    g.line(l + rr, b, r - rr, b, color, pw);
+    g.line(l, t + rr, l, b - rr, color, pw);
+    g.line(r, t + rr, r, b - rr, color, pw);
+    let k = (rr as f32 * 0.5523) as i32;
+    for (x0, y0, x1, y1, x2, y2, x3, y3) in [
+        (l, t + rr, l, t + rr - k, l + rr - k, t, l + rr, t),
+        (r - rr, t, r - rr + k, t, r, t + rr - k, r, t + rr),
+        (r, b - rr, r, b - rr + k, r - rr + k, b, r - rr, b),
+        (l + rr, b, l + rr - k, b, l, b - rr + k, l, b - rr),
+    ] {
+        g.bezier(&[POINT { x: x0, y: y0 }, POINT { x: x1, y: y1 }, POINT { x: x2, y: y2 }, POINT { x: x3, y: y3 }], color, pw);
+    }
+    // prompt: a chevron and an underscore
+    let (px, py, ph) = (cx - (s * 0.22) as i32, cy, (s * 0.13) as i32);
+    g.line(px, py - ph, px + ph, py, color, pw);
+    g.line(px + ph, py, px, py + ph, color, pw);
+    g.line(cx + (s * 0.02) as i32, py + ph, cx + (s * 0.22) as i32, py + ph, color, pw);
+}
+
+/// Cursor Agent's activity bar icon: an isometric cube (a hexagon with three inner edges).
+pub fn draw_cursor_icon(g: &Gfx, cx: i32, cy: i32, size: i32, color: u32, scale: f32) {
+    let s = size as f32;
+    let pw = icon_pen(size, scale);
+    let r = s * 0.44;
+    let v: Vec<(i32, i32)> = (0..6)
+        .map(|k| {
+            let a = k as f32 * std::f32::consts::TAU / 6.0 - std::f32::consts::FRAC_PI_2;
+            (cx + (a.cos() * r).round() as i32, cy + (a.sin() * r).round() as i32)
+        })
+        .collect();
+    for k in 0..6 {
+        let (a, b) = (v[k], v[(k + 1) % 6]);
+        g.line(a.0, a.1, b.0, b.1, color, pw);
+    }
+    // inner edges from the center to the top, lower right and lower left corners
+    for k in [0, 2, 4] {
+        g.line(cx, cy, v[k].0, v[k].1, color, pw);
     }
 }
 

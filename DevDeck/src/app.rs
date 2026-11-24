@@ -553,7 +553,7 @@ cmds! {
     ToggleOutput => "View: Toggle Output", "Ctrl+J";
     CloseEditor => "View: Close Editor", "Ctrl+W";
     CloseOtherEditors => "View: Close Other Editors", "";
-    CloseAllEditors => "View: Close All Editors", "";
+    CloseAllEditors => "View: Close All Editors", "Ctrl+Shift+W";
     KeepEditor => "View: Keep Editor", "";
     PinEditor => "View: Pin Editor", "";
     UnpinEditor => "View: Unpin Editor", "";

@@ -373,7 +373,7 @@ impl App {
             m.it(if pinned { "Close" } else { "Close\tCtrl+W" }, move |a| a.close_tab(i)),
             m.it_if("Close Others", others, move |a| a.close_other_tabs(i)),
             m.it_if("Close to the Right", right, move |a| a.close_tabs_right(i)),
-            m.it_if("Close All", any, |a| a.close_all_tabs()),
+            m.it_if("Close All	Ctrl+Shift+W", any, |a| a.close_all_tabs()),
             MenuItem::Sep,
             m.it_if("Keep Open", preview, move |a| a.keep_tab(i)),
             if pinned { m.it("Unpin", move |a| a.set_tab_pinned(i, false)) } else { m.it("Pin", move |a| a.set_tab_pinned(i, true)) },

@@ -725,6 +725,8 @@ impl App {
             (0x09, true, true) => Some(Cmd::PrevEditor),
             // Ctrl+W / Ctrl+F4 close a terminal tab like any other tab
             (0x57 | 0x73, true, false) if in_editor => Some(Cmd::CloseEditor),
+            // Ctrl+Shift+W closes all editor tabs, from the panel too
+            (0x57, true, true) => Some(Cmd::CloseAllEditors),
             // in an editor tab these switch editors, in the panel they switch terminals
             (0x22, true, false) => Some(if in_editor { Cmd::NextEditor } else { Cmd::FocusNextTerminal }),
             (0x21, true, false) => Some(if in_editor { Cmd::PrevEditor } else { Cmd::FocusPrevTerminal }),
