@@ -494,6 +494,7 @@ cmds! {
     BranchFrom => "Git: Create Branch From...", "";
     RenameBranch => "Git: Rename Branch...", "";
     DeleteBranch => "Git: Delete Branch...", "";
+    DeleteGoneBranches => "Git: Delete Branches With Gone Remotes...", "";
     Merge => "Git: Merge...", "";
     Rebase => "Git: Rebase Branch...", "";
     MergeAbort => "Git: Abort Merge", "";
@@ -636,6 +637,10 @@ pub struct App {
     pub ex: crate::explorer::Explorer,
     /// Selected Branches row, by key (see `brow_key`).
     pub branch_sel: Option<String>,
+    /// Selected Branches ref rows (multi-selection, by key); the focused one is `branch_sel`.
+    pub branch_multi: HashSet<String>,
+    /// Anchor of a Shift range selection in the Branches view (row key).
+    pub branch_anchor: Option<String>,
     /// Collapsed Branches groups ("local", "remote:<name>", "tags").
     pub collapsed_bgroups: HashSet<String>,
     pub focus_row: Option<usize>,
@@ -843,6 +848,8 @@ impl App {
             brows: Vec::new(),
             ex: crate::explorer::Explorer::default(),
             branch_sel: None,
+            branch_multi: HashSet::new(),
+            branch_anchor: None,
             collapsed_bgroups: ["tags".to_string()].into_iter().collect(),
             git_version: None,
             buf: (std::ptr::null_mut(), std::ptr::null_mut(), 0, 0),
@@ -996,6 +1003,8 @@ impl App {
         self.ex = crate::explorer::Explorer::default();
         self.brows.clear();
         self.branch_sel = None;
+        self.branch_multi.clear();
+        self.branch_anchor = None;
         self.graph_sel = None;
         self.view = MainView::Empty;
         self.tabs.clear();
@@ -2698,6 +2707,7 @@ impl App {
             Cmd::BranchFrom => self.create_branch_from(),
             Cmd::RenameBranch => self.rename_branch(),
             Cmd::DeleteBranch => self.delete_branch(None),
+            Cmd::DeleteGoneBranches => self.delete_gone_branches(),
             Cmd::Merge => self.merge_picker(),
             Cmd::Rebase => self.rebase_picker(),
             Cmd::MergeAbort | Cmd::RebaseAbort => self.abort_op(),

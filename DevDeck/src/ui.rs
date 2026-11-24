@@ -1235,7 +1235,12 @@ impl App {
             let y = r.top + i as i32 * rh22 - scroll;
             let rr = rect(r.left, y, r.right, y + rh22);
             let hovered = self.hover == Hit::BranchRow(i);
-            self.row_bg(g, &rr, sel == Some(i), sel == Some(i), hovered, area_focused);
+            // a group row shows as selected while it has the focus and no refs are selected
+            let selected = match row {
+                BRow::Group { .. } => sel == Some(i) && self.branch_multi.is_empty(),
+                BRow::Ref(_) => self.branch_row_selected(i),
+            };
+            self.row_bg(g, &rr, selected, sel == Some(i), hovered, area_focused);
             self.hits.push((rr, Hit::BranchRow(i)));
             match row {
                 BRow::Group { key, label, count } => {
@@ -3314,10 +3319,10 @@ impl App {
                 self.show_menu(x, y, items, m);
             }
             Hit::BranchRow(i) => {
-                if matches!(self.brows.get(i), Some(BRow::Group { .. })) {
+                if matches!(self.brows.get(i), Some(BRow::Group { .. })) && !ctrl && !shift {
                     self.toggle_branch_group(i, None);
                 } else {
-                    self.select_branch_row(i);
+                    self.select_branch_row_ex(i, ctrl, shift);
                 }
             }
             Hit::DiffRow(r) => {
@@ -3580,6 +3585,7 @@ impl App {
                 MenuItem::Sep,
                 m.cmd("Rename Branch...", Cmd::RenameBranch),
                 m.cmd("Delete Branch...", Cmd::DeleteBranch),
+                m.cmd("Delete Branches With Gone Remotes...", Cmd::DeleteGoneBranches),
                 MenuItem::Sep,
                 m.cmd("Publish Branch...", Cmd::Publish),
             ]),
@@ -3677,7 +3683,13 @@ impl App {
             }
             let i = match hit {
                 Hit::BranchRow(i) => {
-                    self.select_branch_row(i);
+                    // right-clicking a selected row keeps the multi-selection (its menu acts on all)
+                    if !self.branch_row_selected(i) {
+                        self.select_branch_row(i);
+                    } else {
+                        self.branch_sel = self.brow_key(i);
+                        self.focus = Focus::Branches;
+                    }
                     i
                 }
                 _ => usize::MAX,
@@ -4173,7 +4185,7 @@ impl App {
             }
             _ => match self.focus {
                 Focus::Changes => self.changes_key(vk, ctrl, shift),
-                Focus::Branches => self.branches_key(vk),
+                Focus::Branches => self.branches_key(vk, ctrl, shift),
                 Focus::Explorer => self.explorer_key(vk),
                 Focus::Search => self.search_key(vk),
                 Focus::Graph => self.graph_key(vk),
@@ -4303,7 +4315,7 @@ impl App {
         }
     }
 
-    fn branches_key(&mut self, vk: u16) {
+    fn branches_key(&mut self, vk: u16, ctrl: bool, shift: bool) {
         let n = self.brows.len();
         if n == 0 || !self.st.branches_open {
             return;
@@ -4319,11 +4331,26 @@ impl App {
             _ => None,
         };
         if let Some(i) = next {
-            self.select_branch_row(i);
+            // Shift extends the selection from the anchor; Ctrl moves the focus only
+            if ctrl && !shift {
+                self.branch_sel = self.brow_key(i);
+            } else {
+                self.select_branch_row_ex(i, false, shift);
+            }
             self.reveal_row(Area::Branches, i);
             return;
         }
         match vk {
+            0x41 if ctrl => self.select_all_branch_rows(),
+            // Ctrl+Space toggles the focused ref in the selection
+            0x20 if ctrl => self.select_branch_row_ex(cur, true, false),
+            0x2E => self.delete_selected_refs(),
+            0x1B if !self.branch_multi.is_empty() => {
+                self.branch_multi.clear();
+                if matches!(self.brows.get(cur), Some(BRow::Ref(_))) {
+                    self.select_branch_row(cur);
+                }
+            }
             0x0D | 0x20 => self.branch_activate(cur),
             // Left: collapse the group, or jump to it from one of its refs
             0x25 => match self.brows.get(cur) {
