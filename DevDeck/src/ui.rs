@@ -3461,6 +3461,9 @@ impl App {
                 if crate::term::CODEX.find().is_some() {
                     items.push(m.cmd("New Codex Session", Cmd::CodexNew));
                 }
+                if crate::term::CURSOR.find().is_some() {
+                    items.push(m.cmd("New Cursor Agent Session", Cmd::CursorNew));
+                }
                 if let Some(i) = self.panel_term() {
                     items.push(m.it("Move Terminal into Editor Area", move |a| a.move_terminal_to_editor(i)));
                 }
@@ -4035,6 +4038,7 @@ impl App {
             (0x43, true, true) => Some(Cmd::OpenTerminal),                   // Ctrl+Shift+C
             (0x41, true, true) => Some(Cmd::ClaudeNew),                      // Ctrl+Shift+A
             (0x4F, true, true) => Some(Cmd::CodexNew),                       // Ctrl+Shift+O
+            (0x55, true, true) => Some(Cmd::CursorNew),                      // Ctrl+Shift+U
             (0xC0, true, false) => Some(Cmd::ToggleTerminal),                // Ctrl+`
             (0x4D, true, true) => Some(Cmd::TogglePanelMax),                 // Ctrl+Shift+M
             (0x42, true, false) => Some(Cmd::ToggleSidebar),                 // Ctrl+B

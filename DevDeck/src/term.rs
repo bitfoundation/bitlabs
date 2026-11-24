@@ -233,38 +233,63 @@ pub fn detect_shells() -> Vec<Shell> {
 pub struct Agent {
     /// Profile name of its sessions.
     pub name: &'static str,
-    /// Executable name without extension: `<exe>.exe`, or npm's `<exe>.cmd`.
+    /// Executable name without extension: `<exe>.exe`, or a `<exe>.cmd` launcher (npm's, or
+    /// its own installer's).
     exe: &'static str,
     /// Where to install it from.
     pub url: &'static str,
-    /// Its WinGet package id.
-    winget: &'static str,
+    /// Its own install folder under %LOCALAPPDATA%, which this process's PATH may lack.
+    local_dir: Option<&'static str>,
+    /// How to install it.
+    install: Install,
 }
 
-pub const CLAUDE: Agent = Agent { name: "Claude Code", exe: "claude", url: "https://claude.com/claude-code", winget: "Anthropic.ClaudeCode" };
-pub const CODEX: Agent = Agent { name: "Codex", exe: "codex", url: "https://github.com/openai/codex", winget: "OpenAI.Codex" };
+/// How an agent CLI is installed.
+enum Install {
+    /// With WinGet, by its package id.
+    WinGet(&'static str),
+    /// By a PowerShell command (its own install script).
+    PowerShell(&'static str),
+}
+
+pub const CLAUDE: Agent = Agent { name: "Claude Code", exe: "claude", url: "https://claude.com/claude-code", local_dir: None, install: Install::WinGet("Anthropic.ClaudeCode") };
+pub const CODEX: Agent = Agent { name: "Codex", exe: "codex", url: "https://github.com/openai/codex", local_dir: None, install: Install::WinGet("OpenAI.Codex") };
+pub const CURSOR: Agent = Agent {
+    name: "Cursor Agent",
+    exe: "cursor-agent",
+    url: "https://cursor.com/cli",
+    local_dir: Some("cursor-agent"),
+    install: Install::PowerShell("irm 'https://cursor.com/install?win32=true' | iex"),
+};
 
 /// Whether a terminal profile is a coding agent's session.
 pub fn is_agent(name: &str) -> bool {
-    [&CLAUDE, &CODEX].iter().any(|a| a.name == name)
+    [&CLAUDE, &CODEX, &CURSOR].iter().any(|a| a.name == name)
 }
 
 impl Agent {
     /// The CLI as a terminal profile, when it is installed: `<exe>.exe` on PATH, else where a
-    /// native installer (%USERPROFILE%\.local\bin) or WinGet (its Links folder) put it, which
-    /// this process's PATH may lack when it was installed after DevDeck started; else npm's
-    /// `<exe>.cmd`.
+    /// native installer (%USERPROFILE%\.local\bin, or its own folder under %LOCALAPPDATA%) or
+    /// WinGet (its Links folder) put it, which this process's PATH may lack when it was
+    /// installed after DevDeck started; else a `<exe>.cmd` launcher in the same places or npm's.
     pub fn find(&self) -> Option<Shell> {
         let dir = |var: &str, sub: &[&str]| std::env::var_os(var).map(|v| sub.iter().fold(std::path::PathBuf::from(v), |p, s| p.join(s)));
-        let known = [dir("USERPROFILE", &[".local", "bin"]), dir("LOCALAPPDATA", &["Microsoft", "WinGet", "Links"])];
+        let known: Vec<std::path::PathBuf> = [
+            dir("USERPROFILE", &[".local", "bin"]),
+            self.local_dir.and_then(|d| dir("LOCALAPPDATA", &[d])),
+            dir("LOCALAPPDATA", &["Microsoft", "WinGet", "Links"]),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         let exe = format!("{}.exe", self.exe);
-        let found = which(&exe).or_else(|| known.into_iter().flatten().map(|d| d.join(&exe)).find(|p| p.is_file()));
+        let found = which(&exe).or_else(|| known.iter().map(|d| d.join(&exe)).find(|p| p.is_file()));
         if let Some(p) = found {
             return Some(Shell { name: self.name.into(), cmd: format!("\"{}\"", p.display()) });
         }
         let cmd = format!("{}.cmd", self.exe);
-        let appdata = std::env::var_os("APPDATA").map(std::path::PathBuf::from);
-        let script = which(&cmd).or_else(|| appdata.map(|a| a.join("npm").join(&cmd)).filter(|p| p.is_file()))?;
+        let npm = dir("APPDATA", &["npm"]);
+        let script = which(&cmd).or_else(|| known.iter().chain(npm.iter()).map(|d| d.join(&cmd)).find(|p| p.is_file()))?;
         // a batch file runs through cmd.exe; /s strips the outer quotes and keeps the quoted path
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
         Some(Shell { name: self.name.into(), cmd: format!("\"{comspec}\" /d /s /c \"\"{}\"\"", script.display()) })
@@ -275,16 +300,33 @@ impl Agent {
         format!("{0}.exe or {0}.cmd", self.exe)
     }
 
-    /// The command that installs it with WinGet.
+    /// The command that installs it: a WinGet command, or a PowerShell one.
     pub fn install_command(&self) -> String {
-        format!("winget install -e --id {}", self.winget)
+        match self.install {
+            Install::WinGet(id) => format!("winget install -e --id {id}"),
+            Install::PowerShell(c) => c.into(),
+        }
     }
 
-    /// A terminal profile that runs `install_command` in cmd.exe and stays open afterwards,
-    /// so its output (and any prompt) can be read.
+    /// What `install_command` runs in, for messages.
+    pub fn install_tool(&self) -> &'static str {
+        match self.install {
+            Install::WinGet(_) => "WinGet",
+            Install::PowerShell(_) => "PowerShell",
+        }
+    }
+
+    /// A terminal profile that runs `install_command` (in cmd.exe, or in Windows PowerShell)
+    /// and stays open afterwards, so its output (and any prompt) can be read.
     pub fn installer(&self) -> Shell {
-        let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
-        Shell { name: format!("Install {}", self.name), cmd: format!("\"{comspec}\" /d /k {}", self.install_command()) }
+        let cmd = match self.install {
+            Install::WinGet(_) => {
+                let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".into());
+                format!("\"{comspec}\" /d /k {}", self.install_command())
+            }
+            Install::PowerShell(c) => format!("powershell.exe -NoLogo -NoProfile -NoExit -ExecutionPolicy Bypass -Command \"{c}\""),
+        };
+        Shell { name: format!("Install {}", self.name), cmd }
     }
 }
 

@@ -548,6 +548,8 @@ cmds! {
     ClaudeNew => "Claude Code: New Session", "Ctrl+Shift+A";
     CodexOpen => "Codex: Open", "";
     CodexNew => "Codex: New Session", "Ctrl+Shift+O";
+    CursorOpen => "Cursor Agent: Open", "";
+    CursorNew => "Cursor Agent: New Session", "Ctrl+Shift+U";
     ToggleOutput => "View: Toggle Output", "Ctrl+J";
     CloseEditor => "View: Close Editor", "Ctrl+W";
     CloseOtherEditors => "View: Close Other Editors", "";
@@ -2651,9 +2653,11 @@ impl App {
         self.st.refresh_recent();
         let claude = crate::term::CLAUDE.find().is_some();
         let codex = crate::term::CODEX.find().is_some();
+        let cursor = crate::term::CURSOR.find().is_some();
         let installed = |c: &Cmd| match c {
             Cmd::ClaudeOpen | Cmd::ClaudeNew => claude,
             Cmd::CodexOpen | Cmd::CodexNew => codex,
+            Cmd::CursorOpen | Cmd::CursorNew => cursor,
             _ => true,
         };
         let available: Vec<&(Cmd, &str, &str)> = COMMANDS.iter().filter(|(c, _, _)| *c != Cmd::Palette && installed(c)).collect();
@@ -2685,7 +2689,7 @@ impl App {
     pub fn exec(&mut self, c: Cmd) {
         let needs_repo = !matches!(c, Cmd::Palette | Cmd::OpenFolder | Cmd::OpenRecent | Cmd::NewWindow | Cmd::Clone | Cmd::Init | Cmd::ToggleOutput | Cmd::CloseEditor | Cmd::CloseOtherEditors | Cmd::CloseAllEditors | Cmd::KeepEditor | Cmd::PinEditor | Cmd::UnpinEditor | Cmd::NextEditor | Cmd::PrevEditor | Cmd::TogglePanelMax | Cmd::PanelRestore | Cmd::PanelFullWidth | Cmd::PanelFullHeight | Cmd::PanelFullScreen | Cmd::ToggleGraphSection | Cmd::ToggleBranchesSection | Cmd::ToggleTheme | Cmd::ToggleSidebar | Cmd::ShowExplorer | Cmd::ShowScm | Cmd::ToggleSidebarPos | Cmd::ToggleTreeView | Cmd::About | Cmd::ClearOutput | Cmd::ToggleInline | Cmd::ToggleCompact | Cmd::NextChange | Cmd::PrevChange | Cmd::ConfigureUser | Cmd::ToggleTerminal | Cmd::NewTerminal | Cmd::NewTerminalEditor | Cmd::ToggleEditorTerminal | Cmd::MoveTerminalToEditor | Cmd::MoveTerminalToPanel | Cmd::KillTerminal | Cmd::FocusNextTerminal | Cmd::FocusPrevTerminal | Cmd::RenameTerminal | Cmd::SelectShell | Cmd::ClearTerminal | Cmd::Find | Cmd::Replace | Cmd::FindNext | Cmd::FindPrev | Cmd::FindNextSel | Cmd::FindPrevSel | Cmd::ReplaceAll | Cmd::ToggleWordWrap);
         // the Explorer and the editor work in a folder without a repository too
-        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::RevealInExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew | Cmd::CodexOpen | Cmd::CodexNew | Cmd::FindInFiles | Cmd::ReplaceInFiles | Cmd::ClearSearch);
+        let folder_ok = matches!(c, Cmd::GotoFile | Cmd::GotoLine | Cmd::Save | Cmd::SaveAll | Cmd::RevertFile | Cmd::ExplorerNewFile | Cmd::ExplorerNewFolder | Cmd::ExplorerRename | Cmd::ExplorerDelete | Cmd::ExplorerCollapse | Cmd::OpenExplorer | Cmd::RevealInExplorer | Cmd::OpenTerminal | Cmd::Refresh | Cmd::ClaudeOpen | Cmd::ClaudeNew | Cmd::CodexOpen | Cmd::CodexNew | Cmd::CursorOpen | Cmd::CursorNew | Cmd::FindInFiles | Cmd::ReplaceInFiles | Cmd::ClearSearch);
         if needs_repo && self.repo.is_none() && !(folder_ok && self.pending_init.is_some()) {
             self.info("There are no available repositories. Open a folder first.");
             return;
@@ -2809,6 +2813,8 @@ impl App {
             Cmd::ClaudeNew => self.new_agent_session(&crate::term::CLAUDE),
             Cmd::CodexOpen => self.open_agent(&crate::term::CODEX),
             Cmd::CodexNew => self.new_agent_session(&crate::term::CODEX),
+            Cmd::CursorOpen => self.open_agent(&crate::term::CURSOR),
+            Cmd::CursorNew => self.new_agent_session(&crate::term::CURSOR),
             Cmd::ClearTerminal => {
                 if let Some(t) = self.term_mut() {
                     t.screen.scrollback.clear();

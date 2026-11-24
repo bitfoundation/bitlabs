@@ -484,9 +484,9 @@ impl App {
         }
     }
 
-    /// "Claude Code: Open" / "Codex: Open": focuses the agent's running session (the
-    /// terminal tab used last first, then any other, in the editor area or the panel), else
-    /// starts one in an editor tab in the open folder.
+    /// "Claude Code: Open" / "Codex: Open" / "Cursor Agent: Open": focuses the agent's running
+    /// session (the terminal tab used last first, then any other, in the editor area or the
+    /// panel), else starts one in an editor tab in the open folder.
     pub fn open_agent(&mut self, agent: &term::Agent) {
         let running = |t: &TermSession| t.shell.name == agent.name && t.exited.is_none();
         let last = self.term_editor_last.and_then(|id| self.term_index(id)).filter(|&i| running(&self.terms[i]));
@@ -502,8 +502,8 @@ impl App {
         self.invalidate();
     }
 
-    /// Ctrl+Shift+A "Claude Code: New Session", Ctrl+Shift+O "Codex: New Session": starts the
-    /// agent in a new editor tab.
+    /// Ctrl+Shift+A "Claude Code: New Session", Ctrl+Shift+O "Codex: New Session", Ctrl+Shift+U
+    /// "Cursor Agent: New Session": starts the agent in a new editor tab.
     pub fn new_agent_session(&mut self, agent: &term::Agent) {
         match agent.find() {
             Some(shell) => self.new_editor_terminal(Some(shell)),
@@ -511,8 +511,8 @@ impl App {
         }
     }
 
-    /// Tells that `agent` is not installed and how to install it: its WinGet command (run it
-    /// in a terminal, or copy it) and its download page.
+    /// Tells that `agent` is not installed and how to install it: its WinGet or PowerShell
+    /// command (run it in a terminal, or copy it) and its download page.
     fn agent_missing(&mut self, agent: &term::Agent) {
         let cmd = agent.install_command();
         let actions = vec![
@@ -522,7 +522,7 @@ impl App {
         ];
         self.push_toast(Toast {
             kind: ToastKind::Warning,
-            message: format!("{} is not installed (no {} found). Install it with WinGet, then start a new session again:", agent.name, agent.exe_names()),
+            message: format!("{} is not installed (no {} found). Install it with {}, then start a new session again:", agent.name, agent.exe_names(), agent.install_tool()),
             expires: std::time::Instant::now(),
             code: Some(cmd),
             link: Some(agent.url.into()),
@@ -720,6 +720,7 @@ impl App {
             (0x48, true, true) => Some(Cmd::ReplaceInFiles),
             (0x41, true, true) => Some(Cmd::ClaudeNew),
             (0x4F, true, true) => Some(Cmd::CodexNew),
+            (0x55, true, true) => Some(Cmd::CursorNew),
             (0x09, true, false) => Some(Cmd::NextEditor),
             (0x09, true, true) => Some(Cmd::PrevEditor),
             // Ctrl+W / Ctrl+F4 close a terminal tab like any other tab
@@ -750,7 +751,7 @@ impl App {
         }
         // xterm keys the character messages cannot tell apart
         let seq: Option<&[u8]> = match vk {
-            // Shift+Tab: back-tab (Claude Code / Codex mode cycling, PSReadLine completion)
+            // Shift+Tab: back-tab (Claude Code / Codex / Cursor Agent mode cycling, PSReadLine completion)
             0x09 if shift && !ctrl => Some(b"\x1b[Z"),
             // Shift+Enter: a new line in the prompt, as Claude Code's /terminal-setup binds it
             // (Codex reads it as Alt+Enter, which inserts a new line there too)
