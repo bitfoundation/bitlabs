@@ -24,10 +24,10 @@
   <PropertyGroup>
     <VersionPrefix>0.1.0</VersionPrefix>
     <VersionSuffix>preview.2</VersionSuffix>
-    <Authors>BlazorTestPlatform contributors</Authors>
-    <Company>BlazorTestPlatform</Company>
+    <Authors>Bit Foundation</Authors>
+    <Company>Bit Foundation</Company>
     <Product>BlazorTestPlatform</Product>
-    <Copyright>Copyright (c) BlazorTestPlatform contributors</Copyright>
+    <Copyright>Copyright (c) 2026 Bit Foundation</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageProjectUrl>https://github.com/bitfoundation/bitlabs/tree/main/BlazorTestPlatform</PackageProjectUrl>
     <RepositoryUrl>https://github.com/bitfoundation/bitlabs</RepositoryUrl>

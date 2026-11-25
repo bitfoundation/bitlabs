@@ -192,6 +192,8 @@ the 0.8.0 ones together describe the first public release. All changes are addit
 
 ### Changed
 
+- **Bit Foundation is the author and copyright holder:** `LICENSE`, and the `Authors`, `Company` and `Copyright` of
+  every package.
 - **Refreshes wait for pending optimistic updates.** While declarative optimistic updates of pending mutations are on a
   query, its invalidations, refetches (`RefetchQueryAsync`, intervals, focus/reconnect triggers) and reads of stale data
   mark it stale instead of fetching (an outdated fetch in flight is cancelled); once the last of those mutations has

@@ -15,11 +15,11 @@
 
   <PropertyGroup Label="Package metadata">
     <Product>DotNetQuery</Product>
-    <Authors>DotNetQuery</Authors>
-    <Company>DotNetQuery</Company>
+    <Authors>Bit Foundation</Authors>
+    <Company>Bit Foundation</Company>
     <VersionPrefix>0.9.0</VersionPrefix>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <Copyright>Copyright (c) DotNetQuery contributors</Copyright>
+    <Copyright>Copyright (c) 2026 Bit Foundation</Copyright>
     <PackageProjectUrl>https://github.com/bitfoundation/bitlabs/tree/main/DotNetQuery</PackageProjectUrl>
     <RepositoryUrl>https://github.com/bitfoundation/bitlabs</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

@@ -6,6 +6,7 @@
 
 - The project moved into the `BlazorAccessibilityToolkit/` folder of the [bitlabs](https://github.com/bitfoundation/bitlabs) repository. Package `PackageProjectUrl`, the SARIF `informationUri`, the MCP server's website and the EARL report's assertor point to `https://github.com/bitfoundation/bitlabs/tree/main/BlazorAccessibilityToolkit`, and `RepositoryUrl` to `https://github.com/bitfoundation/bitlabs`. The analyzer rules' help links point to `docs/analyzers.md` in that folder.
 - The MCP server is registered as `io.github.bitfoundation/blazor-a11y`, and its `.mcp/server.json` names the `BlazorAccessibilityToolkit` subfolder of the repository.
+- Bit Foundation is the author and copyright holder: `LICENSE`, and the `Authors` and `Copyright` of every package.
 - CI is the BlazorAccessibilityToolkit workflow (`.github/workflows/blazoraccessibilitytoolkit.yml` at the repository root), which runs on every change under `BlazorAccessibilityToolkit/`. Its accessibility gate runs from the repository root so that SARIF locations resolve in code scanning.
 
 ### Added

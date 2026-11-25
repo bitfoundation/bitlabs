@@ -114,11 +114,11 @@ fn version_info() -> Vec<u8> {
         block(k, &data, (data.len() / 2) as u16, true, &[])
     };
     let strings = [
-        string("CompanyName", "DevDeck"),
+        string("CompanyName", "Bit Foundation"),
         string("FileDescription", "DevDeck"),
         string("FileVersion", &version),
         string("InternalName", "devdeck"),
-        string("LegalCopyright", "MIT License"),
+        string("LegalCopyright", "Copyright (c) 2026 Bit Foundation"),
         string("OriginalFilename", "devdeck.exe"),
         string("ProductName", "DevDeck"),
         string("ProductVersion", &version),
