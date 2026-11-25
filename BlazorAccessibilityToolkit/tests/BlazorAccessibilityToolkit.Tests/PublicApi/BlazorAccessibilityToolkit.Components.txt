@@ -1,0 +1,76 @@
+static class BlazorAccessibilityToolkit.Components.AccessibilityServiceCollectionExtensions
+  static Microsoft.Extensions.DependencyInjection.IServiceCollection AddAccessibilityComponents(Microsoft.Extensions.DependencyInjection.IServiceCollection services)
+class BlazorAccessibilityToolkit.Components.ActiveDescendantGroup : Microsoft.AspNetCore.Components.ComponentBase
+  BlazorAccessibilityToolkit.Components.RovingOrientation Orientation { get; set; }
+  Microsoft.AspNetCore.Components.RenderFragment ChildContent { get; set; }
+  System.Boolean SelectionFollowsFocus { get; set; }
+  System.Boolean Typeahead { get; set; }
+  System.Boolean Wrap { get; set; }
+  System.Collections.Generic.IReadOnlyDictionary<System.String, System.Object> AdditionalAttributes { get; set; }
+  System.String ItemSelector { get; set; }
+  System.String OwnerId { get; set; }
+  System.String Role { get; set; }
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  ctor()
+class BlazorAccessibilityToolkit.Components.FocusTrap : Microsoft.AspNetCore.Components.ComponentBase
+  Microsoft.AspNetCore.Components.RenderFragment ChildContent { get; set; }
+  System.Boolean Active { get; set; }
+  System.Boolean RestoreFocus { get; set; }
+  System.Collections.Generic.IReadOnlyDictionary<System.String, System.Object> AdditionalAttributes { get; set; }
+  System.String InitialFocus { get; set; }
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  ctor()
+interface BlazorAccessibilityToolkit.Components.ILiveAnnouncer
+  System.Boolean IsAttached { get; }
+  System.Threading.Tasks.Task ClearAsync()
+  System.Threading.Tasks.Task<System.Boolean> AnnounceAsync(System.String message, BlazorAccessibilityToolkit.Components.Politeness politeness = Polite)
+class BlazorAccessibilityToolkit.Components.LiveAnnouncer : Microsoft.AspNetCore.Components.ComponentBase
+  System.TimeSpan ClearAfter { get; set; }
+  System.TimeSpan RepeatDelay { get; set; }
+  System.Void Dispose()
+  ctor()
+sealed class BlazorAccessibilityToolkit.Components.LiveAnnouncerService
+  System.Boolean IsAttached { get; }
+  System.Threading.Tasks.Task ClearAsync()
+  System.Threading.Tasks.Task<System.Boolean> AnnounceAsync(System.String message, BlazorAccessibilityToolkit.Components.Politeness politeness = Polite)
+  ctor()
+class BlazorAccessibilityToolkit.Components.NavigationFocus : Microsoft.AspNetCore.Components.ComponentBase
+  Microsoft.AspNetCore.Components.RouteData RouteData { get; set; }
+  System.String Selector { get; set; }
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  ctor()
+enum BlazorAccessibilityToolkit.Components.Politeness
+  Polite
+  Assertive
+class BlazorAccessibilityToolkit.Components.RouteAnnouncer : Microsoft.AspNetCore.Components.ComponentBase
+  System.String MessageFormat { get; set; }
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  ctor()
+class BlazorAccessibilityToolkit.Components.RovingFocusGroup : Microsoft.AspNetCore.Components.ComponentBase
+  BlazorAccessibilityToolkit.Components.RovingOrientation Orientation { get; set; }
+  Microsoft.AspNetCore.Components.RenderFragment ChildContent { get; set; }
+  System.Boolean SelectionFollowsFocus { get; set; }
+  System.Boolean Typeahead { get; set; }
+  System.Boolean Wrap { get; set; }
+  System.Collections.Generic.IReadOnlyDictionary<System.String, System.Object> AdditionalAttributes { get; set; }
+  System.String ItemSelector { get; set; }
+  System.String Role { get; set; }
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  ctor()
+enum BlazorAccessibilityToolkit.Components.RovingOrientation
+  Horizontal
+  Vertical
+  Both
+class BlazorAccessibilityToolkit.Components.SkipLink : Microsoft.AspNetCore.Components.ComponentBase
+  Microsoft.AspNetCore.Components.RenderFragment ChildContent { get; set; }
+  System.Collections.Generic.IReadOnlyDictionary<System.String, System.Object> AdditionalAttributes { get; set; }
+  System.String Class { get; set; }
+  System.String Target { get; set; }
+  System.String Text { get; set; }
+  System.Threading.Tasks.ValueTask DisposeAsync()
+  ctor()
+class BlazorAccessibilityToolkit.Components.VisuallyHidden : Microsoft.AspNetCore.Components.ComponentBase
+  Microsoft.AspNetCore.Components.RenderFragment ChildContent { get; set; }
+  System.Collections.Generic.IReadOnlyDictionary<System.String, System.Object> AdditionalAttributes { get; set; }
+  const System.String Style
+  ctor()

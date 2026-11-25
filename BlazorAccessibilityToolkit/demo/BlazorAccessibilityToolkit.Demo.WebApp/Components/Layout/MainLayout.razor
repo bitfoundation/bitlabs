@@ -1,0 +1,80 @@
+@inherits LayoutComponentBase
+@implements IDisposable
+@inject NavigationManager Navigation
+@* Blazor's router intercepts in-page links: it scrolls to #main but does not move keyboard focus, so focus it explicitly.
+   The href includes the current path: with <base href="/">, a bare "#main" points at the home page, which is where the
+   link would go before the page becomes interactive. *@
+<a class="skip-link" href="@MainHref" @onclick="SkipToMainAsync" @onclick:preventDefault>Skip to main content</a>
+<div class="shell @(navOpen ? "shell--nav-open" : null)">
+    <header class="masthead">
+        <a class="brand" href="">
+            <svg class="brand__logo" aria-hidden="true" focusable="false" viewBox="0 0 32 32" width="32" height="32">
+                <circle cx="16" cy="16" r="15" fill="#0b57d0" />
+                <circle cx="16" cy="8.5" r="2.6" fill="#fff" />
+                <path d="M8 12.5h16v2.6h-5.4v4.2l2.6 7.2-2.4.9L16 20.6l-2.8 6.8-2.4-.9 2.6-7.2v-4.2H8z" fill="#fff" />
+            </svg>
+            <span>Blazor Accessibility Toolkit</span>
+        </a>
+        <p class="masthead__tagline">Showcase: every example runs the toolkit live</p>
+        <div class="masthead__tools">
+            <a class="masthead__link" href="https://github.com/bitfoundation/bitlabs/tree/main/BlazorAccessibilityToolkit">
+                <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6M8 6l-6 6 6 6" /></svg>
+                <span>Source<span class="visually-hidden">@(" code on GitHub")</span></span>
+            </a>
+            <ThemeSwitcher Initial="@ThemePreference" />
+            @* Narrow screens only: the navigation collapses behind this button. *@
+            <button type="button" class="menu-toggle" aria-expanded="@(navOpen ? "true" : "false")" aria-controls="site-nav" @onclick="() => navOpen = !navOpen">
+                <svg aria-hidden="true" focusable="false" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+                Menu
+            </button>
+        </div>
+    </header>
+    <nav id="site-nav" class="sidenav" aria-label="Showcase">
+        <div class="sidenav__inner">
+            <NavMenu />
+        </div>
+    </nav>
+    @* data-interactive lets end-to-end tests wait until the circuit is connected instead of sleeping. *@
+    <main id="main" tabindex="-1" @ref="main" data-interactive="@(RendererInfo.IsInteractive ? "true" : "false")">
+        @Body
+        <TourNav />
+    </main>
+    @* One live announcer for the whole app: components announce through ILiveAnnouncer. *@
+    <BlazorAccessibilityToolkit.Components.LiveAnnouncer />
+    <footer class="footer">
+        <p>Blazor Accessibility Toolkit demo. Automated checks find a subset of accessibility problems; they cannot prove WCAG conformance.</p>
+        <p>This showcase is audited by the toolkit itself, in the light and dark themes, on Chromium, Firefox and WebKit.</p>
+    </footer>
+</div>
+
+@* Shown by blazor.web.js when the circuit fails. role="alert" announces it when it appears; the dismiss control is a real
+   button (the project template uses a clickable <span>). *@
+<div id="blazor-error-ui" role="alert" data-nosnippet>
+    An unhandled error has occurred.
+    <a href="." class="reload">Reload</a>
+    <button type="button" class="dismiss" aria-label="Dismiss">×</button>
+</div>
+
+@code {
+    private ElementReference main;
+    private bool navOpen;
+
+    /// <summary>The theme stored in the cookie, rendered by the server (see App.razor).</summary>
+    [CascadingParameter(Name = "ThemePreference")] private string ThemePreference { get; set; } = "system";
+
+    protected override void OnInitialized() => Navigation.LocationChanged += OnLocationChanged;
+
+    private async Task SkipToMainAsync() => await main.FocusAsync();
+
+    private string MainHref => new Uri(Navigation.Uri).GetLeftPart(UriPartial.Query) + "#main";
+
+    // The collapsed navigation closes after choosing a page, so the new page is visible, and the skip link follows the
+    // new path.
+    private void OnLocationChanged(object? sender, LocationChangedEventArgs e)
+    {
+        navOpen = false;
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose() => Navigation.LocationChanged -= OnLocationChanged;
+}

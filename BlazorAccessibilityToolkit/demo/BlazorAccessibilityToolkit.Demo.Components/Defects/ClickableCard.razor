@@ -1,0 +1,20 @@
+@* INTENTIONAL DEFECT: a clickable <div>. Mouse users can open it; keyboard users cannot reach or activate it, and
+   screen readers do not know it is interactive. Browsers cannot see Blazor's @onclick, so browser-based scanners miss it.
+   Detected by: blazor-click-handler-semantics (bUnit markup). Fixed version: DisclosureCard. *@
+<div class="card" @onclick="Toggle">
+    <h3>@Title</h3>
+    @if (expanded)
+    {
+        <p>@Details</p>
+    }
+</div>
+
+@code {
+    private bool expanded;
+
+    [Parameter] public string Title { get; set; } = "Card";
+
+    [Parameter] public string Details { get; set; } = string.Empty;
+
+    private void Toggle() => expanded = !expanded;
+}

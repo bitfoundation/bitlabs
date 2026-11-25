@@ -1,0 +1,111 @@
+@page "/aria-patterns"
+<PageTitle>ARIA patterns · Blazor Accessibility Toolkit</PageTitle>
+
+<div class="page-intro">
+    <p class="eyebrow">Browser tests · Playwright</p>
+    <h1>ARIA pattern verification</h1>
+    <p class="lead">
+        The WAI-ARIA Authoring Practices Guide describes how tabs, disclosures, menus and dialogs must behave with the
+        keyboard. <code>AriaPatterns</code> drives a widget with real key presses and records every requirement as a pass
+        or a fail, so a single run shows all the problems instead of stopping at the first.
+    </p>
+</div>
+
+<RunAllTests />
+
+<CodeBlock Caption="Built-in verifiers" Code="@Verifiers" />
+
+<section aria-labelledby="tabs">
+    <h2 id="tabs">Tabs</h2>
+    <p>
+        Try both with the keyboard. In the first, every tab is a separate Tab stop and the arrow keys do nothing. In the
+        second, Tab reaches only the selected tab, and arrow keys, Home and End move between tabs.
+    </p>
+    <ExampleCard Title="Tabs that only work with a mouse" Defect="true" Example="PatternExamples.NaiveTabsPattern" Sources="@(["NaiveTabs.razor"])"
+                 Affects="@(["Keyboard users", "Screen reader users"])">
+        <Stage><NaiveTabs Label="Sections" Items="DemoData.Tabs" /></Stage>
+    </ExampleCard>
+    <ExampleCard Title="Tabs with roving tabindex and arrow keys" Example="PatternExamples.TabsPattern" Sources="@(["Tabs.razor"])">
+        <Stage><Tabs Label="Sections" Items="DemoData.Tabs" /></Stage>
+    </ExampleCard>
+</section>
+
+<section aria-labelledby="disclosure">
+    <h2 id="disclosure">Disclosure</h2>
+    <p>
+        The first card opens and closes, so a quick click test passes. But <code>aria-expanded</code> was hard-coded, and a
+        screen reader announces "collapsed" while the content is open. The test verifies the pattern, then audits the
+        open state in the browser, where <code>blazor-expanded-state-mismatch</code> compares the attribute with what is
+        actually visible.
+    </p>
+    <ExampleCard Title="A disclosure with a stale aria-expanded" Defect="true" Example="PatternExamples.StaleDisclosurePattern" Sources="@(["StaleDisclosure.razor"])"
+                 Hears="Shipping, button, collapsed" HearsLabel="Open, it is still announced as" Affects="@(["Screen reader users"])">
+        <Stage><StaleDisclosure Title="Shipping" Details="Ships in 2 days." /></Stage>
+    </ExampleCard>
+    <ExampleCard Title="A disclosure that keeps aria-expanded in sync" Example="PatternExamples.DisclosurePattern" Sources="@(["DisclosureCard.razor"])"
+                 Hears="Shipping, button, expanded" HearsLabel="Open, it is announced as">
+        <Stage><DisclosureCard Title="Shipping" Details="Ships in 2 days." /></Stage>
+    </ExampleCard>
+</section>
+
+<section aria-labelledby="dialog">
+    <h2 id="dialog">Modal dialog</h2>
+    <p>
+        The verifier opens the dialog from its trigger and checks the whole pattern at once: focus moves in, Tab and
+        Shift+Tab stay inside, Escape closes it, and focus returns to the trigger. The
+        <a href="keyboard">keyboard page</a> tests the same two dialogs with a hand-written scenario instead.
+    </p>
+    <ExampleCard Title="A dialog that only looks modal" Defect="true" Example="PatternExamples.FocuslessDialogPattern" Sources="@(["FocuslessDialog.razor"])"
+                 Affects="@(["Keyboard users", "Screen reader users"])">
+        <Stage>
+            <FocuslessDialog TriggerText="Delete account" Title="Delete account?" ConfirmText="Delete">
+                <p>This removes your profile and cannot be undone.</p>
+            </FocuslessDialog>
+        </Stage>
+    </ExampleCard>
+    <ExampleCard Title="A dialog that follows the pattern" Example="PatternExamples.ModalDialogPattern" Sources="@(["ModalDialog.razor"])">
+        <Stage>
+            <ModalDialog TriggerText="Delete account" Title="Delete account?" ConfirmText="Delete">
+                <p>This removes your profile and cannot be undone.</p>
+            </ModalDialog>
+        </Stage>
+    </ExampleCard>
+</section>
+
+<section aria-labelledby="menu">
+    <h2 id="menu">Menu button</h2>
+    <p>
+        Enter, Space or ArrowDown opens the menu on its first item, arrow keys wrap, Escape closes it and returns focus to
+        the button.
+    </p>
+    <ExampleCard Title="An actions menu" Example="PatternExamples.MenuButtonPattern" Sources="@(["MenuButton.razor"])"
+                 Hears="Actions, menu button, collapsed">
+        <Stage><MenuButton Label="Actions" /></Stage>
+    </ExampleCard>
+</section>
+
+<section aria-labelledby="form-validation">
+    <h2 id="form-validation">Form validation</h2>
+    <p>
+        After a failed submit with the keyboard, every invalid field is marked with <code>aria-invalid</code>, linked to its
+        error text, focus moves to the first invalid field or to an error summary, and the errors reach screen reader
+        users. The forms are shown on the <a href="blazor-rules">Blazor rules</a> page.
+    </p>
+    <ExampleCard Title="The template form" Defect="true" Example="PatternExamples.LegacySignupValidation" Sources="@(["LegacySignupForm.razor"])"
+                 Affects="@(["Screen reader users", "Keyboard users"])">
+        <ChildContent><p>InputText sets aria-invalid, but ValidationMessage is not linked and focus stays on the button.</p></ChildContent>
+    </ExampleCard>
+    <ExampleCard Title="Errors linked and focused" Example="PatternExamples.SignupValidation" Sources="@(["SignupForm.razor", "FieldError.razor"])">
+        <ChildContent><p>The error text is referenced by the field, and focus moves to the first invalid field.</p></ChildContent>
+    </ExampleCard>
+</section>
+
+
+@code {
+    private const string Verifiers = """
+        (await AriaPatterns.VerifyModalDialogAsync(page.GetByRole(AriaRole.Button, new() { Name = "Delete account" }))).ShouldPass();
+        (await AriaPatterns.VerifyTabsAsync(page.GetByRole(AriaRole.Tablist))).ShouldPass();
+        (await AriaPatterns.VerifyDisclosureAsync(page.GetByRole(AriaRole.Button, new() { Name = "Details" }))).ShouldPass();
+        (await AriaPatterns.VerifyMenuButtonAsync(page.GetByRole(AriaRole.Button, new() { Name = "Actions" }))).ShouldPass();
+        """;
+}

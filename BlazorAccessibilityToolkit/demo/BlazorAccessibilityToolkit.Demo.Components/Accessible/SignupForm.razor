@@ -1,0 +1,92 @@
+@* Accessible form validation: required fields are indicated, errors are visible and associated with their fields, focus
+   moves to the first invalid field after a failed submit, and success is announced. Fixed version of LegacySignupForm. *@
+<EditForm EditContext="editContext" OnValidSubmit="SubmitAsync" OnInvalidSubmit="OnInvalidSubmit" FormName="signup" novalidate>
+    <DataAnnotationsValidator />
+    <fieldset>
+        <legend>Create an account</legend>
+        <p class="hint">All fields are required.</p>
+
+        <div class="field">
+            <label for="@NameId">Full name</label>
+            <InputText @ref="nameInput" id="@NameId" @bind-Value="model.Name" autocomplete="name" aria-required="true"
+                       aria-describedby="@ErrorRef(() => model.Name, NameId)" />
+            <FieldError Id="@ErrorId(NameId)" Messages="@Messages(() => model.Name)" />
+        </div>
+
+        <div class="field">
+            <label for="@EmailId">Email</label>
+            <InputText @ref="emailInput" id="@EmailId" type="email" @bind-Value="model.Email" autocomplete="email" aria-required="true"
+                       aria-describedby="@ErrorRef(() => model.Email, EmailId)" />
+            <FieldError Id="@ErrorId(EmailId)" Messages="@Messages(() => model.Email)" />
+        </div>
+    </fieldset>
+
+    <button type="submit" class="primary">Create account</button>
+    <p role="status" class="status">@status</p>
+</EditForm>
+
+@code {
+    private readonly Model model = new();
+    private readonly string idPrefix = $"signup-{Guid.NewGuid():N}";
+    private EditContext editContext = null!;
+    private InputText? nameInput;
+    private InputText? emailInput;
+    private bool focusFirstInvalidField;
+    private string status = string.Empty;
+
+    private string NameId => $"{idPrefix}-name";
+
+    private string EmailId => $"{idPrefix}-email";
+
+    [Parameter] public EventCallback<Model> OnSignedUp { get; set; }
+
+    protected override void OnInitialized() => editContext = new EditContext(model);
+
+    private static string ErrorId(string fieldId) => $"{fieldId}-error";
+
+    // The messages come from the same validation state that sets aria-invalid on the inputs, so a field is never marked
+    // invalid without its error text (and the reference to it).
+    private IReadOnlyList<string> Messages(System.Linq.Expressions.Expression<Func<object?>> field) =>
+        editContext.GetValidationMessages(FieldIdentifier.Create(field)).ToArray();
+
+    private string? ErrorRef(System.Linq.Expressions.Expression<Func<object?>> field, string fieldId) =>
+        Messages(field).Count > 0 ? ErrorId(fieldId) : null;
+
+    private void OnInvalidSubmit()
+    {
+        status = string.Empty;
+        focusFirstInvalidField = true;
+    }
+
+    private async Task SubmitAsync()
+    {
+        status = $"Account created for {model.Email}.";
+        await OnSignedUp.InvokeAsync(model);
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!focusFirstInvalidField)
+        {
+            return;
+        }
+
+        // Focus the first invalid field: its accessible description is the error, so screen readers announce it.
+        focusFirstInvalidField = false;
+        var target = Messages(() => model.Name).Count > 0 ? nameInput : emailInput;
+        if (target?.Element is { } element)
+        {
+            await element.FocusAsync();
+        }
+    }
+
+    public sealed class Model
+    {
+        [Required(ErrorMessage = "Enter your full name.")]
+        public string? Name { get; set; }
+
+        [Required(ErrorMessage = "Enter your email address.")]
+        [EmailAddress(ErrorMessage = "Enter an email address like name@example.com.")]
+        public string? Email { get; set; }
+    }
+}

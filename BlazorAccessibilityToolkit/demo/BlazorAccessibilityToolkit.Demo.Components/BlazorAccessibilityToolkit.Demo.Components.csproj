@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+  <PropertyGroup>
+    <Description>Demo Razor components (accessible patterns and intentional defects) used by the toolkit demo.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <SupportedPlatform Include="browser" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\BlazorAccessibilityToolkit.Components\BlazorAccessibilityToolkit.Components.csproj" />
+  </ItemGroup>
+</Project>

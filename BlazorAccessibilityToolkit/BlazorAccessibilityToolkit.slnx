@@ -1,0 +1,33 @@
+<Solution>
+  <Folder Name="/demo/">
+    <Project Path="demo/BlazorAccessibilityToolkit.Demo.ComponentTests/BlazorAccessibilityToolkit.Demo.ComponentTests.csproj" />
+    <Project Path="demo/BlazorAccessibilityToolkit.Demo.EndToEndTests/BlazorAccessibilityToolkit.Demo.EndToEndTests.csproj" />
+    <Project Path="demo/BlazorAccessibilityToolkit.Demo.WebApp/BlazorAccessibilityToolkit.Demo.WebApp.csproj" />
+    <Project Path="demo/BlazorAccessibilityToolkit.Demo.Components/BlazorAccessibilityToolkit.Demo.Components.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/BlazorAccessibilityToolkit.Analyzers/BlazorAccessibilityToolkit.Analyzers.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.Analyzers.CodeFixes/BlazorAccessibilityToolkit.Analyzers.CodeFixes.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.Cli/BlazorAccessibilityToolkit.Cli.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.Components/BlazorAccessibilityToolkit.Components.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.ComponentTesting/BlazorAccessibilityToolkit.ComponentTesting.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.DevTools/BlazorAccessibilityToolkit.DevTools.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.Playwright/BlazorAccessibilityToolkit.Playwright.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit.Windows/BlazorAccessibilityToolkit.Windows.csproj" />
+    <Project Path="src/BlazorAccessibilityToolkit/BlazorAccessibilityToolkit.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/BlazorAccessibilityToolkit.Analyzers.Tests/BlazorAccessibilityToolkit.Analyzers.Tests.csproj" />
+    <Project Path="tests/BlazorAccessibilityToolkit.ComponentTesting.Tests/BlazorAccessibilityToolkit.ComponentTesting.Tests.csproj" />
+    <Project Path="tests/BlazorAccessibilityToolkit.Playwright.Tests/BlazorAccessibilityToolkit.Playwright.Tests.csproj" />
+    <Project Path="tests/BlazorAccessibilityToolkit.Tests/BlazorAccessibilityToolkit.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tests/Hybrid/">
+    <Project Path="tests/Hybrid/BlazorAccessibilityToolkit.Hybrid.Tests/BlazorAccessibilityToolkit.Hybrid.Tests.csproj" />
+    <Project Path="tests/Hybrid/BlazorAccessibilityToolkit.HybridTestApp/BlazorAccessibilityToolkit.HybridTestApp.csproj" />
+  </Folder>
+  <Folder Name="/tests/Compatibility/">
+    <Project Path="tests/Compatibility/BlazorAccessibilityToolkit.MSTest.Tests/BlazorAccessibilityToolkit.MSTest.Tests.csproj" />
+    <Project Path="tests/Compatibility/BlazorAccessibilityToolkit.NUnit.Tests/BlazorAccessibilityToolkit.NUnit.Tests.csproj" />
+  </Folder>
+</Solution>

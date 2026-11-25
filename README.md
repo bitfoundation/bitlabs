@@ -9,10 +9,25 @@ Projects here are experimental: APIs, file formats, and features may change with
 
 | Project | Stack | Description |
 |---|---|---|
+| [BlazorAccessibilityToolkit](BlazorAccessibilityToolkit/README.md) | .NET 10, Blazor, bUnit, Playwright, Roslyn | An accessibility engineering toolkit for Razor components and Blazor apps: audits components and pages (axe-core, optionally IBM Equal Access), drives them with a real keyboard, checks focus, names, roles, states, live regions and WAI-ARIA patterns, checks `.razor` files at compile time with 38 analyzer rules and code fixes, and turns the results into CI-ready reports and gates through the `blazor-a11y` CLI, which also serves the toolkit to coding agents over MCP. |
 | [BlazorProfiler](BlazorProfiler/README.md) | .NET 10, Blazor | A Blazor-specific performance profiler that collects, correlates, and explains performance problems across interactions, component rendering, HTTP, JS interop, runtime/GC, circuits, and browser-perceived latency. Ships a dashboard, 53 diagnostic rules, an MCP endpoint for coding agents, and a CLI for CI gating. |
 | [BlazorTestPlatform](BlazorTestPlatform/README.md) | .NET 10/11, Blazor, bUnit, Playwright | A quality platform for Blazor component libraries and apps: write a component story once and run it as a bUnit test, a real-browser interaction test, a visual snapshot, an accessibility audit, a render-performance check and a cross-hosting regression test, then browse it in a component workbench and review the results in a self-hosted test hub or the `btp` CLI. |
 | [DevDeck](DevDeck/README.md) | Rust, Win32 + GDI | A native, ultra-light Windows Git client modeled on the VS Code Source Control view, built to run many instances at once with almost no memory or CPU cost (~0.8 MB executable, ~3 MB private memory per window). |
 | [DotNetQuery](DotNetQuery/README.md) | .NET 8/10, Blazor, WPF, WinUI, Avalonia, MAUI, Uno | Server-state management for .NET, the idiomatic counterpart to TanStack Query: fetching, caching, deduplication, invalidation, retries, optimistic mutations, pagination, prerender hydration, persistence, offline queues, real-time sync, and DevTools, with first-class Blazor support and XAML adapters. |
+
+### BlazorAccessibilityToolkit
+
+```
+cd BlazorAccessibilityToolkit
+dotnet build BlazorAccessibilityToolkit.slnx
+dotnet test BlazorAccessibilityToolkit.slnx
+dotnet run --project demo/BlazorAccessibilityToolkit.Demo.WebApp
+```
+
+Requires the .NET 10 SDK (see [`global.json`](BlazorAccessibilityToolkit/global.json)); the browser suites need Playwright
+browsers, and the Blazor Hybrid tests run on Windows only (WebView2). Start with
+[getting started](BlazorAccessibilityToolkit/docs/getting-started.md); the guides are in [`BlazorAccessibilityToolkit/docs`](BlazorAccessibilityToolkit/docs).
+CI runs on every change under `BlazorAccessibilityToolkit/` through the [BlazorAccessibilityToolkit workflow](.github/workflows/blazoraccessibilitytoolkit.yml).
 
 ### BlazorProfiler
 
